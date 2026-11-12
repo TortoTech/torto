@@ -4519,7 +4519,16 @@ mod tests {
                             continue;
                         };
                         let visible = region.visible_byte_range().unwrap();
-                        copied.push_str(&region.selection_fragment(visible).unwrap().quote);
+                        let fragment = region.selection_fragment(visible).unwrap();
+                        let body_left = rebook_layout::reading_content_left(width as f32, &style)
+                            + (f32::from(depth) + 1.0) * style.typography.font_size * style.typesetting.list_indent_em;
+                        assert!(fragment.rects.iter().all(|rect| rect.x0 >= f64::from(body_left) - 0.1),
+                            "source highlights must exclude the outdented marker");
+                        if let Some(marker) = region.marker_bounds_for_sources(std::slice::from_ref(&range)) {
+                            assert!(marker.x0 < f64::from(body_left));
+                            assert!(marker.x0 >= -0.1, "outdented markers must stay on the page");
+                        }
+                        copied.push_str(&fragment.quote);
                         for hyphen in &region.discretionary_hyphens {
                             hyphen_count += 1;
                             continuation_hyphen |= hyphen.line_index > 0;

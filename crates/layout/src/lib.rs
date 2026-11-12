@@ -24,6 +24,8 @@ mod hyphen_cache;
 mod image_sizing_tests;
 mod image_text;
 mod list_markers;
+#[cfg(test)]
+mod list_geometry_tests;
 mod media_captions;
 mod note_spacing;
 mod raster_cache;
@@ -1733,8 +1735,9 @@ impl LayoutEngine {
                 }
             })
             .collect();
+        let list_groups = if unified_reflow { semantic_list_groups(&layout_blocks) } else { Vec::new() };
         if unified_reflow {
-            let mut groups = semantic_list_groups(&layout_blocks);
+            let mut groups = list_groups.clone();
             groups.extend(semantic_paragraph_groups(&layout_blocks));
             for group in groups {
                 let mut next = ReferenceNumbers { number_citations: true, ..Default::default() };
@@ -1760,6 +1763,7 @@ impl LayoutEngine {
             }
         }
         let layout_blocks: Vec<_> = numbered_blocks.iter().map(|b| b.as_ref()).collect();
+        let list_insets = self.list_body_insets(&layout_blocks, &list_groups, reader_style);
         let mut block_index = 0;
         while block_index < layout_blocks.len() {
             if unified_reflow
@@ -1862,7 +1866,12 @@ impl LayoutEngine {
                         }
                         continue;
                     }
-                    let resolved = resolve_text_block(block, reader_style, TextContext::Flow);
+                    let mut resolved = resolve_text_block(block, reader_style, TextContext::Flow);
+                    if list_markers::hanging_body(block)
+                        && list_insets.get(block_index).is_some_and(|inset| *inset > 0.0)
+                    {
+                        resolved.to_mut().style.margin_start += list_insets[block_index];
+                    }
                     let mut prepared = self.shape_text_from_source(
                         source,
                         &resolved,
@@ -2446,6 +2455,7 @@ impl LayoutEngine {
             true,
             self.deferred_images
                 .then_some((source, self.raster_generation)),
+            TextContext::Flow,
         ))
     }
 
@@ -3069,6 +3079,7 @@ impl LayoutEngine {
             Vec::new(),
             true,
             None,
+            TextContext::Flow,
         )
     }
 
@@ -3095,6 +3106,7 @@ impl LayoutEngine {
             Vec::new(),
             reader_style.typesetting.mode != TypesettingMode::Unified,
             formula_context,
+            TextContext::Table,
         )
     }
 
@@ -3109,6 +3121,7 @@ impl LayoutEngine {
         mut source_spans: Vec<TextSourceSpan>,
         optimize_line_breaks: bool,
         formula_context: Option<(&dyn BookSource, u64)>,
+        context: TextContext,
     ) -> PreparedText {
         let normalized = list_markers::normalize(
             block, reader_style.typesetting.mode == TypesettingMode::Unified,
@@ -3118,7 +3131,7 @@ impl LayoutEngine {
             && block.content.iter().any(|i| matches!(i,Inline::Image(r) if r.image.ocr_text.is_some()));
         let original_source_spans = if image_text { source_spans.clone() } else { Vec::new() };
         if image_text { source_spans = image_text::source_spans(block, &source_spans); }
-        let (start_offset, available_width, first_line_indent) =
+        let (mut start_offset, mut available_width, first_line_indent) =
             resolve_text_measure(block, content_width, minimum_width);
         let sentence_reference = if block.style.sentence_indents
             && block.style.preserve_sentence_prefix
@@ -3141,6 +3154,7 @@ impl LayoutEngine {
                 Vec::new(),
                 optimize_line_breaks,
                 formula_context,
+                context,
             ))
         } else {
             None
@@ -3263,6 +3277,19 @@ impl LayoutEngine {
         } else {
             0.0
         };
+        if context == TextContext::Flow
+            && reader_style.typesetting.mode == TypesettingMode::Unified
+            && list_markers::hanging_body(block)
+        {
+            // Keep the paragraph-derived body inset. Only the marker borrows
+            // space from that inset; never consume the page's own margin.
+            let slot = if marker_width > 0.0 { marker_width } else {
+                self.measure_list_marker_width(&list_markers::visible_prefix(block), &font_stack, typography)
+            };
+            let inset = (slot - start_offset).max(0.0);
+            start_offset += inset - marker_width;
+            available_width = (available_width - inset + marker_width).max(minimum_width);
+        }
         let mut layout = self.build_text_layout_with_boundaries(
             &text,
             &spans,
@@ -3324,7 +3351,8 @@ impl LayoutEngine {
         // Reshape at chosen discretionary breaks and remeasure before accepting
         // the paragraph. This preserves ligatures within each resulting line.
         if should_optimize {
-            let analysis = linebreak::parley::ParagraphAnalysis::new(&text);
+            let analysis = linebreak::parley::ParagraphAnalysis::new(&text)
+                .with_protected_prefix(source_text_start);
             for _ in 0..4 {
                 let prepared = if text.contains('\n') {
                     linebreak::parley::plan_sentences(
@@ -3332,6 +3360,7 @@ impl LayoutEngine {
                         continuation_indent, typography.font_size, &hyphen_widths,
                         block.style.sentence_indents,
                         sentence_reference.as_ref().map(|r|(r.layout.as_ref(),r.text.as_ref())),
+                        source_text_start,
                     )
                 } else { linebreak::parley::plan_optimized_reusable(
                     &mut layout,
@@ -3448,7 +3477,7 @@ impl LayoutEngine {
             if optimize_line_breaks
                 && ruby.is_empty()
                 && (block.style.align == TextAlignment::Justify || sentence_reference.is_some())
-                && let Some(plan) = linebreak::parley::plan_wrapped_with_sentence_prefix(
+                && let Some(plan) = linebreak::parley::plan_wrapped_with_protected_prefix(
                     &mut layout,
                     &text,
                     available_width,
@@ -3456,6 +3485,7 @@ impl LayoutEngine {
                         .as_ref()
                         .map(|reference| (reference.layout.as_ref(), reference.text.as_ref())),
                     block.style.align == TextAlignment::Justify,
+                    source_text_start,
                 )
             {
                 let adjusted =
@@ -3505,7 +3535,7 @@ impl LayoutEngine {
             let mut original = block.clone();
             for index in missing_images { if let Inline::Image(run) = &mut original.content[index] { run.image.ocr_text = None; } }
             return self.shape_text_with_sources(&original, reader_style, content_width, minimum_width,
-                inline_rasters, original_source_spans, optimize_line_breaks, formula_context,
+                inline_rasters, original_source_spans, optimize_line_breaks, formula_context, context,
             );
         }
         let alignment = table_shaping::resolved_text_alignment(&layout, block, optimized);
@@ -4070,6 +4100,34 @@ impl LayoutEngine {
         }
     }
 
+    fn list_body_insets(
+        &mut self,
+        blocks: &[&Block],
+        groups: &[Range<usize>],
+        style: &ReaderStyle,
+    ) -> Vec<f32> {
+        if groups.is_empty() { return Vec::new(); }
+        let stack = style.typography.default_stack_for(style.writing_system);
+        let mut widths = HashMap::new();
+        let mut insets = vec![0.0_f32; blocks.len()];
+        // Only the current layout fragment is measured. A wide number reserves
+        // space inside the text column for its entire list, never in page margins.
+        for group in groups {
+            let mut extra = 0.0_f32;
+            for block in &blocks[group.clone()] {
+                let Block::Text(text) = block else { continue; };
+                if !list_markers::hanging_body(text) { continue; }
+                let prefix = list_markers::visible_prefix(text);
+                let width = *widths.entry(prefix).or_insert_with_key(|prefix| {
+                    self.measure_list_marker_width(prefix, &stack, &style.typography)
+                });
+                extra = extra.max(width - style.typography.font_size * list_markers::body_indent_em(text, style));
+            }
+            insets[group.clone()].fill(extra);
+        }
+        insets
+    }
+
     fn measure_list_marker_width(
         &mut self,
         marker: &str,
@@ -4405,8 +4463,11 @@ fn resolve_text_block_with_caption_emphasis<'a>(
                 resolved.style.margin_start_fraction = 0.0;
             }
             TextBlockKind::ListItem { depth, .. } => {
-                resolved.style.margin_start =
-                    base_size * profile.list_indent_em * (f32::from(depth) + 1.0);
+                resolved.style.margin_start = if list_markers::hanging_body(block) {
+                    base_size * list_markers::body_indent_em(block, reader_style)
+                } else {
+                    base_size * profile.list_indent_em * (f32::from(depth) + 1.0)
+                };
                 resolved.style.margin_start_fraction = 0.0;
             }
             TextBlockKind::DefinitionTerm { depth } => {
@@ -7832,6 +7893,7 @@ mod tests {
             vec![],
             true,
             None,
+            TextContext::Flow,
         );
         assert!(prepared.layout.len() > 1);
         assert!(prepared.inline_images.is_empty());
@@ -9134,12 +9196,12 @@ mod tests {
         };
 
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
-        assert!((resolved.style.margin_start - 30.0).abs() < 0.001);
+        assert!((resolved.style.margin_start - 40.0).abs() < 0.001);
         assert!(resolved.style.margin_start_fraction.abs() < 0.001);
     }
 
     #[test]
-    fn translated_lists_keep_the_same_level_indents_as_the_original() {
+    fn translated_lists_follow_their_display_paragraph_indent_and_share_the_level_step() {
         let style = ReaderStyle {
             typesetting: ReaderTypesetting::unified(),
             ..Default::default()
@@ -9167,7 +9229,8 @@ mod tests {
             let cjk = block(WritingSystem::Cjk);
             let original = resolve_text_block(&latin, &style, TextContext::Flow);
             let translated = resolve_text_block(&cjk, &style, TextContext::Flow);
-            assert_eq!(original.style.margin_start, translated.style.margin_start);
+            assert_eq!(original.style.margin_start, style.typography.font_size * (1.5 + f32::from(depth) * style.typesetting.list_indent_em));
+            assert_eq!(translated.style.margin_start, style.typography.font_size * (2.0 + f32::from(depth) * style.typesetting.list_indent_em));
             assert_eq!(original.style.indent, translated.style.indent);
         }
         let paragraph = TextBlock {
@@ -9272,7 +9335,7 @@ mod tests {
         };
 
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
-        assert!((resolved.style.margin_start - 90.0).abs() < 0.001);
+        assert!((resolved.style.margin_start - 100.0).abs() < 0.001);
         assert!(resolved.style.margin_start_fraction.abs() < 0.001);
     }
 
@@ -9304,7 +9367,7 @@ mod tests {
         };
 
         let resolved = resolve_text_block(&block, &style, TextContext::Flow);
-        assert!((resolved.style.margin_start - 60.0).abs() < 0.001);
+        assert!((resolved.style.margin_start - 70.0).abs() < 0.001);
         assert!(resolved.style.margin_start_fraction.abs() < 0.001);
         assert!(resolved.style.indent.abs() < 0.001);
         assert!(list_marker_prefix(resolved.kind).is_empty());

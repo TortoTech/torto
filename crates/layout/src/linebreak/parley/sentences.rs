@@ -7,11 +7,12 @@ pub(crate) fn plan_sentences(
     layout: &mut Layout<TextBrush>, text: &str, width: f32, first_indent: f32,
     continuation_indent: f32, em: f32, hyphens: &HashMap<usize, f32>,
     repeat_indent: bool, reference: Option<(&Layout<TextBrush>, &str)>,
+    protected_prefix: usize,
 ) -> Option<ReusableParagraphPlan> {
     if layout.is_rtl() || !text.contains('\n') { return None; }
     let prefix = reference.and_then(|reference| {
         let mut wrapped=layout.clone();
-        let mut plan=plan_wrapped_with_sentence_prefix(&mut wrapped,text,width,Some(reference),true)?;
+        let mut plan=plan_wrapped_with_protected_prefix(&mut wrapped,text,width,Some(reference),true,protected_prefix)?;
         let count=wrapped.lines().position(|line| line.break_reason()==parley::layout::BreakReason::Explicit)?+1;
         let end=text.find('\n')?;
         plan.lines.truncate(count);
@@ -53,7 +54,8 @@ pub(crate) fn plan_sentences(
         } else {
             plan_measured_content_with_analysis(body,&measured,&inline,width,
                 if start==0 || repeat_indent {first_indent} else {continuation_indent},
-                continuation_indent,em,&candidates,&ParagraphAnalysis::new(body))?
+                continuation_indent,em,&candidates,&ParagraphAnalysis::new(body)
+                    .with_protected_prefix(protected_prefix.saturating_sub(start)))?
         };
         if hard {
             // Parley consumes the newline as an item; never paint a hyphen there.

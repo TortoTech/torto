@@ -47,12 +47,24 @@ pub(crate) fn plan_wrapped_justification(
     plan_wrapped_with_sentence_prefix(layout, text, column_width, None, true)
 }
 
+#[cfg(test)]
 pub(crate) fn plan_wrapped_with_sentence_prefix(
     layout: &mut Layout<TextBrush>,
     text: &str,
     column_width: f32,
     reference: Option<(&Layout<TextBrush>, &str)>,
     justify_suffix: bool,
+) -> Option<ParagraphPlan> {
+    plan_wrapped_with_protected_prefix(layout, text, column_width, reference, justify_suffix, 0)
+}
+
+pub(crate) fn plan_wrapped_with_protected_prefix(
+    layout: &mut Layout<TextBrush>,
+    text: &str,
+    column_width: f32,
+    reference: Option<(&Layout<TextBrush>, &str)>,
+    justify_suffix: bool,
+    protected_prefix: usize,
 ) -> Option<ParagraphPlan> {
     let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
     if layout.is_rtl()
@@ -145,7 +157,7 @@ pub(crate) fn plan_wrapped_with_sentence_prefix(
                     .is_some_and(is_cjk_justification_char)
                 && !brush.footnote_reference
                 && !clusters[index + 1].2.footnote_reference;
-            if space || cjk {
+            if range.start >= protected_prefix && (space || cjk) {
                 slots.push((range.clone(), if space { advance * 0.5 } else { 0.0 }));
             }
         }
@@ -322,13 +334,19 @@ pub(crate) fn plan_optimized_with_hanging_indent(
 pub(crate) struct ParagraphAnalysis {
     supported: bool,
     legal_breaks: Vec<usize>,
+    protected_prefix: usize,
 }
 
 impl ParagraphAnalysis {
     pub(crate) fn new(text: &str) -> Self {
         let _timing = crate::timing::stage(crate::timing::TimingStage::LineBreak);
         let supported = is_supported_ltr_prose(text);
-        Self { supported, legal_breaks: if supported { super::engine::legal_breaks(text) } else { Vec::new() } }
+        Self { supported, legal_breaks: if supported { super::engine::legal_breaks(text) } else { Vec::new() }, protected_prefix: 0 }
+    }
+
+    pub(crate) fn with_protected_prefix(mut self, prefix: usize) -> Self {
+        self.protected_prefix = prefix;
+        self
     }
 }
 
@@ -488,8 +506,10 @@ fn plan_measured_content_with_analysis(
             em: cluster.em,
             first,
             last,
-            is_space: source.chars().all(|character| character.is_whitespace()),
-            is_breakable_space: source.chars().all(is_breakable_space),
+            is_space: cluster.range.start >= analysis.protected_prefix
+                && source.chars().all(|character| character.is_whitespace()),
+            is_breakable_space: cluster.range.start >= analysis.protected_prefix
+                && source.chars().all(is_breakable_space),
             break_after: ordinary_break || hyphen_breaks.contains_key(&cluster.range.end),
             ordinary_baseline: cluster.ordinary_baseline,
             footnote_reference: cluster.footnote_reference,

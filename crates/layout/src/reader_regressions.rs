@@ -105,8 +105,5 @@ fn translated_cjk_list_markers_use_the_shared_level_indent() {
         run.style.display_writing_system = Some(WritingSystem::Cjk);
     }
     let resolved = resolve_text_block(&item, &style, TextContext::Flow);
-    assert_eq!(
-        resolved.style.margin_start,
-        style.typography.font_size * style.typesetting.list_indent_em
-    );
+    assert_eq!(resolved.style.margin_start, style.typography.font_size * 2.0);
 }

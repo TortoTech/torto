@@ -1648,7 +1648,9 @@ fn translation_size_scale(style: TextStyle) -> Option<f32> {
 /// A translated RTL paragraph uses LTR left alignment; other source styles stay intact.
 fn normalize_rtl_translation(block: &mut TextBlock) {
     use rebook_publication::{TextAlignment, TextDirection};
-    if block.style.authored_list_marker.is_some() {
+    if block.style.authored_list_marker.is_some()
+        || matches!(block.kind, TextBlockKind::ListItem { marker_visible: true, .. })
+    {
         let text: String = block
             .content
             .iter()
@@ -1687,7 +1689,21 @@ fn normalize_rtl_translation(block: &mut TextBlock) {
                             .contains(&label.to_ascii_lowercase().as_str())
                         || ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
                             .contains(&label);
-                    valid.then_some(value[..end].chars().count() + 1)
+                    // Native list numbering belongs to the source, not the
+                    // model. A body abbreviation such as "i.e." is not a
+                    // replacement for the generated item number.
+                    let native_number = matches!(block.kind,
+                        TextBlockKind::ListItem { ordinal, .. }
+                            if label.parse::<u32>().ok() == Some(ordinal));
+                    let native_alpha = block.style.list_marker_format.is_some()
+                        && !label.is_empty() && label.len() <= 7
+                        && label.bytes().all(|byte| byte.is_ascii_alphabetic())
+                        && matches!(block.kind, TextBlockKind::ListItem { ordinal, .. }
+                            if label.bytes().try_fold(0_u32, |number, byte| {
+                                number.checked_mul(26)?.checked_add(u32::from(byte.to_ascii_lowercase() - b'a' + 1))
+                            }) == Some(ordinal));
+                    ((valid && block.style.authored_list_marker.is_some()) || native_number || native_alpha)
+                        .then_some(value[..end].chars().count() + 1)
                 })
         } else {
             None
@@ -2674,6 +2690,39 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn translated_native_lists_deduplicate_model_markers_without_stripping_body_symbols() {
+        for (text, ordered, expected) in [
+            ("• 译文", false, Some(2)),
+            ("●译文", false, Some(1)),
+            ("12. 译文", true, Some(4)),
+            ("译文", false, None),
+            ("-5 is a negative number", false, None),
+            ("|A| is a magnitude", false, None),
+            ("i.e. an explanation", true, None),
+            ("2024. Historical context", true, None),
+            ("L. 译文", true, Some(3)),
+        ] {
+            let mut block = TextBlock {
+                kind: TextBlockKind::ListItem { ordered, ordinal: 12, depth: 0, marker_visible: true },
+                content: vec![Inline::Text(TextRun { text: text.into(), style: Default::default(), link: None })],
+                style: BlockStyle { list_group: Some(10),
+                    list_marker_format: text.starts_with("L. ").then_some(rebook_publication::ListMarkerFormat::UpperAlpha),
+                    ..Default::default() },
+                source: None,
+            };
+            normalize_rtl_translation(&mut block);
+            assert_eq!(block.style.authored_list_marker, expected, "{text}");
+            assert_eq!(block.style.list_group, Some(10));
+            assert_eq!(block.content[0].text_runs()[0].text, text);
+        }
+        let mut paragraph = TextBlock { kind: TextBlockKind::Paragraph,
+            content: vec![Inline::Text(TextRun { text: "• actual prose".into(), style: Default::default(), link: None })],
+            style: Default::default(), source: None };
+        normalize_rtl_translation(&mut paragraph);
+        assert_eq!(paragraph.style.authored_list_marker, None);
     }
 
     #[test]
