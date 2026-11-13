@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/windows/torto-128.png" width="112" height="112" alt="Torto app icon">
+  <img src="assets/macos/torto-512.png" width="112" height="112" alt="Torto app icon">
 </p>
 
 <h1 id="torto" align="center">Torto</h1>
@@ -44,9 +44,9 @@ Focus Mode is Torto's default close-reading experience:
 
 - **Read by meaning, not by page.** One semantic unit is active at a time. Lists stay grouped with their introductory paragraph, and oversized tables or media scroll internally instead of being skipped.
 - **Steady reading line.** Short units start at a fixed centered baseline and expand only when needed, eliminating vertical eye jumps between paragraphs of different lengths. Choose between **Background highlight** and **Dim surroundings** for the focus style.
-- **Keyboard-first passage actions.** Press `Space` to open the action toolbar, `Tab` to open the chat panel, `1` to highlight the paragraph, `2` to open the note panel, `3` to **Split by sentence**, `4` to **Visualize table** (switch between a table and its AI chart), `0` to preview a figure or table, and `Left Alt` to **Toggle footnotes / formula notes**. All shortcuts are configurable.
+- **Keyboard-first passage actions on desktop.** Press `Space` to open the action toolbar, `Tab` to open the chat panel, `1` to highlight the paragraph, `2` to open the note panel, `3` to **Split by sentence**, `4` to **Visualize table** (switch between a table and its AI chart), `0` to preview a figure or table, and `Left Alt` to **Preview annotations** (footnotes and formula notes). All shortcuts are configurable.
 - **Attached context & reference previews.** Each passage has its own chat session while highlights and notes persist at durable source locations. Preview referenced figures, tables, and equations in place and cycle through multiple references in reading order.
-- **PDFs in the same workflow.** Text-based PDFs reflow locally right away; scanned PDFs enter Focus Mode once cloud OCR generates a reflowable layer.
+- **PDFs in the same workflow on desktop.** Text-based PDFs can reflow locally; scanned PDFs can enter Focus Mode once cloud OCR generates a reflowable layer. Android supports reading PDFs in their original layout.
 
 ## Features
 
@@ -55,14 +55,14 @@ Focus Mode is Torto's default close-reading experience:
 | **Focus Mode** | Read one semantic unit at a stable centered baseline with sentence splitting (`3`), dimmed surroundings, and context-bound actions. | ✅ Core |
 | **Multi-format & library** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, CHM, and PDF files; browse covers, track reading statistics, and detect duplicates. | ✅ |
 | **Native Rust rendering** | Parse, typeset, paginate, and render natively without a browser or WebView; download default reading fonts in the background. | ✅ |
-| **Classic layouts & themes** | Switch between single-column, two-column, and vertical-scroll views with unified or book-authored styles and Light, Dark, or system themes. | ✅ |
+| **Classic layouts & themes** | Choose unified or book-authored styles and light, dark, or system themes. Desktop offers single-column, two-column, and vertical-scroll layouts. | ✅ |
 | **Media & reference previews** | Inspect zoomable images, tables, and rendered LaTeX formulas (`0` or click); preview figures/tables/equations from inline references; copy tables as Markdown. | ✅ |
-| **AI layout, formulas & charts** | Recover headings, quotes, code blocks, captions, and image-based tables; explain display-formula symbols (`Left Alt`); generate charts for suitable tables (`4`). | ✅ Optional |
-| **AI reading assistant** | Chat per passage (`Tab`) or in a resizable book-chat sidebar with source citations, image Q&A (including pasted images), `/` skills, and `@` references. | ✅ Optional |
+| **AI layout, formulas & charts** | Recognize quotes, code blocks, captions, and image-based tables; explain formula symbols and generate charts for suitable tables. Headings are recognized from the book’s structure and styling. | ✅ Optional |
+| **AI reading assistant** | Ask about a passage or the whole book and follow citations to the source. Desktop supports a resizable sidebar, image questions, and `/` skills; Android offers a full-screen book chat. | ✅ Optional |
 | **Translation & glossary** | Read in replacement or bilingual mode (including TOC), with optional **Expert translation** that maintains a per-book terminology glossary. | ✅ Optional |
-| **PDF local reflow & OCR** | Reflow text-based PDFs locally; discover metadata/TOC with an AI agent or convert scanned PDFs via PaddleOCR and MinerU. | ✅ |
-| **WebDAV sync** | Sync books, progress, highlights, notes, reading statistics, and prepared PDF reflow layouts directly through your own WebDAV storage. | ✅ Optional |
-| **Feedback & updates** | Send bug reports or feature requests with screenshots and reading context in-app; verify and install MSI updates with SHA-256 on Windows. | ✅ |
+| **PDF local reflow & OCR** | On desktop, reflow text-based PDFs locally, discover metadata and the table of contents with AI, or convert scanned PDFs via PaddleOCR or MinerU. | ✅ Desktop |
+| **WebDAV sync** | Sync books, progress, highlights, notes, and reading statistics through your own WebDAV storage. The current book syncs first, followed by other recently read books. | ✅ Optional |
+| **Feedback & updates** | Send feedback with optional screenshots and reading context, and check for updates from within the app. | ✅ |
 
 ### AI & PDF workflow highlights
 
@@ -72,17 +72,31 @@ Focus Mode is Torto's default close-reading experience:
 
 ## Screenshots
 
+Desktop screenshots from the [Torto introduction on LINUX DO](https://linux.do/t/topic/3104255).
+
+### Focus Mode
+
+Keep the current passage clear while dimming the surrounding text.
+
+![Torto Focus Mode with the active paragraph in full contrast and surrounding passages dimmed](assets/screenshots/focus-mode.jpg)
+
 ### Local bookshelf
 
 Import books, browse covers, search by title or author, review reading statistics, and continue where you left off.
 
-![Torto local ebook library](assets/screenshots/library.png)
+![Torto bookshelf with book covers, reading progress, and a search field](assets/screenshots/library.jpg)
 
-### Classic two-column layout
+### Footnote previews
 
-Focus Mode is the default experience described above. Torto also provides a conventional two-column layout for readers who prefer a page-like spread.
+Read the footnotes beside the active passage without leaving your place in the book.
 
-![Torto classic two-column reader](assets/screenshots/reader.png)
+![Torto showing two footnotes in a panel next to the active passage](assets/screenshots/reference-preview.jpg)
+
+### Table visualization
+
+Switch between a table and its generated chart while keeping the caption and surrounding text in view.
+
+![Torto displaying a grouped bar chart generated from a book table](assets/screenshots/table-chart.jpg)
 
 ## Download
 
@@ -101,7 +115,9 @@ macOS also supports [portable mode](docs/macos-portable.md) using the same app:
 create `torto-portable-data` beside the `.app` in a writable folder. Move the
 whole folder to carry its library and settings; the outer folder can have any name.
 
-After installing, import books from the shelf and open any book in Focus Mode:
+Import a book from the shelf to start reading. On Android, tap the page to show the reader controls. For setup and platform-specific features, see the [Android guide](docs/android.md).
+
+In desktop Focus Mode:
 - Move between reading units with `↑` / `↓`, the mouse wheel, or the scrollbar.
 - Press `Space` for actions, `Tab` for passage chat, `1` / `2` for highlights and notes, `3` to split sentences, `4` to toggle table charts, and `Left Alt` for footnotes and formula symbol notes.
 - Press `Ctrl + F` to search the book and `Ctrl + ,` to configure layout, typography, translation, AI, OCR, shortcuts, and WebDAV sync.
