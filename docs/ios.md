@@ -35,16 +35,6 @@ xcodebuild -project apps/ios/Torto.xcodeproj -scheme Torto \
 
 脚本从同一份 Rust 源码构建真机与 Apple Silicon 模拟器库，校对两者的 Swift 接口，从 Android 矢量资源生成 iOS 图标，再生成 Xcode 工程。用 Xcode 打开工程即可选择模拟器；真机需要配置签名团队。发布构建使用 `scripts/build-ios.sh release`。首次发布前仍需完成真机性能、无障碍和隐私清单核对。
 
-GitHub Actions 的 [iOS 工作流](../.github/workflows/ios.yml) 会在涉及 iOS 或共享核心的 PR、主干提交时运行，也可在 Actions 页面手动启动。它编译无签名的真机目标和 Apple Silicon 模拟器目标，校验产物后上传模拟器包和 SHA-256 文件。下载并解压 Artifact 后，可在 Mac 上安装到已启动的模拟器：
-
-```sh
-shasum -a 256 -c Torto-*-ios-simulator-arm64.tar.gz.sha256
-tar -xzf Torto-*-ios-simulator-arm64.tar.gz
-xcrun simctl install booted Torto.app
-```
-
-如果已启动多个模拟器，将 `booted` 换为目标设备的 UUID。Action 产物不用于 iPhone 安装，也不会作为 GitHub Release 的 IPA 发布。
-
 ## 验证
 
 `scripts/smoke/ios-bridge.sh` 在 macOS 用真实 Rust 静态库与生成的 Swift 绑定运行。它检查原书导入、专注翻节、批注保存、阅读会话关闭后的图像生命周期，以及在新进程和不同视口宽度恢复同一段落。测试只用合成书籍和临时书库，不连接个人账户。宿主测试不替代 iOS 编译、模拟器或真机检查。
