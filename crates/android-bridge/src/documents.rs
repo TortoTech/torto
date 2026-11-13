@@ -140,10 +140,13 @@ fn note(s: &mut ReaderState, markup: &str, target: &str, marker: &str, token: u6
     }
     let spec = Note { markup: markup.into(), target: target.into(), marker: marker.into(), token, indent };
     let markup = live_note(s, &spec);
-    let id = format!("note-{token}-{}-{}", blake3::hash(markup.as_bytes()), indent.to_bits());
-    if s.document
-        .as_ref()
-        .is_some_and(|d| d.id == id && d.style == s.session.style())
+    // Translation may rebuild the document while the host still owns its ID.
+    // Keep that ID stable until dismissal; test the markup separately for reuse.
+    let id = format!("note-{token}-{}-{}", blake3::hash(target.as_bytes()), indent.to_bits());
+    if s.document.as_ref().is_some_and(|d| {
+        d.id == id && d.style == s.session.style()
+            && d.note.as_ref().is_some_and(|n| n.markup == markup && n.marker == marker)
+    })
     {
         return Ok(());
     }
@@ -534,6 +537,29 @@ impl MobileReader {
                     {
                         return reference(s, target);
                     }
+                }
+                if let Some(image) = p.image_at(x, y) {
+                    let formula = image.formula.clone();
+                    let hit = rebook_reader::ReaderImage {
+                        source: image.source,
+                        origin: image.origin,
+                        formula: image.formula,
+                        position: d.positions[index as usize],
+                        x: image.bounds.x0 as f32,
+                        y: image.bounds.y0 as f32,
+                        display_width: image.bounds.width() as f32,
+                        display_height: image.bounds.height() as f32,
+                        width: image.width,
+                        height: image.height,
+                        pixels: image.pixels,
+                    };
+                    let mut action = interactions::TouchAction::new(
+                        if formula.is_some() { "formula" } else { "image" },
+                        formula.unwrap_or_default(),
+                        String::new(),
+                    );
+                    action.media = Some(interactions::image_page(s, hit)?);
+                    return Ok(action);
                 }
                 let Some(hit) = p.hit_test_text(x, y, false) else {
                     return Ok(interactions::TouchAction::new(

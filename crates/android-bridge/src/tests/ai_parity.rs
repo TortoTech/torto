@@ -954,6 +954,7 @@ pub(super) async fn linked_note_popup(core:&Arc<MobileCore>,root:&std::path::Pat
     let translated=reader.clone().note_page("First linked definition.".into(),42,target.clone(),"1".into(),24.,0,viewport.clone(),0xff000000,0xfff4f5f7,
         ).await.unwrap();
     assert!(translated.page.info().regions.iter().any(|r|r.text.contains("共享源位置")));
+    assert_eq!(translated.id, first.id, "the open note keeps its identity while its text is translated");
     assert_eq!(listener.pages.load(Ordering::Relaxed),0,"translation must not reflow the covered body");
     let requests=server.requests.lock().unwrap();
     assert_eq!(requests.len(),2,"mobile must reuse the shared first request plus one retry");
@@ -968,7 +969,8 @@ pub(super) async fn linked_note_popup(core:&Arc<MobileCore>,root:&std::path::Pat
         let prepared=plugins::prepare_translation_inputs(&raw,false);
         assert!(!s.pipeline.translation.untranslated_prepared(1,&prepared,&ranges).map_err(error)?.is_empty());Ok(())
     }).unwrap();
-    reader.clone().close_document(translated.id).await.unwrap();
+    reader.clone().close_document(first.id).await.unwrap();
+    reader.with(|s| { assert!(s.document.is_none()); Ok(()) }).unwrap();
     reader.clone().note_page("First linked definition.".into(),43,target,"1".into(),24.,0,viewport,0xff000000,0xfff4f5f7,
         ).await.unwrap();
     reader.clone().update_ai_demand(activity,listener.clone()).await.unwrap();

@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 bindgen = ["uniffi/cli"]
+ios-interop = []
 
 [[bin]]
 name = "torto-bindgen"

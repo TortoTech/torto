@@ -2,6 +2,17 @@ use crate::{Result, error};
 use rebook_app_core::credentials;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+/// Fresh iOS profiles use the shared store without Android's migration callback.
+#[cfg(any(target_os = "ios", feature = "ios-interop"))]
+#[uniffi::export]
+pub fn initialize_ios_credential_storage(path: String) -> Result<()> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(error("An absolute credential file path is required"));
+    }
+    credentials::install(Arc::new(credentials::FileStore::new(path, None))).map_err(error)
+}
+
 /// One-time import of old Android Keystore preferences. All new reads/writes
 /// use the same Rust JSON store as Windows and macOS.
 #[uniffi::export(with_foreign)]

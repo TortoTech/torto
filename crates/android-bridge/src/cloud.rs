@@ -340,6 +340,15 @@ impl MobileCore {
     }
 }
 
+#[cfg(any(target_os = "ios", feature = "ios-interop"))]
+#[uniffi::export]
+impl MobileCore {
+    /// Interrupt a host's wait without advancing a sync deadline or queueing IO.
+    pub fn wake_sync_wait(&self) {
+        self.sync_wake.changed(sync::SyncChange::Reading);
+    }
+}
+
 #[derive(Clone, Copy, uniffi::Enum)]
 pub enum CloudSyncTrigger {
     Automatic,

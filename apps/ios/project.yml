@@ -1,0 +1,57 @@
+name: Torto
+options:
+  deploymentTarget:
+    iOS: "18.0"
+configs:
+  Debug: debug
+  Release: release
+targets:
+  Torto:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    configFiles:
+      Debug: Generated/Version.xcconfig
+      Release: Generated/Version.xcconfig
+    info:
+      path: Generated/Info.plist
+      properties:
+        BGTaskSchedulerPermittedIdentifiers: [org.tortotech.torto.cloud-sync]
+        UIBackgroundModes: [processing]
+    sources:
+      - Sources
+      - Generated/torto_android.swift
+      - Generated/Assets.xcassets
+      - path: Generated/Notices
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - framework: Generated/TortoCore.xcframework
+        embed: false
+      - sdk: CoreText.framework
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: libiconv.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.tortotech.torto
+        PRODUCT_NAME: Torto
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        "ARCHS[sdk=iphonesimulator*]": arm64
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Torto
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Connect to your WebDAV server when you enable cloud sync."
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CURRENT_PROJECT_VERSION: "1"
+schemes:
+  Torto:
+    build:
+      targets:
+        Torto: all
+    run:
+      config: Debug

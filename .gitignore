@@ -16,5 +16,13 @@ watchexec-preview*.log
 *.jks
 *.keystore
 
+# iOS generated Rust bindings, binaries and local Xcode state
+/apps/ios/Generated/
+/apps/ios/build/
+/apps/ios/build-device/
+xcuserdata/
+
 # Synthetic Android device-test fixture, not a user book.
 !/apps/android/app/src/androidTest/assets/reader-interactions.epub
+
+/apps/ios/Torto.xcodeproj/

@@ -1,0 +1,58 @@
+# Torto iOS 原型
+
+`apps/ios` 是面向 iOS / iPadOS 18 及以上的原生客户端。SwiftUI 管理书架、设置和面板，UIKit 绘制正文及处理手势。Rust 继续管理原书定位、排版、渲染和 WebDAV 协议。
+
+## 当前范围
+
+- 从“文件”导入书籍、三列封面书架、书籍管理与阅读详情。导入经系统授权读取文件，复制到临时目录后交给 Rust 去重入库。
+- 跟随 Android 的书架／我、浅色和深色配色、图标、分组设置、阅读工具栏及面板。iPad 根据可用宽度增加封面列数。
+- 设置和统计页的标题为 16 pt 并居中，设置分组外边距为 16 pt，行内主、副文字分别为 16 和 14 pt。书架底栏和阅读底栏图标为 28 pt，笔记导航图标为 24 pt。保留 iOS 原生安全区、键盘和系统文件／照片选择器。
+- 专注和经典阅读、段落／小节导航、目录、书内搜索、图片与脚注预览、选择、高亮与笔记、读完标记、阅读统计。书内与笔记搜索显示结果数量；修改或清空查询时丢弃旧结果。读完页显示开始和最近阅读日期、笔记分类和近期阅读明细，统计加载失败可重试。PDF 原图模式不显示专注开关。
+- 横向翻页／节跟手滑动；专注模式纵向跨节保留位移和渐变。正文划选可拖动手柄，在专注模式靠近屏幕边缘时继续滚动。脚注和引用中可划选复制、打开内部链接、预览图片和公式；点正文中的已有批注可编辑原笔记。
+- 复用默认字体下载。阅读中下载完成会提示应用；设置和阅读弹窗使用同一字号滑块，范围 16–40，步长 2。阅读主题可单独选择浅色或深色，并调整阅读亮度。
+- AI 提供商、翻译及 AI 排版设置共用移动端配置。翻译、AI 排版和阅读助手设置在离开子页时只保存改过的字段。正文、脚注、引用的翻译和 AI 排版由同一 Rust 调度器处理。全屏问书支持流式 Markdown 和公式、停止、数字引用跳转、还原临时改写和删除；向上查看时暂停自动跟随，可一键回到底部。对话只保留在本次阅读中。
+- 支持从“我”和阅读工具栏打开全屏反馈。打开后聚焦输入框，字数校验在本地即时完成。附带信息按字段展示，已添加的截图可全屏缩放预览；只有点提交才上传反馈。
+- WebDAV 复用共享同步调度。退到后台优先提交阅读进度和批注；后台库检查通过 iOS 系统安排，系统可以延后执行。设置页显示同步进度、上次同步时间和重试状态，可手动同步或停止。收到其他设备的新进度时，阅读页可选择跳转。
+- 「关于」复用 Android 的更新流程：启动后检查 GitHub 稳定发布，显示更新说明、下载进度和停止／重试。只识别 `Torto-<version>-ios-arm64.ipa`，优先使用 GitHub Asset API，必要时回退到同一个 GitHub 发布附件地址。下载通过大小和 SHA-256 校验后可导出，不在应用内安装。没有对应附件时显示暂无 iOS 更新。
+- 阅读统计支持周、月、年和总计，带时长分布、书籍排行和单书阅读历史。可以从详情卡片打开本地已下载的书。
+- PDF 重排／OCR 和 App Store 发布尚未接入。VoiceOver 正文按当前视口文本区域提供标签，仍需真机验证导航和交互。
+
+共享桥接暂保留 `torto-android-bridge` 包名，以免改变 Android 现有 UniFFI 与 JNI ABI。iOS 通过静态 XCFramework 链接同一实现，Core Graphics 数据提供器持有 Rust 的不可变像素缓冲，释放图像时归还引用。页面、选区和焦点遮罩分别处理，静止时不持续重绘。
+
+## 本机构建
+
+安装完整的 [Xcode](https://developer.apple.com/xcode/resources/)，打开并完成首次设置，在 Xcode 的组件设置安装 iOS 模拟器运行时。可通过 `DEVELOPER_DIR` 选择 Xcode，不必修改系统默认工具链。
+
+```sh
+brew install xcodegen
+# 图标生成需要 Python 3.9 或以上
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+scripts/build-ios.sh debug
+xcodebuild -project apps/ios/Torto.xcodeproj -scheme Torto \
+  -destination 'generic/platform=iOS Simulator' -derivedDataPath apps/ios/build \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
+脚本从同一份 Rust 源码构建真机与 Apple Silicon 模拟器库，校对两者的 Swift 接口，从 Android 矢量资源生成 iOS 图标，再生成 Xcode 工程。用 Xcode 打开工程即可选择模拟器；真机需要配置签名团队。发布构建使用 `scripts/build-ios.sh release`。首次发布前仍需完成真机性能、无障碍和隐私清单核对。
+
+GitHub Actions 的 [iOS 工作流](../.github/workflows/ios.yml) 会在涉及 iOS 或共享核心的 PR、主干提交时运行，也可在 Actions 页面手动启动。它编译无签名的真机目标和 Apple Silicon 模拟器目标，校验产物后上传模拟器包和 SHA-256 文件。下载并解压 Artifact 后，可在 Mac 上安装到已启动的模拟器：
+
+```sh
+shasum -a 256 -c Torto-*-ios-simulator-arm64.tar.gz.sha256
+tar -xzf Torto-*-ios-simulator-arm64.tar.gz
+xcrun simctl install booted Torto.app
+```
+
+如果已启动多个模拟器，将 `booted` 换为目标设备的 UUID。Action 产物不用于 iPhone 安装，也不会作为 GitHub Release 的 IPA 发布。
+
+## 验证
+
+`scripts/smoke/ios-bridge.sh` 在 macOS 用真实 Rust 静态库与生成的 Swift 绑定运行。它检查原书导入、专注翻节、批注保存、阅读会话关闭后的图像生命周期，以及在新进程和不同视口宽度恢复同一段落。测试只用合成书籍和临时书库，不连接个人账户。宿主测试不替代 iOS 编译、模拟器或真机检查。
+
+Xcode 27.2 下，iOS 真机目标与 Apple Silicon 模拟器目标均已通过无签名 Debug 构建。真机目标构建只验证编译和链接，安装到设备仍需要签名。
+
+在 iPhone 18 Pro 模拟器使用仓库的测试 EPUB 验证了设置、字号、阅读工具栏、主题、笔记、全屏图片和问书键盘。用本地模拟模型验证了正文翻译在一次 HTTP 503 后自动重试、关闭翻译恢复原文，以及退出问书再打开时仍保留本次阅读的对话。
+
+阅读交互回归使用合成 EPUB，覆盖同一 XHTML 内的小节往返、脚注内划选复制与链接跳转，以及从正文重新打开、编辑并保存已有批注。
+
+用隔离的模拟器和本地 WebDAV 验证了手动同步、样书上传，以及从阅读页退到后台时提交阅读进度。阅读统计回归覆盖跨年切换、总计、单书历史和从详情打开正文。系统何时唤醒后台库检查仍需真机验证。

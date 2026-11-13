@@ -131,7 +131,7 @@ fn context(reader: Option<&MobileReader>, env: FeedbackEnvironment) -> Result<da
             version: env!("CARGO_PKG_VERSION").into(),
         },
         os: data::Os {
-            name: "Android".into(),
+            name: if cfg!(target_os = "ios") { "iOS" } else { "Android" }.into(),
             version: data::clipped(&format!("{} · {}", env.os_version, env.device), 100),
             arch: data::clipped(&env.arch, 40),
         },

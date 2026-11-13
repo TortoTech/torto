@@ -15,13 +15,14 @@ pub enum Platform {
     WindowsPortableX64,
     AndroidArm64,
     AndroidX64,
+    IosArm64,
     MacosArm64,
     MacosX64,
 }
 impl Platform {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::WindowsX64, Self::WindowsPortableX64, Self::AndroidArm64, Self::AndroidX64,
-        Self::MacosArm64, Self::MacosX64,
+        Self::IosArm64, Self::MacosArm64, Self::MacosX64,
     ];
     pub fn is_macos(self) -> bool {
         matches!(self, Self::MacosArm64 | Self::MacosX64)
@@ -32,6 +33,7 @@ impl Platform {
             Self::WindowsPortableX64 => "-windows-x86_64-portable.zip",
             Self::AndroidArm64 => "-android-arm64-v8a.apk",
             Self::AndroidX64 => "-android-x86_64.apk",
+            Self::IosArm64 => "-ios-arm64.ipa",
             Self::MacosArm64 => "-macos-arm64.zip",
             Self::MacosX64 => "-macos-x86_64.zip",
         }
@@ -49,6 +51,7 @@ impl Platform {
             // needs its own marker because each manifest names one APK.
             Self::AndroidArm64 => "torto-android-update.json",
             Self::AndroidX64 => "torto-android-x86_64-update.json",
+            Self::IosArm64 => "torto-ios-arm64-update.json",
         }
     }
 }
@@ -363,7 +366,11 @@ where
     if let Some(id) = asset.github_asset_id {
         urls.push(github::TORTO.asset_url(id));
     }
-    urls.extend([asset.url.clone(), alternative.to_string()]);
+    urls.push(asset.url.clone());
+    // iOS packages are distributed via the GitHub release channel only.
+    if !asset.name.ends_with(Platform::IosArm64.suffix()) {
+        urls.push(alternative.to_string());
+    }
     for url in urls {
         let result = fetch(url).await.and_then(|bytes| {
             verify_installer_bytes(asset, &bytes)?;
@@ -434,13 +441,24 @@ pub fn release_from_github_platform(
     if latest <= current {
         return Ok(None);
     }
+    let expected_name = platform.name(&latest.to_string());
     let asset = release
         .assets
         .into_iter()
-        .find(|asset| asset.name.ends_with(platform.suffix()))
-        .ok_or_else(|| {
-            "The latest release does not include an installer for this platform".to_string()
-        })?;
+        .find(|asset| {
+            if platform == Platform::IosArm64 {
+                asset.name == expected_name
+            } else {
+                asset.name.ends_with(platform.suffix())
+            }
+        });
+    let Some(asset) = asset else {
+        // Existing releases can be newer than this client without shipping an IPA.
+        if platform == Platform::IosArm64 {
+            return Ok(None);
+        }
+        return Err("The latest release does not include an installer for this platform".into());
+    };
     validate_release_url(
         &asset.browser_download_url,
         "github.com",
@@ -468,7 +486,7 @@ pub fn release_from_github_platform(
         },
     };
     validate_asset(&update.asset)?;
-    if update.asset.name != platform.name(&latest.to_string()) {
+    if update.asset.name != expected_name {
         return Err("The installer does not match the release version".into());
     }
     Ok(Some(update))
@@ -694,6 +712,48 @@ pub async fn check_gitee(
 #[cfg(test)]
 mod mobile_tests {
     use super::*;
+
+    #[test]
+    fn ios_selects_exact_release_asset_and_verifies_github_download() {
+        use sha2::{Digest, Sha256};
+        let bytes = b"fixture IPA bytes";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let version = "0.10.0";
+        let name = Platform::IosArm64.name(version);
+        let mut metadata = serde_json::json!({
+            "tag_name": "v0.10.0", "body": "Release notes", "draft": false, "prerelease": false,
+            "assets": [{"id": 71, "name": Platform::AndroidArm64.name(version), "size": 123,
+                "browser_download_url": "https://github.com/TortoTech/torto/releases/download/v0.10.0/Torto-0.10.0-android-arm64-v8a.apk"}]
+        });
+        let check = |value: &serde_json::Value, current| {
+            release_from_github_platform(serde_json::from_value(value.clone()).unwrap(), current, Platform::IosArm64)
+        };
+        assert!(check(&metadata, "0.9.0").unwrap().is_none());
+        metadata["assets"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": 72, "name": name, "size": bytes.len(), "digest": format!("sha256:{sha256}"),
+            "browser_download_url": format!("https://github.com{RELEASE_DOWNLOAD_PREFIX}v{version}/{name}")
+        }));
+        assert!(check(&metadata, version).unwrap().is_none());
+        let release = check(&metadata, "0.9.0").unwrap().unwrap();
+        assert_eq!(release.asset.name, name);
+        assert_eq!(release.asset.github_asset_id, Some(72));
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut attempts = Vec::new();
+        let downloaded = runtime.block_on(download_with_fallback(&release.asset, |url| {
+            attempts.push(url);
+            std::future::ready(if attempts.len() == 1 { Ok(vec![0; bytes.len()]) } else { Ok(bytes.to_vec()) })
+        })).unwrap();
+        assert_eq!(downloaded, bytes);
+        assert_eq!(attempts, [github::TORTO.asset_url(72), release.asset.url.clone()]);
+        let mut attempts = 0;
+        assert!(runtime.block_on(download_with_fallback(&release.asset, |_| {
+            attempts += 1;
+            std::future::ready(Ok(vec![0; bytes.len()]))
+        })).is_err());
+        assert_eq!(attempts, 2);
+        metadata["assets"][1]["digest"] = serde_json::Value::Null;
+        assert!(check(&metadata, "0.9.0").is_err());
+    }
     #[test]
     fn android_releases_require_the_exact_abi_name_and_digest() {
         let json = serde_json::json!({"tag_name":"v0.10.0","body":"notes","draft":false,"prerelease":false,"assets":[{"id":72,"name":"Torto-0.10.0-android-arm64-v8a.apk","size":100,"digest":format!("sha256:{}","a".repeat(64)),"browser_download_url":"https://github.com/TortoTech/torto/releases/download/v0.10.0/Torto-0.10.0-android-arm64-v8a.apk"}]});

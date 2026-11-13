@@ -13,6 +13,8 @@ fn platform(abi: &str) -> Result<updates::Platform> {
     match abi {
         "arm64-v8a" => Ok(updates::Platform::AndroidArm64),
         "x86_64" => Ok(updates::Platform::AndroidX64),
+        #[cfg(any(target_os = "ios", feature = "ios-interop"))]
+        "ios-arm64" => Ok(updates::Platform::IosArm64),
         _ => Err(error("此设备没有对应的安装包")),
     }
 }
@@ -25,16 +27,22 @@ impl MobileCore {
         source: String,
     ) -> Result<Option<AppUpdate>> {
         work(move || {
+            let platform = platform(&abi)?;
             let source = match source.as_str() {
                 "automatic" => updates::UpdateSource::Automatic,
                 "github" => updates::UpdateSource::Github,
                 "gitee" => updates::UpdateSource::Gitee,
                 _ => return Err(error("更新来源无效")),
             };
+            if platform == updates::Platform::IosArm64
+                && !matches!(source, updates::UpdateSource::Github)
+            {
+                return Err(error("iOS 更新只使用 GitHub"));
+            }
             let found = runtime()
                 .block_on(updates::check_release(
                     current.split('-').next().unwrap_or(&current),
-                    platform(&abi)?,
+                    platform,
                     source,
                 ))
                 .map_err(error)?;
@@ -68,8 +76,12 @@ impl MobileCore {
                 return Err(error("更新元数据过大"));
             }
             let release: updates::UpdateRelease = serde_json::from_str(&token).map_err(error)?;
-            if release.asset.name != platform(&abi)?.name(&release.version) {
+            let platform = platform(&abi)?;
+            if release.asset.name != platform.name(&release.version) {
                 return Err(error("安装包与设备不匹配"));
+            }
+            if platform == updates::Platform::IosArm64 && release.asset.github_asset_id.is_none() {
+                return Err(error("iOS 更新缺少 GitHub 附件信息"));
             }
             let progress = request.clone();
             let result = runtime()

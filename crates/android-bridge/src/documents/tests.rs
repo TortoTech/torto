@@ -169,6 +169,24 @@ pub(crate) async fn image_reference_preview(core: &Arc<MobileCore>, root: &std::
                             Ok(())
                         })
                         .unwrap();
+                    let image_target = reader.with(|s| {
+                        Ok(s.document.as_ref().unwrap().pages.iter().enumerate().find_map(|(index, page)| {
+                            page.image_bounds().map(|bounds| (
+                                index as u32,
+                                ((bounds.x0 + bounds.x1) / 2.) as f32,
+                                ((bounds.y0 + bounds.y1) / 2.) as f32,
+                            ))
+                        }).unwrap())
+                    }).unwrap();
+                    let image = reader.clone().document_activate(
+                        preview.id.clone(), image_target.0, image_target.1, image_target.2,
+                    ).await.unwrap();
+                    assert_eq!(image.kind, "image");
+                    assert!(image.media.is_some());
+                    reader.with(|s| {
+                        assert_eq!(s.document.as_ref().unwrap().id, preview.id, "tapping a raster leaves its parent document open");
+                        Ok(())
+                    }).unwrap();
                     let page = &preview.page;
                     let mut left = page.width();
                     let mut right = 0;

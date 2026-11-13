@@ -1,4 +1,4 @@
-//! Android's typed application boundary. Parsing, layout and navigation remain Rust-owned.
+//! Typed mobile application boundary. Parsing, layout and navigation remain Rust-owned.
 use anyrender::ImageRenderer;
 use rebook_app_core::library::LocalLibrary;
 use rebook_layout::{LayoutViewport, ReaderStyle, SpreadMode, TypesettingMode};
@@ -18,6 +18,8 @@ mod cloud;
 mod documents;
 mod feedback;
 mod interactions;
+#[cfg(any(target_os = "ios", feature = "ios-interop"))]
+mod ios;
 mod maintenance;
 mod mobile_source;
 mod pixels;
@@ -47,7 +49,7 @@ fn error(e: impl std::fmt::Display) -> CoreError {
 }
 
 // UniFFI futures do not implicitly enter a Tokio runtime. All work is explicitly
-// submitted here; CPU/file operations never execute on Kotlin's calling thread.
+// submitted here; CPU/file operations never execute on the UI calling thread.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
