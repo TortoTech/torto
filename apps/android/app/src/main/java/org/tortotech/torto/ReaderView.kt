@@ -29,6 +29,7 @@ import kotlin.math.roundToInt
 /** Touch previews translate retained content; committed focus stops update native state. */
 class ReaderView(context: Context) : View(context) {
     var animateOpening=false
+    var embeddedInScrollContainer=false
     var onMotion: ((Boolean) -> Unit)? = null
     var onContentLoading: ((Boolean) -> Unit)? = null
     var onReadingGesture: (() -> Unit)? = null
@@ -121,6 +122,7 @@ class ReaderView(context: Context) : View(context) {
     private val accessibility = object : ExploreByTouchHelper(this) {
         override fun onPopulateNodeForHost(node: AccessibilityNodeInfoCompat) {
             super.onPopulateNodeForHost(node)
+            if(embeddedInScrollContainer)return
             node.isScrollable = true
             node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_FORWARD)
             node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_BACKWARD)
@@ -323,6 +325,7 @@ class ReaderView(context: Context) : View(context) {
         override fun onScroll(a:MotionEvent?,b:MotionEvent,dx:Float,dy:Float):Boolean {
             val current=frame ?: return false
             if(selecting||a==null)return false
+            if(embeddedInScrollContainer)return false
             if(gestureAxis==0)gestureAxis=if(abs(b.x-a.x)>abs(b.y-a.y))1 else 2
             if(!reportedGesture&&(current.info.isScroll||abs(b.x-a.x)>abs(b.y-a.y))){reportedGesture=true;onReadingGesture?.invoke()}
             if(!current.info.isScroll){

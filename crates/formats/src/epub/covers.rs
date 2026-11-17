@@ -39,6 +39,26 @@ pub(super) fn candidates(
                 push(href.resource_url());
             }
         }
+        // Some EPUB 2 publishers point the guide straight at the image,
+        // using a vendor cover type rather than a manifest cover property.
+        for reference in doc.descendants().filter(|n| n.has_tag_name("reference")) {
+            if !token_attribute(reference, "type").iter().any(|kind| {
+                matches!(kind.to_ascii_lowercase().as_str(),
+                    "cover" | "other.ms-coverimage-standard")
+            }) {
+                continue;
+            }
+            if let Some(href) = attribute_local(reference, "href")
+                .and_then(|href| base.resolve(href).ok())
+                .map(|href| href.resource_url())
+                && (guess_media_type(href.path()).starts_with("image/")
+                    || package.manifest.values().any(|item| {
+                        item.href == href && item.media_type.starts_with("image/")
+                    }))
+            {
+                push(href);
+            }
+        }
     }
     if allow_names {
         for item in package

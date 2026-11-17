@@ -54,7 +54,7 @@ pub enum HtmlError {
 }
 
 /// Publication-level semantic hints that cannot be derived reliably from one HTML resource.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default)]
 pub struct SectionParseHints<'a> {
     /// Reader-owned page spacing replaces body margins, leaving child styles intact.
     pub ignore_body_margins: bool,
@@ -65,7 +65,11 @@ pub struct SectionParseHints<'a> {
     pub ancestor_targets: &'a [PublicationUrl],
     /// Explicit TOC destinations must never be absorbed into a media caption.
     pub heading_targets: &'a [PublicationUrl],
+    /// On-demand access to adjacent content referenced by legacy footnote links.
+    pub linked_footnote_document: Option<&'a dyn Fn(&PublicationUrl) -> Option<String>>,
 }
+
+mod linked_footnotes;
 
 fn classify_footnote_links(
     document: &Document<'_>,
@@ -374,7 +378,10 @@ pub fn parse_section_with_resource_metadata(
         .descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "body")
         .unwrap_or_else(|| document.root_element());
-    let footnote_links = classify_footnote_links(&document, &descriptor.href);
+    let mut footnote_links = classify_footnote_links(&document, &descriptor.href);
+    if let Some(load) = hints.linked_footnote_document {
+        linked_footnotes::classify(&document, &descriptor.href, load, &mut footnote_links);
+    }
     #[cfg(debug_assertions)]
     let links_finished = profile_started.elapsed();
     let mut parser = ReadingIrParser::new(

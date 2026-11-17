@@ -35,29 +35,16 @@ impl TouchAction {
     }
 }
 pub(crate) fn rich_note(s: &ReaderState, target: &PublicationUrl, marker: &str) -> String {
-    let markup = s
+    let unified = s.session.style().typesetting.mode == rebook_layout::TypesettingMode::Unified;
+    s
         .source
         .book()
         .sections
         .iter()
         .position(|p| p.href.path() == target.path())
         .and_then(|i| s.source.parse_section(i).ok())
-        .and_then(|section| text::focus_footnote_markdown_in_section(&section, target))
-        .unwrap_or_default();
-    let marker = marker.trim();
-    let marker = if markup.starts_with(marker) {marker} else {marker.trim_matches(['[',']'])};
-    let explicit_marker = !marker.is_empty()
-        && markup
-            .strip_prefix(marker)
-            .and_then(|s| s.chars().next())
-            .is_some_and(|c| {
-                c.is_whitespace() || matches!(c, '.' | '．' | '，' | '、' | ')' | '）' | ']' | '】')
-            });
-    if explicit_marker {
-        text::normalize_resolved_footnote_text(&markup, marker).unwrap_or(markup)
-    } else {
-        markup
-    }
+        .and_then(|section| text::focus_footnote_markdown_in_section(&section, target, marker, unified))
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]

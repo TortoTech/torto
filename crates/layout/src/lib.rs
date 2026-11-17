@@ -4664,6 +4664,16 @@ enum SemanticScriptClass {
     Neutral,
 }
 
+/// Apply the unified reader's emphasis to a translated note before it is
+/// serialized for a popup. Keep the popup's own spacing and raw-note styles.
+pub fn apply_translated_note_emphasis(content: &mut Vec<Inline>) {
+    if let Some(language) = content.iter().flat_map(Inline::text_runs)
+        .find_map(|run| run.style.display_writing_system)
+    {
+        resolve_semantic_inline_presentation(content, language);
+    }
+}
+
 fn resolve_semantic_inline_presentation(
     content: &mut Vec<Inline>,
     fallback_writing_system: WritingSystem,
@@ -5418,11 +5428,12 @@ fn prepare_inline_content(
     let mut spans = Vec::new();
     let mut inline_images = Vec::new();
     let mut next_footnote_reference_group = 1_u32;
-    let numbered_notes = if focus_footnote_icons && unified_math {
+    let footnote_groups = if focus_footnote_icons {
         paragraph_footnotes(block)
     } else {
         Vec::new()
     };
+    let mut footnote_groups = footnote_groups.iter().enumerate().peekable();
     let prefix = if block.style.authored_list_marker.is_some() {
         String::new()
     } else {
@@ -5485,13 +5496,15 @@ fn prepare_inline_content(
                     text.extend(std::iter::repeat_n('\u{2060}', run.text.chars().count()));
                     continue;
                 }
-                let numbered_note = numbered_notes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, range)| range.contains(&inline_index));
-                if numbered_note.is_some_and(|(_, range)| range.start != inline_index) {
+                while footnote_groups.peek().is_some_and(|(_, range)| range.end <= inline_index) {
+                    footnote_groups.next();
+                }
+                let footnote_group = footnote_groups.peek().copied()
+                    .filter(|(_, range)| range.contains(&inline_index));
+                if footnote_group.is_some_and(|(_, range)| range.start != inline_index) {
                     continue;
                 }
+                let numbered_note = footnote_group.filter(|_| unified_math);
                 if run.style.inline_citation != 0
                     && inline_index > 0
                     && matches!(&block.content[inline_index-1], Inline::Text(previous) if previous.style.inline_citation == run.style.inline_citation)
@@ -5520,15 +5533,7 @@ fn prepare_inline_content(
                 if style.color == Rgba::BLACK {
                     style.color = fallback_color;
                 }
-                let linked_footnote_reference = run
-                    .link
-                    .as_ref()
-                    .is_some_and(|target| target.fragment().is_some())
-                    && (run.style.link_role == LinkRole::FootnoteReference
-                        || (run.style.link_role == LinkRole::Normal
-                            && run.style.baseline == TextBaseline::Superscript));
-                let footnote_reference = focus_footnote_icons
-                    && (run.style.inline_role == InlineRole::Footnote || linked_footnote_reference);
+                let footnote_reference = footnote_group.is_some();
                 let website_group = 0x4000_0000 | next_footnote_reference_group;
                 if website {
                     let original: String = block.content[inline_index..].iter().take_while(|inline| matches!(inline,Inline::Text(r) if r.link==run.link && r.style.inline_citation==0 && r.style.inline_role==InlineRole::Normal && r.style.link_role==LinkRole::Normal)).filter_map(|inline|match inline {Inline::Text(r)=>Some(r.text.as_str()),_=>None}).collect();
@@ -5579,18 +5584,12 @@ fn prepare_inline_content(
                     style.baseline = TextBaseline::Superscript;
                     style.bold = false;
                     style.italic = false;
-                } else if footnote_reference {
-                    if let Some((index, range)) = numbered_note {
-                        let original: String = block.content[range.clone()]
-                            .iter()
-                            .filter_map(|inline| {
-                                if let Inline::Text(run) = inline {
-                                    Some(run.text.as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
+                } else if let Some((index, range)) = footnote_group {
+                    let original: String = block.content[range.clone()].iter()
+                        .flat_map(Inline::text_runs)
+                        .map(|run| run.text.as_str())
+                        .collect();
+                    if unified_math {
                         let number = if run.style.footnote_number == 0 {
                             index as u32 + 1
                         } else {
@@ -5620,7 +5619,7 @@ fn prepare_inline_content(
                         style.bold = false;
                         style.italic = false;
                     } else {
-                        text.push_str(&footnote_icon_placeholder(&run.text));
+                        text.push_str(&footnote_icon_placeholder(&original));
                     }
                 } else {
                     text.push_str(&run.text);
@@ -7545,6 +7544,35 @@ mod tests {
                 .all(|span| span.footnote_reference_group == 0)
         );
         assert_eq!(classic_text, "123[4][5]inline note");
+    }
+
+    #[test]
+    fn a_split_footnote_marker_reserves_one_indicator_in_either_mode() {
+        let href = rebook_publication::PublicationUrl::parse("notes.xhtml#note-4").unwrap();
+        let text = |value: &str, baseline, link| Inline::Text(TextRun {
+            text: value.to_owned(),
+            style: TextStyle { baseline, link_role: LinkRole::FootnoteReference, ..Default::default() },
+            link: Some(link),
+        });
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                text(" ", TextBaseline::Normal, href.clone()),
+                text("[4]", TextBaseline::Superscript, href.clone()),
+                text(" ", TextBaseline::Normal, href),
+                text(" ", TextBaseline::Normal, rebook_publication::PublicationUrl::parse("notes.xhtml#stray").unwrap()),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+        for unified in [false, true] {
+            let (value, spans, _, _, _, _, _) = prepare_inline_content(
+                &block, Rgba::BLACK, &ReaderTypography::default(), 320.0,
+                &resvg::usvg::Options::default(), true, unified, false, &[], &mut [], None,
+            );
+            assert_eq!(spans.iter().filter(|span| span.footnote_reference_group != 0).count(), 1);
+            assert_eq!(value.chars().count(), 6);
+        }
     }
 
     #[test]

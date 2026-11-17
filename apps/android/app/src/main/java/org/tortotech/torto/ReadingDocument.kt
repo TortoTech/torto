@@ -81,7 +81,10 @@ private data class DocumentDrag(val document:DocumentFrame,val x:Float,val y:Flo
                             view.onHandleStart={handle=it}
                             view.onHandleMove={x,y->drags.trySend(DocumentDrag(document,x,y,x,y,handle))}
                             view.onHandleEnd={handle=null}
-                            view.onTurn={forward->scope.launch {list.animateScrollToItem((index+1+if(forward)1 else -1).coerceIn(1,initial.total.toInt()))}}
+                            view.embeddedInScrollContainer=interaction.kind=="note"
+                            view.onTurn=if(view.embeddedInScrollContainer)null else {forward->scope.launch {
+                                list.animateScrollToItem((index+1+if(forward)1 else -1).coerceIn(1,initial.total.toInt()))
+                            };Unit}
                             view.present(document.frame,selected?.takeIf {it.page==document.index}?.text)
                         },modifier=Modifier.fillMaxSize())
                         selected?.takeIf {it.page==document.index&&handle==null}?.let {selection->
