@@ -3,12 +3,12 @@ use super::*;
 #[test]
 fn replacement_fidelity_is_required_and_unsafe_text_or_latex_is_terminal() {
     let item = json!({"image_id":0,"status":"recognized_text","text":"t = 0 sec",
-        "literal":true,"latex":null,"equation_number":null,"table_html":null});
+        "literal":true,"latex":null,"equation_number":null,"table_html":null,"chart_trace":null});
     assert!(parse(&json!({"results":[item.clone()]}).to_string(), &[0]).is_empty());
     let mut unsafe_text = item;
     unsafe_text["replacement_safe"] = json!(false);
     let unsafe_math = json!({"image_id":1,"status":"recognized","replacement_safe":false,
-        "text":null,"literal":true,"latex":"\\text{t = 0 sec}","equation_number":null,"table_html":null});
+        "text":null,"literal":true,"latex":"\\text{t = 0 sec}","equation_number":null,"table_html":null,"chart_trace":null});
     let value = json!({"results":[unsafe_text,unsafe_math]});
     let schema = options();
     assert!(
@@ -43,6 +43,7 @@ fn complete_image_response(mut value: Value) -> Value {
                     .or_insert(Value::Bool(true));
                 object.entry("text").or_insert(Value::Null);
                 object.entry("table_html").or_insert(Value::Null);
+                object.entry("chart_trace").or_insert(Value::Null);
                 object.entry("literal").or_insert(Value::Bool(false));
             }
         }
@@ -153,7 +154,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             assert!(!instructions.contains("g=groups") && !instructions.contains("pr=proposal"));
             let status = &body["response_format"]["json_schema"]["schema"]["properties"]["r"]["items"]
                 ["properties"]["ss"];
-            assert_eq!(status["enum"], json!(["ok", "tx", "no", "u", "ut", "tb"]));
+            assert_eq!(status["enum"], json!(["ok", "tx", "no", "u", "ut", "tb", "tc"]));
             for meaning in [
                 "ok=recognized",
                 "tx=recognized_text",
@@ -161,6 +162,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
                 "u=unreadable",
                 "ut=unreadable_text",
                 "tb=recognized_table",
+                "tc=recognized_chart",
             ] {
                 assert!(status["description"].as_str().unwrap().contains(meaning));
             }

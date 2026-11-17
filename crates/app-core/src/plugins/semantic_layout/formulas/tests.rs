@@ -110,6 +110,7 @@ fn literal_radicals_strokes_and_punctuation_are_text_without_normalization() {
         "⼀",
     ] {
         let response = Response {
+            chart_trace: None,
             table_html: None,
             revision: TEXT_REVISION,
             replacement_safe: true,
@@ -133,6 +134,7 @@ fn text_results_preserve_images_and_do_not_become_formulas() {
     let original = section(vec![image("text")]);
     let candidate = candidates(&original).pop().unwrap();
     let response = Response {
+        chart_trace: None,
         table_html: None,
         revision: TEXT_REVISION,
         replacement_safe: true,
@@ -300,6 +302,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
     }
     assert!(
         Response {
+            chart_trace: None,
             table_html: None,
             revision: TEXT_REVISION,
             replacement_safe: true,
@@ -316,6 +319,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
     );
     assert!(
         Response {
+            chart_trace: None,
             table_html: None,
             revision: TEXT_REVISION,
             replacement_safe: true,
@@ -696,6 +700,7 @@ fn table_results_require_safe_complete_grid_and_preserve_captioned_candidates() 
     let original = section(vec![image("table")]);
     let href = candidates(&original)[0].image.href.clone();
     let mut response = Response {
+        chart_trace: None,
         table_html: Some("<table><tr><th rowspan='2'>Category</th><th colspan='2'>Value</th></tr><tr><th>2023</th><th>2024</th></tr><tr><td>A</td><td>-1.2</td><td>3.4%</td></tr></table>".into()),
         revision: TEXT_REVISION, replacement_safe: true, text: None, literal: false, transient: false,
         status: "recognized_table".into(), latex: None, equation_number: None,

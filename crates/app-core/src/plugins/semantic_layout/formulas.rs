@@ -9,7 +9,7 @@ pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
 pub(super) const TRANSCRIBE_PROMPT: &str = include_str!("formulas/transcribe.md");
 const SYMBOL_PROMPT: &str = include_str!("formulas/symbols.md");
 const REPLACEMENT_PROMPT: &str = include_str!("formulas/replacement.md");
-pub(super) const TEXT_REVISION: u32 = 8;
+pub(super) const TEXT_REVISION: u32 = 9;
 mod batch;
 
 // Keep the chapter/group identity stable. Image policy has its own revision and
@@ -34,13 +34,14 @@ pub(super) fn chapter_cache_options() -> Value {
 fn current_image_options() -> Value {
     let item = json!({"type":"object","additionalProperties":false,"properties":{
         "image_id":{"type":"integer","description":"Copy an ID from requested_ids. IDs need not be consecutive."},
-        "status":{"type":"string","enum":["recognized","recognized_text","not_formula","unreadable","unreadable_text","recognized_table"],"description":"recognized: the whole image is mathematics or a formal rule. recognized_text: the whole meaningful image is faithful Unicode text, including letters or script examples. recognized_table: a complete legible data table, including merged headers and continued tables. not_formula: diagrams, plots, photos, decorations or mixed visual/text images. unreadable: formula details are unclear; unreadable_text: text details are unclear or unsupported. Never infer characters from the surrounding words."},
+        "status":{"type":"string","enum":["recognized","recognized_text","not_formula","unreadable","unreadable_text","recognized_table","recognized_chart"],"description":"recognized: the whole image is mathematics or a formal rule. recognized_text: the whole meaningful image is faithful Unicode text, including letters or script examples. recognized_table: a complete legible data table, including merged headers and continued tables. recognized_chart: a legible simple standalone line chart; not_formula: complex diagrams, photos, decorations or mixed visual/text images. unreadable: formula details are unclear; unreadable_text: text details are unclear or unsupported. Never infer characters from the surrounding words."},
+        "chart_trace":image_charts::schema(),
         "table_html":{"type":["string","null"],"description":"For recognized_table only, a complete faithful XHTML table using table/thead/tbody/tfoot/tr/th/td/caption/br with rowspan and colspan. Preserve all visible cells, merged/multilevel headers, numbers, units, notes and continuation labels. Escape XML characters; close br as <br/>. No style, images, links, scripts or Markdown. For other statuses null."},
         "text":{"type":["string","null"],"description":"Exact visible Unicode text for recognized_text only; otherwise null. Preserve case, accents, combining characters, punctuation and meaningful spaces. No output wrappers, Markdown fences, explanation or guessed characters. Literal source-code XML/HTML must stay exactly as seen; preserve indentation and line breaks."},
         "literal":{"type":"boolean","description":"For recognized_text, true for source code, character/script/pronunciation examples and literal symbols which must remain unchanged in translation; false for ordinary prose/words. Otherwise false."},
         "latex":{"type":["string","null"],"description":"Transcribe faithful supported LaTeX without dollar delimiters or Markdown. For a negative status, return null. Use standard math commands, text operators and matrix/aligned environments. Exclude custom macros, packages, images, URLs and executable commands. Encode each command backslash as two JSON backslashes; encode a row separator as four. Do not drop backslashes or turn command prefixes into control characters."},
         "equation_number":{"type":["string","null"],"description":"Copy only a separate equation number visible in this image. Exclude it from latex. Do not infer it from context. If absent or the status is negative, return null."}
-    },"required":["image_id","status","latex","equation_number","text","literal","table_html"]});
+    },"required":["image_id","status","latex","equation_number","text","literal","table_html","chart_trace"]});
     json!({"temperature":0.0,"output_schema":{
             "type":"object","additionalProperties":false,
             "properties":{"results":{"type":"array","description":"Return one result per requested ID, including negative results. Use an array for a single image too. IDs must match exactly; order is unrestricted.","items":item}},
@@ -209,6 +210,8 @@ struct Response {
     #[serde(default)]
     table_html: Option<String>,
     #[serde(default)]
+    chart_trace: Option<image_charts::Trace>,
+    #[serde(default)]
     revision: u32,
     #[serde(default)]
     replacement_safe: bool,
@@ -225,6 +228,15 @@ struct Response {
 
 impl Response {
     fn formula(&self) -> Result<Option<ImageFormula>, String> {
+        if self.status == "recognized_chart" {
+            if !self.replacement_safe { return Ok(None); }
+            if self.text.is_some() || self.table_html.is_some() || self.latex.is_some()
+                || self.equation_number.is_some() || self.literal
+                || self.chart_trace.as_ref().and_then(image_charts::Trace::svg).is_none()
+            { return Err("Invalid line chart".into()); }
+            return Ok(None);
+        }
+        if self.chart_trace.is_some() { return Err("Unexpected line chart".into()); }
         if self.status == "recognized_table" {
             if !self.replacement_safe {
                 return Ok(None);
@@ -356,6 +368,12 @@ fn record(
     if response.transient {
         *failed += 1;
     }
+    if response.replacement_safe && response.status == "recognized_chart"
+        && response.formula().is_ok()
+        && let Some(svg) = response.chart_trace.as_ref().and_then(image_charts::Trace::svg)
+    {
+        annotations.push(Annotation::ImageChart { href: href.clone(), svg });
+    }
     if response.replacement_safe
         && response.status == "recognized_table"
         && response.formula().is_ok()
@@ -435,7 +453,24 @@ async fn flush(
                 vec![None; batch.len()]
             }
         };
-    for (item, result) in batch.into_iter().zip(results) {
+    for (item, mut result) in batch.into_iter().zip(results) {
+        if let Some(response) = result.as_mut()
+            && let Some(trace) = response.chart_trace.take()
+        {
+            let encoded = item.url.strip_prefix("data:image/png;base64,").unwrap_or_default().to_owned();
+            let checked = if !item.candidate.inline {
+                tokio::task::spawn_blocking(move || {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+                    let image = image::load_from_memory(&bytes).ok()?.into_luma8();
+                    trace.matches_raster(&image).then_some(trace)
+                }).await.ok().flatten()
+            } else { None };
+            response.chart_trace = checked;
+            if response.chart_trace.is_none() {
+                response.status = "not_formula".into();
+                response.replacement_safe = false;
+            }
+        }
         if let Some(response) = &result
             && !response.transient
             && let Some(path) = item.path
@@ -652,6 +687,11 @@ pub(super) fn compose(blocks: &mut [Block], href: &PublicationUrl, formula: Opti
 pub(super) fn validate_annotations(section: &Section, annotations: &[Annotation]) -> bool {
     let candidates = candidates(section);
     annotations.iter().all(|a| match a {
+        Annotation::ImageChart { href, svg } => {
+            candidates.iter().any(|c| !c.inline && &c.image.href == href)
+                && svg.len() <= 32768 && svg.starts_with("<svg ")
+                && resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).is_ok()
+        }
         Annotation::ImageTable { href, table } => {
             candidates.iter().any(|c| &c.image.href == href)
                 && rebook_html::validate_recognized_table(table).is_ok()

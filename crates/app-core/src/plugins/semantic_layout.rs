@@ -27,6 +27,9 @@ mod formulas;
 mod heading_policy;
 use heading_policy::{presentation_cache_paths, read_presentation_cache};
 mod image_tables;
+mod image_charts;
+mod passage_charts;
+pub use passage_charts::PassageChart;
 mod log;
 mod normalize;
 mod text_formulas;
@@ -154,6 +157,7 @@ enum Annotation {
         sources: Vec<SourceRange>,
         credit: Option<SourceRange>,
     },
+    ImageChart { href: PublicationUrl, svg: String },
     ImageTable {
         href: PublicationUrl,
         table: rebook_publication::TableBlock,
@@ -268,6 +272,7 @@ pub struct SemanticLayoutSource {
     chart_fonts: Arc<[peniko::Blob<u8>]>,
     formula_note_views: RwLock<HashSet<String>>,
     chart_views: RwLock<HashSet<String>>,
+    passage_charts: RwLock<passage_charts::Views>,
     unified_citations: std::sync::atomic::AtomicBool,
     heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
     fingerprints: RwLock<HashMap<usize, (u64, String)>>,
@@ -314,6 +319,7 @@ impl SemanticLayoutSource {
             chart_fonts: fonts,
             formula_note_views: RwLock::new(HashSet::new()),
             chart_views: RwLock::new(HashSet::new()),
+            passage_charts: Default::default(),
             unified_citations: std::sync::atomic::AtomicBool::new(false),
             heuristic_cache: RwLock::new(HashMap::new()),
             fingerprints: RwLock::new(HashMap::new()),
@@ -454,6 +460,7 @@ impl SemanticLayoutSource {
     }
 
     pub fn clear(&self) {
+        self.clear_passage_charts();
         if let Ok(mut views) = self.formula_note_views.write() {
             views.clear();
         }
@@ -671,6 +678,7 @@ impl BookSource for SemanticLayoutSource {
                 );
                 citations::apply_heuristic_fallback(&mut section);
             }
+            self.apply_passage_charts(&mut section.blocks);
             return Ok(section);
         }
         let mut recognition = self
@@ -760,6 +768,7 @@ impl BookSource for SemanticLayoutSource {
             );
             citations::apply_heuristic_fallback(&mut section);
         }
+        self.apply_passage_charts(&mut section.blocks);
         Ok(section)
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -1201,7 +1210,8 @@ fn load_recognition_with_hash(
 
 fn image_annotation_href(annotation: &Annotation) -> Option<&PublicationUrl> {
     match annotation {
-        Annotation::ImageTable { href, .. }
+        Annotation::ImageChart { href, .. }
+        | Annotation::ImageTable { href, .. }
         | Annotation::ImageText { href, .. }
         | Annotation::ImageFormula { href, .. }
         | Annotation::UnreadableFormula { href } => Some(href),
@@ -1262,7 +1272,8 @@ fn load_recognition_inner(
                     | Annotation::FormulaNotes { .. }
                     | Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
-                    | Annotation::ImageTable { .. }
+                    | Annotation::ImageChart { .. }
+        | Annotation::ImageTable { .. }
                     | Annotation::ImageText { .. }
                     | Annotation::ImageFormula { .. }
                     | Annotation::UnreadableFormula { .. }
@@ -1274,7 +1285,8 @@ fn load_recognition_inner(
                 | Annotation::FormulaNotes { .. }
                 | Annotation::InlineCitations { .. }
                 | Annotation::TextFormulas { .. }
-                | Annotation::ImageTable { .. }
+                | Annotation::ImageChart { .. }
+        | Annotation::ImageTable { .. }
                 | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
                 | Annotation::UnreadableFormula { .. } => {
@@ -2434,6 +2446,10 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         );
         return;
     }
+    if let Annotation::ImageChart { href, svg } = annotation {
+        image_charts::compose(blocks, href, svg);
+        return;
+    }
     if let Annotation::ImageTable { href, table } = annotation {
         image_tables::compose(blocks, href, table);
         return;
@@ -2495,6 +2511,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
+        | Annotation::ImageChart { .. }
         | Annotation::ImageTable { .. }
         | Annotation::ImageText { .. }
         | Annotation::ImageFormula { .. }
@@ -2586,6 +2603,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
+        | Annotation::ImageChart { .. }
         | Annotation::ImageTable { .. }
         | Annotation::ImageText { .. }
         | Annotation::ImageFormula { .. }

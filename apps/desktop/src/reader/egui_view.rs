@@ -2180,9 +2180,7 @@ impl DesktopReader {
                 self.toggle_current_focus_structure();
             }
             Some(4) => {
-                if let Some((source, _)) = self.current_focus_chart_control() {
-                    self.toggle_table_chart(ctx, &source);
-                }
+                self.visualize_current_block(ctx);
             }
             Some(_) => {}
             None => return false,
@@ -3528,7 +3526,9 @@ impl DesktopReader {
         reason = "the compact focus toolbar keeps its actions and editor transitions together"
     )]
     fn focus_actions_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
-        if !self.ui.focus_actions_visible {
+        let pending = self.focus_units.get(self.focus_unit_index)
+            .is_some_and(|unit| self.passage_chart_pending(&unit.range));
+        if !self.ui.focus_actions_visible && !pending {
             return;
         }
         let viewport = crate::ui::overlay_rect(ctx);
@@ -3552,7 +3552,7 @@ impl DesktopReader {
         };
         let chart_control = self.current_focus_chart_control();
         let mut y = focus_actions_overlay_y(note_open, anchor_y, viewport);
-        if !note_open && chart_control.is_some() {
+        if !note_open && (chart_control.is_some() || pending) {
             y = y.min((viewport.bottom() - 190.0).max(viewport.top() + 12.0));
         }
         let mut chat = false;
@@ -3602,7 +3602,9 @@ impl DesktopReader {
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
-                if let Some(draft) = self.annotation_note_draft.as_mut() {
+                if pending && !self.ui.focus_actions_visible {
+                    ui.add(crate::ui::LoadingSpinner::new());
+                } else if let Some(draft) = self.annotation_note_draft.as_mut() {
                     focus_assistant_frame(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
                         ui.set_width((width - 20.0).max(100.0));
                         match focus_annotation_editor(ui, draft, self.language) {
@@ -3636,6 +3638,8 @@ impl DesktopReader {
                             switch_chart = table_chart_toggle_button(
                                 ui, self.language, *active, Some(&self.shortcuts.focus_table_chart),
                             ).clicked();
+                        } else if pending {
+                            ui.add(crate::ui::LoadingSpinner::new());
                         }
                     });
                 }
@@ -3657,9 +3661,7 @@ impl DesktopReader {
             self.ui.focus_actions_visible = false;
             self.toggle_current_focus_structure();
         } else if switch_chart {
-            if let Some((source, _)) = chart_control {
-                self.toggle_table_chart(ctx, &source);
-            }
+            self.visualize_current_block(ctx);
         } else if save_note {
             let note = self
                 .annotation_note_draft
@@ -5599,6 +5601,34 @@ impl DesktopReader {
         self.refresh_semantic_layout();
         ctx.request_repaint();
         true
+    }
+
+    fn focus_passage_chart_target(&self) -> Option<(rebook_publication::SourceRange, usize)> {
+        if !self.is_focus_mode() || !self.focus_units_ready { return None; }
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        if self.semantic_source.passage_chart_control(&unit.range).is_none()
+            && (unit.is_image || unit.is_table || unit.text.trim().chars().take(16).count() < 16
+                || self.plugin_settings.semantic_layout_endpoint().is_err())
+        { return None; }
+        Some((unit.range.clone(), unit.position.section_index))
+    }
+
+    fn visualize_current_block(&mut self, ctx: &egui::Context) {
+        if let Some((source, _)) = self.current_focus_chart_control() {
+            self.toggle_table_chart(ctx, &source);
+        } else if let Some((source, index)) = self.focus_passage_chart_target() {
+            // Translation may arrive after an on-demand result. An active
+            // cache entry without a displayed image no longer matches the text.
+            let result_is_stale = self.semantic_source.passage_chart_control(&source) == Some(true)
+                && self.focus_units.get(self.focus_unit_index).is_some_and(|unit| !unit.is_image);
+            if !result_is_stale && self.semantic_source.toggle_passage_chart(&source) {
+                self.semantic_layout.presentation_anchor = Some(source);
+                self.refresh_semantic_layout();
+            } else {
+                self.queue_passage_chart(index, source);
+            }
+            ctx.request_repaint();
+        }
     }
 
     fn current_focus_chart_control(&self) -> Option<(rebook_publication::SourceRange, bool)> {

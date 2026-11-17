@@ -31,6 +31,8 @@ fn parse_results(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
     struct Item {
         #[serde(default)]
         table_html: Option<String>,
+        #[serde(default)]
+        chart_trace: Option<image_charts::Trace>,
         replacement_safe: bool,
         #[serde(default)]
         text: Option<String>,
@@ -76,6 +78,7 @@ fn parse_results(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
         };
         let response = Response {
             table_html: item.table_html,
+            chart_trace: item.chart_trace,
             revision: TEXT_REVISION,
             replacement_safe: item.replacement_safe,
             text: item.text,
@@ -90,18 +93,19 @@ fn parse_results(content: &str, ids: &[usize]) -> HashMap<usize, Response> {
             Err(_)
                 if matches!(
                     response.status.as_str(),
-                    "recognized" | "recognized_text" | "recognized_table"
+                    "recognized" | "recognized_text" | "recognized_table" | "recognized_chart"
                 ) =>
             {
                 Response {
                     table_html: None,
+                    chart_trace: None,
                     revision: TEXT_REVISION,
                     replacement_safe: false,
                     text: None,
                     literal: false,
                     status: if matches!(
                         response.status.as_str(),
-                        "recognized_text" | "recognized_table"
+                        "recognized_text" | "recognized_table" | "recognized_chart"
                     ) {
                         "unreadable_text"
                     } else {

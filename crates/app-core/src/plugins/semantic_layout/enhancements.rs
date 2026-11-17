@@ -247,14 +247,14 @@ impl SemanticLayoutSource {
         if !href.path().starts_with("torto-chart/") {
             return None;
         }
-        self.with_derived(|a| match a {
-            Annotation::TableChart { svg, .. } if chart_href(svg) == *href => Some(Resource {
+        self.passage_resource(href).or_else(|| self.with_derived(|a| match a {
+            Annotation::TableChart { svg, .. } | Annotation::ImageChart { svg, .. } if chart_href(svg) == *href => Some(Resource {
                 href: href.clone(),
                 media_type: "image/svg+xml".into(),
                 bytes: Arc::from(svg.as_bytes()),
             }),
             _ => None,
-        })
+        }))
     }
     pub(super) fn chart_raster(
         &self,

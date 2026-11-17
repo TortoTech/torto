@@ -411,7 +411,7 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             ),
             (
                 ShortcutAction::FocusTableChart,
-                language.text("可视化表格", "Visualize table"),
+                language.text("可视化当前块", "Visualize current block"),
             ),
             (
                 ShortcutAction::FocusImagePreview,

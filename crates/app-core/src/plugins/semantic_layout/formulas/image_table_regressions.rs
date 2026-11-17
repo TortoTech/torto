@@ -174,7 +174,7 @@ fn check(source: Arc<dyn BookSource>, original: Section, expected_images: usize)
                 assert!(pixels.height() > 240);
                 assert!(pixels.width() <= 1616 && pixels.height() <= 1616);
                 let inline = metadata["md"]["in"].as_bool().unwrap();
-                results.push(json!({"ii":metadata["ii"],"ss":if inline {"no"} else {"tb"},"rs":!inline,"th":if inline {Value::Null} else {json!(TABLE)},"t":null,"lt":false,"l":null,"n":null}));
+                results.push(json!({"ii":metadata["ii"],"ss":if inline {"no"} else {"tb"},"rs":!inline,"th":if inline {Value::Null} else {json!(TABLE)},"t":null,"lt":false,"l":null,"n":null,"chart_trace":null}));
                 images += 1;
             }
             let result = json!({"r":results});
