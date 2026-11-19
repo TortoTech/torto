@@ -59,7 +59,14 @@ class WhitespaceSelectionTest {
             assertEquals("A quick drag remains reading navigation",1,turns.get())
             assertEquals(before,selects.get())
         }finally {
-            instrumentation.runOnMainSync {if(created)view.cancelPendingNavigation();activity?.finish()}
+            instrumentation.runOnMainSync {
+                if (created) view.cancelPendingNavigation()
+                activity?.let {
+                    // Detach the reader before recycling the bitmap it still holds.
+                    it.setContentView(FrameLayout(it))
+                    it.finish()
+                }
+            }
             instrumentation.removeMonitor(monitor);bitmap?.recycle()
         }
     }

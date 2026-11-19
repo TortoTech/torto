@@ -411,7 +411,7 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             ),
             (
                 ShortcutAction::FocusTableChart,
-                language.text("可视化表格", "Visualize table"),
+                language.text("可视化当前块", "Visualize current block"),
             ),
             (
                 ShortcutAction::FocusImagePreview,
@@ -698,6 +698,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 }
             });
         } else {
+            #[cfg(target_os = "windows")]
             ui.label(
                 RichText::new(state.draft_language.text(
                     "更新由 Microsoft Store 管理。",
@@ -742,7 +743,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         ui.label(
             RichText::new(state.draft_language.text(
                 "当前平台暂不支持应用内自动更新。",
@@ -979,6 +980,9 @@ fn semantic_layout_rows(
     plugin_settings: &mut PluginSettings,
     model_options: &[ConfiguredModel],
 ) {
+    let decisions_available = plugin_settings.providers.iter()
+        .find(|provider| provider.id == plugin_settings.semantic_layout.provider)
+        .is_some_and(rebook_app_core::plugins::semantic_layout::supports_citation_decisions);
     let settings = &mut plugin_settings.semantic_layout;
     settings_row_label(ui, language.text("AI排版", "AI layout"));
     settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
@@ -1019,6 +1023,17 @@ fn semantic_layout_rows(
             );
         });
         ui.end_row();
+        if decisions_available {
+            settings_row_label(ui, language.text("文献引用预判（试验）", "Citation screening (experimental)"));
+            settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                toggle_switch(ui, &mut settings.citation_decisions);
+                settings_help_icon(ui, language.text(
+                    "批量验证文献引用候选。判别不确定时使用排版模型。",
+                    "Batch-check citation candidates. Uncertain batches use the layout model.",
+                ));
+            });
+            ui.end_row();
+        }
     }
 }
 

@@ -345,6 +345,12 @@ impl EpubPublication {
             "image/svg+xml" => "<html><body><img src=\"#\"/></body></html>".into(),
             _ => return Err(EpubError::Unsupported(format!("reflowable section media type: {}", descriptor.media_type))),
         };
+        let linked_document = |href: &PublicationUrl| {
+            let mime = self.media_types.get(href.path())?;
+            matches!(mime.as_str(), "application/xhtml+xml" | "text/html")
+                .then(|| self.archive.read_content_xml(&href.resource_url()).ok())
+                .flatten()
+        };
         let mut section = parse_section_with_resource_metadata(
             &xml,
             descriptor,
@@ -352,7 +358,11 @@ impl EpubPublication {
             |href| self.is_decorative_separator_image(href),
             |href| crate::html_context::image_dimensions(&self.archive.read(href).ok()?),
             |href| self.font_traits(href),
-            SectionParseHints { ignore_body_margins, ..self.html_context.hints(descriptor) },
+            SectionParseHints {
+                ignore_body_margins,
+                linked_footnote_document: Some(&linked_document),
+                ..self.html_context.hints(descriptor)
+            },
         )?;
         self.html_context.mark_note_references(&mut section);
         if let Some(hints) = self.toc_heading_hints.get(descriptor.href.path()) {
@@ -1858,6 +1868,51 @@ pub(crate) mod tests {
         assert!(source.cover_section().unwrap().is_some());
         let source = EpubPublication::open_bytes(minimal_epub()).unwrap();
         assert!(source.cover_page.is_none());
+    }
+
+    #[test]
+    fn reads_epub2_vendor_guide_cover_with_an_unrelated_image_name() {
+        let mut entries = minimal_entries();
+        let package = std::str::from_utf8(entries[2].1).unwrap()
+            .replace("id=\"cover\" href=\"Images/cover.png\" media-type=\"image/png\" properties=\"cover-image\"",
+                "id=\"coverimagestandard\" href=\"Images/cvi.png\" media-type=\"image/png\"")
+            .replace("</package>", "<guide><reference type=\"other.ms-coverimage-standard\" href=\"Images/cvi.png\"/></guide></package>");
+        entries[2].1 = package.as_bytes();
+        let image = png(200, 300);
+        entries[4] = ("OPS/Images/cvi.png", &image, CompressionMethod::Deflated);
+        let book = crate::open_bytes(zip_entries(&entries), "vendor-cover.epub").unwrap();
+        assert_eq!(book.book().cover.as_ref().unwrap().path(), "OPS/Images/cvi.png");
+        assert!(book.cover_bytes().is_some());
+    }
+
+    #[test]
+    fn cross_document_backlink_wraps_only_its_multiblock_footnote() {
+        let mut entries = minimal_entries();
+        let package = std::str::from_utf8(entries[2].1).unwrap()
+            .replace("</manifest>", "<item id=\"next\" href=\"Text/next.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>")
+            .replace("</spine>", "<itemref idref=\"next\"/></spine>");
+        entries[2].1 = package.as_bytes();
+        entries[5].1 = br#"<html><body><h1 id="start">Chapter</h1>
+            <p>Book text <a id="ref-b" href="next.xhtml#note-b"><sup>b</sup></a> continues.</p>
+            <p>Other text <a id="other" href="next.xhtml#ordinary">[2]</a>.</p></body></html>"#;
+        entries.push(("OPS/Text/next.xhtml", br#"<html><body>
+            <div class="fn"><a id="note-b" href="chapter.xhtml#ref-b">b</a>
+              <div>The body starts in a separate block.</div><p>A second paragraph.</p>
+            </div><p><a id="ordinary" href="chapter.xhtml#other">[3]</a> Unrelated paragraph.</p>
+            </body></html>"#, CompressionMethod::Deflated));
+        let source = EpubPublication::open_bytes(zip_entries(&entries)).unwrap();
+        let chapter = source.parse_section(0).unwrap();
+        let roles = chapter.blocks.iter().flat_map(Block::text_blocks)
+            .flat_map(|t| t.content.iter().flat_map(Inline::text_runs))
+            .filter(|r| r.link.is_some()).map(|r| r.style.link_role).collect::<Vec<_>>();
+        assert_eq!(roles, [rebook_publication::LinkRole::FootnoteReference, rebook_publication::LinkRole::Normal]);
+        let linked = source.parse_section(1).unwrap();
+        let [Block::Note(note), Block::Text(ordinary)] = linked.blocks.as_slice() else {
+            panic!("expected exactly one grouped note and an unrelated paragraph");
+        };
+        assert_eq!(note.kind, rebook_publication::NoteBlockKind::Definition);
+        assert!(note.blocks.len() >= 2);
+        assert_eq!(ordinary.kind, rebook_publication::TextBlockKind::Paragraph);
     }
 
     #[test]

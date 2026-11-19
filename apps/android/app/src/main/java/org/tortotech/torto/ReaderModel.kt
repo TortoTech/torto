@@ -276,10 +276,19 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         CloudRuntime.cancel()
         runOperation {val saved=core.saveCloudOptions(options,if(clearPassword)"" else password.takeIf {it.isNotBlank()});val services=core.serviceSettings();mutable.update {it.copy(cloud=saved,services=services)};withContext(Dispatchers.IO){CloudRuntime.schedule(getApplication());if(CloudRuntime.foreground)CloudRuntime.foreground(getApplication(),true)};done()}
     }
-    fun synchronize(){viewModelScope.launch {
-        try{val report=CloudRuntime.perform(getApplication(),CloudSyncTrigger.MANUAL);report?.summary?.let {summary->mutable.update {it.copy(notice="同步完成：上传 ${summary.uploaded} 本，下载 ${summary.downloaded} 本")}}}
-        catch(e:Exception){if(e !is CancellationException)mutable.update {it.copy(error=e.message)}}
-    }}
+    fun synchronize() {
+        viewModelScope.launch {
+            try {
+                val result = CloudRuntime.perform(getApplication(), CloudSyncTrigger.MANUAL)
+                if (result?.summary != null && result.error == null && result.retryAfterMs == null) {
+                    mutable.update { it.copy(notice = "同步完成") }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                mutable.update { it.copy(error = error.message) }
+            }
+        }
+    }
     fun applicationForeground(value:Boolean){
         CloudRuntime.foreground(getApplication(),value)
         DiagnosticLog.record(getApplication(),if(value)"app.foreground" else "app.background")

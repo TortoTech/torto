@@ -10,6 +10,7 @@ license.workspace = true
 rebook-publication = { path = "../publication" }
 roxmltree.workspace = true
 thiserror.workspace = true
+unicode-segmentation.workspace = true
 
 [lints]
 workspace = true

@@ -6,6 +6,8 @@ use rebook_publication::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod uppercase_headings;
+
 fn text(t: &TextBlock) -> String {
     t.content
         .iter()
@@ -351,6 +353,7 @@ impl TypographySource {
         }
         if !frontmatter(&self.inner.book().table_of_contents, &section.href) {
             recover_headings(&mut section, self.normalize);
+            uppercase_headings::recover(&mut section, self.normalize);
         }
         for block in &mut section.blocks {
             let Block::Text(t) = block else { continue };
@@ -561,6 +564,26 @@ mod tests {
                 .iter()
                 .all(|t| !t.kind.is_heading())
         );
+    }
+    #[test]
+    fn uppercase_subheadings_keep_anchors_and_leave_other_block_candidates_alone() {
+        let para = format!("<p>{}</p>", prose());
+        let raw = source("uppercase-headings", format!(
+            "<h1>Chapter One</h1>{para}<p id='power'>THE POWER OF POCKET MONEY</p>{para}
+             <p>SELFISHNESS OR SELF-SUFFICIENCY?</p>{para}<p>A COMPLETE QUESTION.</p>{para}
+             <p>1. KEEP THIS LIST ITEM</p>{para}<p>NOTES: SURVEY RESPONDENTS</p>{para}
+             <img src='missing.png'/><p>CHILDREN IN THE CLASSROOM</p>{para}
+             <blockquote><p>THIS IS AN AUTHORED QUOTE</p></blockquote>{para}
+             <p><a href='https://example.com'>FOLLOW THIS LINK</a></p>{para}
+             <h1>Chapter Two</h1>{para}<p>AN ISOLATED LINE</p>{para}"
+        ));
+        let before = raw.parse_section(0).unwrap();
+        let parsed = wrap(raw).parse_section(0).unwrap();
+        let titles = texts(&parsed).into_iter().filter(|t| t.kind == TextBlockKind::Heading(2))
+            .map(text).collect::<Vec<_>>();
+        assert_eq!(titles, ["THE POWER OF POCKET MONEY", "SELFISHNESS OR SELF-SUFFICIENCY?"]);
+        assert_eq!(before.anchors, parsed.anchors);
+        assert!(texts(&parsed).iter().any(|t| text(t) == "AN ISOLATED LINE" && !t.kind.is_heading()));
     }
     #[test]
     fn sampling_reads_at_most_five_sections_and_only_the_first_24_body_paragraphs() {

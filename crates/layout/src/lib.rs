@@ -9,6 +9,8 @@ mod deferred_tests;
 pub mod image_processing;
 pub mod linebreak;
 pub mod text_layout;
+mod drop_caps;
+mod authored_floats;
 pub mod timing;
 use text_layout::{Layout, PositionedLayoutItem};
 
@@ -31,6 +33,7 @@ mod note_spacing;
 mod raster_cache;
 mod semantic_lists;
 mod semantic_paragraphs;
+mod table_alignment;
 mod table_captions;
 mod text_figures;
 pub use table_captions::{Presentation as TablePresentation, presentation as table_presentation};
@@ -1765,7 +1768,23 @@ impl LayoutEngine {
         let layout_blocks: Vec<_> = numbered_blocks.iter().map(|b| b.as_ref()).collect();
         let list_insets = self.list_body_insets(&layout_blocks, &list_groups, reader_style);
         let mut block_index = 0;
+        let mut side_float: Option<authored_floats::Band> = None;
         while block_index < layout_blocks.len() {
+            if let Some(band) = &side_float
+                && (!band.active(&paginator) || !band.accepts(layout_blocks[block_index]))
+            {
+                band.settle(&mut paginator);
+                side_float = None;
+            }
+            if !unified_reflow && let Some(next) = layout_blocks.get(block_index + 1)
+                && let Some(band) = self.try_authored_float(
+                    &mut paginator, source, layout_blocks[block_index], next, reader_style, content_width,
+                )?
+            {
+                side_float = Some(band);
+                block_index += 1;
+                continue;
+            }
             if unified_reflow
                 && let (Some(Block::Image(image)), Some(Block::Text(caption))) = (
                     layout_blocks.get(block_index).copied(),
@@ -1818,6 +1837,19 @@ impl LayoutEngine {
                 continue;
             }
 
+            if let Some((combined, spans)) = authored_floats::join_label(&layout_blocks[block_index..]) {
+                let mut resolved = resolve_text_block(&combined, reader_style, TextContext::Flow);
+                let style = &mut resolved.to_mut().style;
+                style.indent = 0.0;
+                style.margin_start = 0.0;
+                style.margin_start_fraction = 0.0;
+                let prepared = self.shape_text_from_source_with_spans(
+                    source, &resolved, reader_style, content_width, spans,
+                )?;
+                paginator.push_text(&prepared, &resolved)?;
+                block_index += 2;
+                continue;
+            }
             let block = layout_blocks[block_index];
             match block {
                 Block::Text(block) => {
@@ -1826,8 +1858,9 @@ impl LayoutEngine {
                         block_index += 1;
                         continue;
                     }
-                    if unified_reflow
+                    if (unified_reflow || block.style.right_equation_number)
                         && let Some((run, number)) = formula_images::only_formula(block)
+                        && (unified_reflow || number.is_some())
                         && self.push_formula_image(
                             &mut paginator,
                             source,
@@ -1872,12 +1905,16 @@ impl LayoutEngine {
                     {
                         resolved.to_mut().style.margin_start += list_insets[block_index];
                     }
-                    let mut prepared = self.shape_text_from_source(
-                        source,
-                        &resolved,
-                        reader_style,
-                        content_width,
-                    )?;
+                    let mut prepared = if side_float.is_some() {
+                        let rasters = self.load_inline_rasters(source, &resolved)?;
+                        self.shape_text_with_sources(&resolved, reader_style, content_width, 40.0,
+                            &rasters, Vec::new(), false, None, TextContext::Flow)
+                    } else {
+                        self.shape_text_from_source(source, &resolved, reader_style, content_width)?
+                    };
+                    if let Some(band) = &side_float {
+                        band.wrap(&mut prepared, &paginator, &resolved);
+                    }
                     if block.source.is_none()
                         && let Some(Block::Text(primary)) = block_index
                             .checked_sub(1)
@@ -2874,6 +2911,9 @@ impl LayoutEngine {
             .mul_add(table_metrics.line_height, table_metrics.cell_padding * 2.0);
         let mut row_heights = vec![minimum_row_height; row_count];
         let mut cells = Vec::with_capacity(grid_cells.len());
+        let mut inferred_alignment = grid_cells.iter().any(|(_, _, _, _, cell)| {
+            table_alignment::allows_default(cell)
+        }).then(|| table_alignment::Columns::new(column_count));
         for (((row, row_span, column, column_span, cell), rasters), measured) in
             grid_cells.into_iter().zip(&rasters).zip(measured_cells)
         {
@@ -2905,6 +2945,9 @@ impl LayoutEngine {
             if row_span == 1 {
                 row_heights[row] = row_heights[row].max(required_height);
             }
+            if let Some(align) = &mut inferred_alignment {
+                align.observe(cells.len(), column, cell, &text);
+            }
             cells.push(PreparedTableCell {
                 row,
                 row_span,
@@ -2915,6 +2958,9 @@ impl LayoutEngine {
                 text,
                 required_height,
             });
+        }
+        if let Some(align) = inferred_alignment {
+            align.apply(&mut cells);
         }
         for cell in cells.iter().filter(|cell| cell.row_span > 1) {
             let current = row_heights[cell.row..cell.row + cell.row_span]
@@ -3287,7 +3333,30 @@ impl LayoutEngine {
             start_offset += inset - marker_width;
             available_width = (available_width - inset + marker_width).max(minimum_width);
         }
-        let mut layout = self.build_text_layout_with_boundaries(
+        let floating = (context == TextContext::Flow
+            && reader_style.typesetting.mode != TypesettingMode::Unified
+            && block.kind == TextBlockKind::Paragraph
+            && !block.style.sentence_indents
+            && ruby.is_empty()
+            && source_text_start == 0
+            && spans.first().is_some_and(|span| span.style.drop_cap.is_some()))
+            .then(|| self.shape_floating_initial(
+                &text, &spans, &inline_images, &font_stack, typography, block,
+                first_line_indent, available_width, reader_style.foreground,
+            ))
+            .flatten();
+        let has_initial = floating.is_some();
+        if !has_initial
+            && let Some(first) = spans.first_mut()
+            && let Some(initial) = first.style.drop_cap.take()
+        {
+            first.style.size_scale = initial.ordinary_scale;
+        }
+        let marker_width = block.style.floating_label.map_or(marker_width, |count| {
+            let end = text.char_indices().nth(count as usize).map_or(text.len(), |(offset, _)| offset);
+            self.measure_list_marker_width(&text[..end], &font_stack, typography)
+        });
+        let mut layout = floating.unwrap_or_else(|| self.build_text_layout_with_boundaries(
             &text,
             &spans,
             &inline_images,
@@ -3303,13 +3372,11 @@ impl LayoutEngine {
             } else {
                 parley::OverflowWrap::BreakWord
             },
-        );
-        self.apply_text_indents(
-            &mut layout,
-            block,
-            marker_width,
-            first_line_indent);
-        let should_optimize = optimize_line_breaks
+        ));
+        if !has_initial {
+            self.apply_text_indents(&mut layout, block, marker_width, first_line_indent);
+        }
+        let should_optimize = !has_initial && optimize_line_breaks
             && reader_style.typesetting.line_break_strategy == LineBreakStrategy::Optimized
             && ruby.is_empty()
             && matches!(
@@ -3468,7 +3535,7 @@ impl LayoutEngine {
                 marker_width,
                 first_line_indent);
         }
-        if !optimized {
+        if !optimized && !has_initial {
             break_text_lines(&mut layout, Some(available_width));
             linebreak::parley::repair_trailing_footnote_line(&mut layout, &text, available_width);
             if optimize_line_breaks
@@ -3937,7 +4004,8 @@ impl LayoutEngine {
                 // icon scale rather than the minimum body-text size.
                 (typography.font_size * span.style.size_scale).clamp(8.0, 12.0)
             } else {
-                (typography.font_size * span.style.size_scale.clamp(0.5, 3.0))
+                let max_scale = if span.style.drop_cap.is_some() { 6.0 } else { 3.0 };
+                (typography.font_size * span.style.size_scale.clamp(0.5, max_scale))
                     .max(typography.minimum_font_size)
             };
             builder.push(StyleProperty::FontSize(size), span.range.clone());
@@ -4093,7 +4161,11 @@ impl LayoutEngine {
             );
         }
         if marker_width > 0.0 {
-            apply_list_hanging_indent(layout, block.kind, marker_width);
+            if block.style.floating_label.is_some() {
+                layout.set_text_indent(marker_width, IndentOptions { hanging: true, ..Default::default() });
+            } else {
+                apply_list_hanging_indent(layout, block.kind, marker_width);
+            }
         }
     }
 
@@ -4242,6 +4314,45 @@ fn unified_body_line_height(system: WritingSystem) -> f32 {
     }
 }
 
+const UNIFIED_HEADING_LINE_HEIGHT: f32 = 1.3;
+
+fn unified_heading_line_height(block: &TextBlock, fallback: WritingSystem) -> f32 {
+    // Inline annotations, raised glyphs and objects can extend above the
+    // normal text line. Keep the existing leading for those titles.
+    if block.content.iter().any(|inline| match inline {
+        Inline::Text(run) => run.style.baseline != TextBaseline::Normal,
+        Inline::Break => false,
+        _ => true,
+    }) {
+        return UNIFIED_HEADING_LINE_HEIGHT;
+    }
+
+    let mut system = None;
+    for ch in block
+        .content
+        .iter()
+        .flat_map(Inline::text_runs)
+        .flat_map(|run| run.text.chars())
+    {
+        match ch.script() {
+            Script::Han | Script::Hiragana | Script::Katakana | Script::Hangul | Script::Bopomofo => {
+                system = Some(WritingSystem::Cjk);
+            }
+            Script::Latin => {
+                system.get_or_insert(WritingSystem::Latin);
+            }
+            Script::Common | Script::Inherited | Script::Unknown => {}
+            _ if ch.is_alphabetic() => return UNIFIED_HEADING_LINE_HEIGHT,
+            _ => {}
+        }
+    }
+    match system.unwrap_or(fallback) {
+        WritingSystem::Latin => 1.15,
+        WritingSystem::Cjk => 1.20,
+        WritingSystem::Other | WritingSystem::Unknown => UNIFIED_HEADING_LINE_HEIGHT,
+    }
+}
+
 fn resolve_text_block<'a>(
     block: &'a TextBlock,
     reader_style: &ReaderStyle,
@@ -4333,7 +4444,7 @@ fn resolve_text_block_with_caption_emphasis<'a>(
         TextContext::Flow => match block.kind {
             TextBlockKind::Heading(level) => (
                 unified_heading_scale(profile.heading_scale, level),
-                1.3,
+                UNIFIED_HEADING_LINE_HEIGHT,
                 base_size * profile.heading_body_gap_em,
             ),
             TextBlockKind::HeadingOrdinal(level) => (
@@ -4430,7 +4541,13 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     } else {
         0.0
     };
-    resolved.style.line_height = line_height;
+    // The title's internal leading and authored gaps after the title are independent.
+    resolved.style.line_height =
+        if context == TextContext::Flow && matches!(block.kind, TextBlockKind::Heading(_)) {
+            unified_heading_line_height(&resolved, display_system)
+        } else {
+            line_height
+        };
     if block.style.paragraph_group.is_some()
         && matches!(resolved.style.align, TextAlignment::Center | TextAlignment::End)
     {
@@ -4504,6 +4621,10 @@ fn resolve_text_block_with_caption_emphasis<'a>(
                 // Unified typesetting starts from a neutral decoration layer.
                 // Semantic/application decorations can opt back in explicitly.
                 run.style.underline = false;
+                if run.style.drop_cap.take().is_some() {
+                    run.style.inline_size_scale = None;
+                    run.style.keyword_size_scale = None;
+                }
                 let text_scale = scale
                     * run
                         .style
@@ -4662,6 +4783,16 @@ enum SemanticScriptClass {
     Cjk,
     ItalicFriendly,
     Neutral,
+}
+
+/// Apply the unified reader's emphasis to a translated note before it is
+/// serialized for a popup. Keep the popup's own spacing and raw-note styles.
+pub fn apply_translated_note_emphasis(content: &mut Vec<Inline>) {
+    if let Some(language) = content.iter().flat_map(Inline::text_runs)
+        .find_map(|run| run.style.display_writing_system)
+    {
+        resolve_semantic_inline_presentation(content, language);
+    }
 }
 
 fn resolve_semantic_inline_presentation(
@@ -5418,11 +5549,12 @@ fn prepare_inline_content(
     let mut spans = Vec::new();
     let mut inline_images = Vec::new();
     let mut next_footnote_reference_group = 1_u32;
-    let numbered_notes = if focus_footnote_icons && unified_math {
+    let footnote_groups = if focus_footnote_icons {
         paragraph_footnotes(block)
     } else {
         Vec::new()
     };
+    let mut footnote_groups = footnote_groups.iter().enumerate().peekable();
     let prefix = if block.style.authored_list_marker.is_some() {
         String::new()
     } else {
@@ -5485,13 +5617,15 @@ fn prepare_inline_content(
                     text.extend(std::iter::repeat_n('\u{2060}', run.text.chars().count()));
                     continue;
                 }
-                let numbered_note = numbered_notes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, range)| range.contains(&inline_index));
-                if numbered_note.is_some_and(|(_, range)| range.start != inline_index) {
+                while footnote_groups.peek().is_some_and(|(_, range)| range.end <= inline_index) {
+                    footnote_groups.next();
+                }
+                let footnote_group = footnote_groups.peek().copied()
+                    .filter(|(_, range)| range.contains(&inline_index));
+                if footnote_group.is_some_and(|(_, range)| range.start != inline_index) {
                     continue;
                 }
+                let numbered_note = footnote_group.filter(|_| unified_math);
                 if run.style.inline_citation != 0
                     && inline_index > 0
                     && matches!(&block.content[inline_index-1], Inline::Text(previous) if previous.style.inline_citation == run.style.inline_citation)
@@ -5520,15 +5654,7 @@ fn prepare_inline_content(
                 if style.color == Rgba::BLACK {
                     style.color = fallback_color;
                 }
-                let linked_footnote_reference = run
-                    .link
-                    .as_ref()
-                    .is_some_and(|target| target.fragment().is_some())
-                    && (run.style.link_role == LinkRole::FootnoteReference
-                        || (run.style.link_role == LinkRole::Normal
-                            && run.style.baseline == TextBaseline::Superscript));
-                let footnote_reference = focus_footnote_icons
-                    && (run.style.inline_role == InlineRole::Footnote || linked_footnote_reference);
+                let footnote_reference = footnote_group.is_some();
                 let website_group = 0x4000_0000 | next_footnote_reference_group;
                 if website {
                     let original: String = block.content[inline_index..].iter().take_while(|inline| matches!(inline,Inline::Text(r) if r.link==run.link && r.style.inline_citation==0 && r.style.inline_role==InlineRole::Normal && r.style.link_role==LinkRole::Normal)).filter_map(|inline|match inline {Inline::Text(r)=>Some(r.text.as_str()),_=>None}).collect();
@@ -5579,18 +5705,12 @@ fn prepare_inline_content(
                     style.baseline = TextBaseline::Superscript;
                     style.bold = false;
                     style.italic = false;
-                } else if footnote_reference {
-                    if let Some((index, range)) = numbered_note {
-                        let original: String = block.content[range.clone()]
-                            .iter()
-                            .filter_map(|inline| {
-                                if let Inline::Text(run) = inline {
-                                    Some(run.text.as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
+                } else if let Some((index, range)) = footnote_group {
+                    let original: String = block.content[range.clone()].iter()
+                        .flat_map(Inline::text_runs)
+                        .map(|run| run.text.as_str())
+                        .collect();
+                    if unified_math {
                         let number = if run.style.footnote_number == 0 {
                             index as u32 + 1
                         } else {
@@ -5620,7 +5740,7 @@ fn prepare_inline_content(
                         style.bold = false;
                         style.italic = false;
                     } else {
-                        text.push_str(&footnote_icon_placeholder(&run.text));
+                        text.push_str(&footnote_icon_placeholder(&original));
                     }
                 } else {
                     text.push_str(&run.text);
@@ -6001,6 +6121,8 @@ struct Paginator {
     cursor_y: f32,
     pages: Vec<PageLayout>,
     items: Vec<PageItem>,
+    // Kept out of ordinary paragraph gap measurement until page commit.
+    floating_items: Vec<(usize, PageItem)>,
     center_standalone_image: bool,
     minimum_paragraph_gap: f32,
     previous_block_was_paragraph: bool,
@@ -6051,6 +6173,7 @@ impl Paginator {
             cursor_y: geometry.top,
             pages: Vec::new(),
             items: Vec::new(),
+            floating_items: Vec::new(),
             center_standalone_image,
             minimum_paragraph_gap: minimum_paragraph_gap.max(0.0),
             previous_block_was_paragraph: false,
@@ -6175,6 +6298,15 @@ impl Paginator {
         }
         if !display_formula {
             self.add_preserved_spacing(block.style.margin_before);
+        }
+        let initial_lines = if prepared.lines.start == 0 {
+            prepared.layout.initial_line_count().min(prepared.lines.end)
+        } else { 0 };
+        if initial_lines > 0 && self.column_has_content
+            && let Some(line) = prepared.layout.get(initial_lines - 1)
+            && line.metrics().block_max_coord > self.bottom - self.cursor_y - self.pending_quote_padding()
+        {
+            self.advance_column();
         }
         let mut line_start = prepared.lines.start;
         while line_start < prepared.lines.end {
@@ -6777,6 +6909,17 @@ impl Paginator {
     }
 
     fn commit_page(&mut self) {
+        if !self.floating_items.is_empty() {
+            let mut floats = self.floating_items.drain(..).peekable();
+            let flow = std::mem::take(&mut self.items);
+            for (index, item) in flow.into_iter().enumerate() {
+                while floats.peek().is_some_and(|(at, _)| *at <= index) {
+                    if let Some((_, float)) = floats.next() { self.items.push(float); }
+                }
+                self.items.push(item);
+            }
+            self.items.extend(floats.map(|(_, item)| item));
+        }
         if self.items.is_empty() {
             self.cursor_y = self.top;
             return;
@@ -7548,6 +7691,35 @@ mod tests {
     }
 
     #[test]
+    fn a_split_footnote_marker_reserves_one_indicator_in_either_mode() {
+        let href = rebook_publication::PublicationUrl::parse("notes.xhtml#note-4").unwrap();
+        let text = |value: &str, baseline, link| Inline::Text(TextRun {
+            text: value.to_owned(),
+            style: TextStyle { baseline, link_role: LinkRole::FootnoteReference, ..Default::default() },
+            link: Some(link),
+        });
+        let block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![
+                text(" ", TextBaseline::Normal, href.clone()),
+                text("[4]", TextBaseline::Superscript, href.clone()),
+                text(" ", TextBaseline::Normal, href),
+                text(" ", TextBaseline::Normal, rebook_publication::PublicationUrl::parse("notes.xhtml#stray").unwrap()),
+            ],
+            style: Default::default(),
+            source: None,
+        };
+        for unified in [false, true] {
+            let (value, spans, _, _, _, _, _) = prepare_inline_content(
+                &block, Rgba::BLACK, &ReaderTypography::default(), 320.0,
+                &resvg::usvg::Options::default(), true, unified, false, &[], &mut [], None,
+            );
+            assert_eq!(spans.iter().filter(|span| span.footnote_reference_group != 0).count(), 1);
+            assert_eq!(value.chars().count(), 6);
+        }
+    }
+
+    #[test]
     fn focus_footnote_icon_never_becomes_an_orphan_last_line() {
         const CJK: &[u8] = include_bytes!("../../../assets/fonts/LXGWWenKaiGBScreen.ttf");
         let mut engine = LayoutEngine::with_fonts([ReaderFontBlob::new(Arc::new(CJK))]);
@@ -8167,13 +8339,87 @@ mod tests {
         assert!(resolved.style.margin_before.abs() < 0.001);
         assert!((resolved.style.margin_after - 14.0).abs() < 0.001);
         assert!(resolved.style.indent.abs() < 0.001);
-        assert!((resolved.style.line_height - 1.3).abs() < 0.001);
+        assert!((resolved.style.line_height - 1.15).abs() < 0.001);
         let Inline::Text(run) = &resolved.content[0] else {
             panic!("expected text run");
         };
         assert!((run.style.size_scale - 1.432).abs() < 0.001);
         assert!(run.style.bold);
         assert!(!run.style.italic);
+    }
+
+    #[test]
+    fn unified_wrapped_headings_use_the_displayed_script_and_keep_the_trailing_gap() {
+        let style = ReaderStyle {
+            // Either a heading in another language or a translation can
+            // differ from the book's declared language.
+            writing_system: WritingSystem::Cjk,
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let mut engine = LayoutEngine::new();
+        for (title, leading) in [
+            ("Élévation des idées et mémoire", 1.15),
+            ("AI時代のデータと記憶を読み解く", 1.20),
+        ] {
+            let block = TextBlock {
+                kind: TextBlockKind::Heading(1),
+                content: vec![Inline::Text(TextRun {
+                    text: title.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle {
+                    hard_break_after: true,
+                    ..BlockStyle::default()
+                },
+                source: None,
+            };
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            assert_eq!(resolved.style.line_height, leading);
+            assert!((resolved.style.margin_after - 40.0).abs() < 0.01);
+
+            let prepared = engine.shape_text(&resolved, &style, 190.0);
+            assert!(prepared.layout.len() >= 2);
+            let line_height = style.typography.font_size * style.typesetting.heading_scale * leading;
+            let first = prepared.layout.get(0).unwrap().metrics().baseline;
+            let second = prepared.layout.get(1).unwrap().metrics().baseline;
+            assert!((second - first - line_height).abs() < 0.5);
+
+            let mut book_style = style.clone();
+            book_style.typesetting.mode = TypesettingMode::Book;
+            assert_eq!(
+                resolve_text_block(&block, &book_style, TextContext::Flow).style.line_height,
+                block.style.line_height
+            );
+        }
+    }
+
+    #[test]
+    fn unified_heading_with_ruby_retains_annotation_room() {
+        let text = |value: &str| TextRun {
+            text: value.into(),
+            style: TextStyle::default(),
+            link: None,
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Heading(1),
+            content: vec![Inline::Ruby(Box::new(rebook_publication::RubyRun {
+                base: vec![text("漢字")],
+                annotation: vec![text("かんじ")],
+                below: false,
+            }))],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        assert_eq!(resolved.style.line_height, UNIFIED_HEADING_LINE_HEIGHT);
+        let shaped = LayoutEngine::new().shape_text(&resolved, &style, 190.0);
+        assert_eq!(shaped.ruby.len(), 1);
     }
 
     #[test]
@@ -8718,6 +8964,58 @@ mod tests {
             authored_offset.abs() < 0.001,
             "authored left alignment should be preserved"
         );
+    }
+
+    #[test]
+    fn table_aligns_data_and_wrapped_text_columns_without_repositioning_headers() {
+        use rebook_publication::BlockStyle;
+        let cell = |value: &str, header, align| TableCell {
+            text: TextBlock {
+                kind: TextBlockKind::Paragraph,
+                content: vec![Inline::Text(TextRun { text: value.into(), style: Default::default(), link: None })],
+                style: BlockStyle::default(),
+                source: None,
+            },
+            authored_alignment: align,
+            column_span: 1,
+            row_span: 1,
+            header,
+        };
+        let mut locked_heading = cell("Status", false, None);
+        locked_heading.text.style.keep_table_alignment = true;
+        let rows = [
+            vec![cell("Label", true, None), cell("Value", true, None), locked_heading],
+            vec![cell("Group A", true, None), cell("−12.5%", false, None),
+                cell("A long description of the group that will wrap into several lines in this narrow text column.", false, None)],
+            vec![cell("Group B", false, None), cell("4,200", false, None), cell("Stable", false, None)],
+            vec![cell("West", false, None), cell("8", false, Some(TextAlignment::Start)), cell("Active", false, None)],
+        ];
+        let table = TableBlock {
+            visualization: None, before: vec![], after: vec![], source: None,
+            rows: rows.into_iter().map(|cells| TableRow { cells }).collect(),
+        };
+        let source = EmptySource::new("table-column-alignments");
+        for typesetting in [ReaderTypesetting::default(), ReaderTypesetting::unified()] {
+            let style = ReaderStyle { typesetting, ..Default::default() };
+            let layout = LayoutEngine::new().shape_table(&source, &table, &style, 330.0).unwrap();
+            let fractions = |index: usize| {
+                let text = &layout.cells[index].text;
+                let line = text.layout.get(text.lines.start).unwrap().metrics();
+                let free = text.available_width - line.advance + line.hanging_advance;
+                assert!(free > 1.0, "{index}: {free}");
+                line.offset / free
+            };
+            for i in [0, 1, 2, 3] {
+                assert!((fractions(i) - 0.5).abs() < 0.02, "header {i}");
+            }
+            for i in [4, 7] {
+                assert!((fractions(i) - 1.0).abs() < 0.02, "number {i}");
+            }
+            assert!(layout.cells[5].text.lines.len() > 1);
+            for i in [6, 8, 9, 10, 11] {
+                assert!(fractions(i).abs() < 0.02, "left aligned cell {i}");
+            }
+        }
     }
 
     #[test]

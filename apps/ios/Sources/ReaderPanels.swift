@@ -414,7 +414,9 @@ private struct DocumentTouchSurface: UIViewRepresentable {
             guard let selection = input.selection else { return }
             context.scaleBy(x: logicalScale, y: logicalScale)
             context.setFillColor(UIColor.systemGreen.withAlphaComponent(0.25).cgColor)
-            for bounds in selection.bounds { context.fill(rectangle(bounds)) }
+            context.beginPath()
+            for bounds in selection.bounds { context.addRect(rectangle(bounds)) }
+            context.fillPath(using: .winding)
             context.setFillColor(UIColor.systemGreen.cgColor)
             for p in endpoints {
                 context.fillEllipse(in: CGRect(x: p.x - 5, y: p.y - 3, width: 10, height: 10))

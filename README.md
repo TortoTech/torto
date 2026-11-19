@@ -53,7 +53,7 @@ Focus Mode is Torto's default close-reading experience:
 | **Feature** | **Description** | **Status** |
 | --- | --- | --- |
 | **Focus Mode** | Read one semantic unit at a stable centered baseline with sentence splitting (`3`), dimmed surroundings, and context-bound actions. | ✅ Core |
-| **Multi-format & library** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, CHM, and PDF files; browse covers, track reading statistics, and detect duplicates. | ✅ |
+| **Multi-format & library** | Read DRM-free EPUB, MOBI, AZW, AZW3/KF8, FB2, FBZ, CBZ, CHM, TXT, LIT, and PDF files; browse covers, track reading statistics, and detect duplicates. | ✅ |
 | **Native Rust rendering** | Parse, typeset, paginate, and render natively without a browser or WebView; download default reading fonts in the background. | ✅ |
 | **Classic layouts & themes** | Choose unified or book-authored styles and light, dark, or system themes. Desktop offers single-column, two-column, and vertical-scroll layouts. | ✅ |
 | **Media & reference previews** | Inspect zoomable images, tables, and rendered LaTeX formulas (`0` or click); preview figures/tables/equations from inline references; copy tables as Markdown. | ✅ |

@@ -241,6 +241,10 @@ struct AiRoleSettings: View {
                     choiceRow(mobileText("思考等级", "Reasoning effort"), draft[keyPath: role.effort], effort.map { MobileChoice($0, effortName($0)) }) { id in
                         change { $0[keyPath: role.effort] = id }
                     }
+                    if role == .layout && draft.layoutEnabled && provider?.citationDecisionsAvailable == true {
+                        MobileToggle(title: mobileText("文献引用预判（试验）", "Citation screening (experimental)"),
+                                     value: bool(\.layoutCitationDecisions))
+                    }
                 }
                 SectionCaption(title: hint)
                 if role == .translation {
@@ -318,7 +322,7 @@ struct AiRoleSettings: View {
                     if edited[keyPath: key] != original[keyPath: key] { latest[keyPath: key] = edited[keyPath: key] }
                 }
                 apply(role.provider); apply(role.model); apply(role.effort)
-                if role == .layout { apply(\.layoutEnabled) }
+                if role == .layout { apply(\.layoutEnabled); apply(\.layoutCitationDecisions) }
                 if role == .translation {
                     apply(\.targetLanguage); apply(\.showOriginal); apply(\.translateToc); apply(\.expertTranslation)
                 }

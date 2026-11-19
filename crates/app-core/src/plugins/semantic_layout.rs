@@ -22,11 +22,16 @@ pub use visible::{
 
 mod batching;
 mod citations;
+mod decisions;
 pub mod enhancements;
+mod figure_captions;
 mod formulas;
 mod heading_policy;
 use heading_policy::{presentation_cache_paths, read_presentation_cache};
 mod image_tables;
+mod image_charts;
+mod passage_charts;
+pub use passage_charts::PassageChart;
 mod log;
 mod normalize;
 mod text_formulas;
@@ -37,6 +42,7 @@ pub use log::translation_event;
 pub use log::{event as diagnostic_event, with_job};
 mod code_blocks;
 mod quote_sources;
+mod request_images;
 
 // This is the on-disk data format, not an application release or prompt revision.
 const CACHE_FORMAT_VERSION: u32 = 1;
@@ -49,6 +55,7 @@ pub struct SemanticLayoutSettings {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: ReasoningEffort,
+    pub citation_decisions: bool,
 }
 
 impl Default for SemanticLayoutSettings {
@@ -58,8 +65,13 @@ impl Default for SemanticLayoutSettings {
             provider: String::new(),
             model: String::new(),
             reasoning_effort: ReasoningEffort::None,
+            citation_decisions: false,
         }
     }
+}
+
+pub fn supports_citation_decisions(provider: &super::AiProvider) -> bool {
+    decisions::endpoint(provider).is_some()
 }
 
 // Internal request roles, not user settings. Headings come only from the publication parser.
@@ -154,6 +166,7 @@ enum Annotation {
         sources: Vec<SourceRange>,
         credit: Option<SourceRange>,
     },
+    ImageChart { href: PublicationUrl, svg: String },
     ImageTable {
         href: PublicationUrl,
         table: rebook_publication::TableBlock,
@@ -268,6 +281,7 @@ pub struct SemanticLayoutSource {
     chart_fonts: Arc<[peniko::Blob<u8>]>,
     formula_note_views: RwLock<HashSet<String>>,
     chart_views: RwLock<HashSet<String>>,
+    passage_charts: RwLock<passage_charts::Views>,
     unified_citations: std::sync::atomic::AtomicBool,
     heuristic_cache: RwLock<HashMap<usize, (String, Vec<Annotation>)>>,
     fingerprints: RwLock<HashMap<usize, (u64, String)>>,
@@ -314,6 +328,7 @@ impl SemanticLayoutSource {
             chart_fonts: fonts,
             formula_note_views: RwLock::new(HashSet::new()),
             chart_views: RwLock::new(HashSet::new()),
+            passage_charts: Default::default(),
             unified_citations: std::sync::atomic::AtomicBool::new(false),
             heuristic_cache: RwLock::new(HashMap::new()),
             fingerprints: RwLock::new(HashMap::new()),
@@ -454,6 +469,7 @@ impl SemanticLayoutSource {
     }
 
     pub fn clear(&self) {
+        self.clear_passage_charts();
         if let Ok(mut views) = self.formula_note_views.write() {
             views.clear();
         }
@@ -671,6 +687,7 @@ impl BookSource for SemanticLayoutSource {
                 );
                 citations::apply_heuristic_fallback(&mut section);
             }
+            self.apply_passage_charts(&mut section.blocks);
             return Ok(section);
         }
         let mut recognition = self
@@ -760,6 +777,7 @@ impl BookSource for SemanticLayoutSource {
             );
             citations::apply_heuristic_fallback(&mut section);
         }
+        self.apply_passage_charts(&mut section.blocks);
         Ok(section)
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
@@ -1029,6 +1047,7 @@ fn request_contract_fingerprint() -> &'static str {
         digest(
             &serde_json::to_vec(&json!([
                 "compact-wire-v1",
+                request_images::REVISION,
                 PROMPT,
                 code_blocks::PROMPT,
                 code_blocks::SCOPE_PROMPT,
@@ -1146,7 +1165,7 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
         return None;
     }
     let (provider, model) = settings.semantic_layout_endpoint().ok()?;
-    Some(json!([
+    let mut identity = json!([
         CACHE_FORMAT_VERSION,
         request_contract_fingerprint(),
         book_id,
@@ -1159,7 +1178,16 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
             .resolved_target_language(crate::preferences::AppLanguage::system_translation_target()),
         true,
         true
-    ]))
+    ]);
+    if config.citation_decisions
+        && let Some(endpoint) = decisions::endpoint(provider)
+    {
+        identity.as_array_mut()?.push(endpoint.identity());
+    }
+    if let Some(endpoint) = decisions::figure_endpoint(provider) {
+        identity.as_array_mut()?.push(endpoint.figure_identity());
+    }
+    Some(identity)
 }
 
 /// Non-secret identity for host jobs. Use the same model, endpoint, language and
@@ -1201,7 +1229,8 @@ fn load_recognition_with_hash(
 
 fn image_annotation_href(annotation: &Annotation) -> Option<&PublicationUrl> {
     match annotation {
-        Annotation::ImageTable { href, .. }
+        Annotation::ImageChart { href, .. }
+        | Annotation::ImageTable { href, .. }
         | Annotation::ImageText { href, .. }
         | Annotation::ImageFormula { href, .. }
         | Annotation::UnreadableFormula { href } => Some(href),
@@ -1262,7 +1291,8 @@ fn load_recognition_inner(
                     | Annotation::FormulaNotes { .. }
                     | Annotation::InlineCitations { .. }
                     | Annotation::TextFormulas { .. }
-                    | Annotation::ImageTable { .. }
+                    | Annotation::ImageChart { .. }
+        | Annotation::ImageTable { .. }
                     | Annotation::ImageText { .. }
                     | Annotation::ImageFormula { .. }
                     | Annotation::UnreadableFormula { .. }
@@ -1274,7 +1304,8 @@ fn load_recognition_inner(
                 | Annotation::FormulaNotes { .. }
                 | Annotation::InlineCitations { .. }
                 | Annotation::TextFormulas { .. }
-                | Annotation::ImageTable { .. }
+                | Annotation::ImageChart { .. }
+        | Annotation::ImageTable { .. }
                 | Annotation::ImageText { .. }
                 | Annotation::ImageFormula { .. }
                 | Annotation::UnreadableFormula { .. } => {
@@ -1580,11 +1611,21 @@ async fn recognize_inner(
         compose(&mut working.blocks, annotation);
     }
     let section = &working;
-    let (groups, failed) = recognize_windows(&client, settings, section, book_id, &fingerprint, target.clone(), fixed_target, None).await?;
+    let decision = if settings.semantic_layout.citation_decisions
+        && formulas::candidates(&target_section).is_empty()
+    {
+        decisions::endpoint(provider)
+    } else {
+        None
+    };
+    let (groups, failed) = recognize_windows(
+        &client, settings, section, book_id, &fingerprint, target.clone(), fixed_target,
+        None, decision.as_ref(), book_source,
+    ).await?;
     annotations.extend(groups);
     skipped_groups += failed;
     for nested in code_blocks::nested_sections(section, target.clone()) {
-        let (groups, failed) = recognize_windows(&client, settings, &nested.section, book_id, &fingerprint, 0..nested.section.blocks.len(), false, Some(&nested.context)).await?;
+        let (groups, failed) = recognize_windows(&client, settings, &nested.section, book_id, &fingerprint, 0..nested.section.blocks.len(), false, Some(&nested.context), None, None).await?;
         annotations.extend(groups);
         skipped_groups += failed;
     }
@@ -1638,6 +1679,8 @@ async fn recognize_windows(
     target: std::ops::Range<usize>,
     fixed_target: bool,
     code_context: Option<&[String]>,
+    decision: Option<&decisions::Endpoint<'_>>,
+    book_source: Option<&dyn BookSource>,
 ) -> Result<(Vec<Annotation>, usize), String> {
     let code_only = code_context.is_some();
     let (provider, model) = settings.semantic_layout_endpoint()?;
@@ -1649,6 +1692,8 @@ async fn recognize_windows(
     let mut skipped_groups = 0;
     let mut used = HashSet::new();
     let mut start = target.start;
+    let figure_decision = if code_only { None } else { decisions::figure_endpoint(provider) };
+    let mut vision_supported = true;
     while start < target.end {
         let end = if fixed_target {
             target.end
@@ -1683,7 +1728,7 @@ async fn recognize_windows(
                     || paragraph(block).is_some()
                     || citation_candidates.iter().any(|c| c.block == i)
             }
-        }) {
+        }) || (config.captions && !figure_captions::candidates(section, start..end, lo..hi).is_empty()) {
             let input = window_input(section, config, start..end, lo..hi, &citation_candidates, code_context);
             let key = digest(
                 &serde_json::to_vec(&json!([
@@ -1698,6 +1743,8 @@ async fn recognize_windows(
                     config.quotes,
                     config.captions,
                     code_only,
+                    book_source.is_some(),
+                    figure_decision.as_ref().map(decisions::Endpoint::figure_identity),
                     input
                 ]))
                 .map_err(|e| e.to_string())?,
@@ -1727,19 +1774,60 @@ async fn recognize_windows(
                     formulas: cache.formulas,
                     skipped_groups: 0,
                 }
-            } else {
-                let groups = request_window_groups(
-                    &client,
-                    (provider, model, settings.semantic_layout.reasoning_effort),
-                    &input,
+            } else if let Some(endpoint) = decision
+                && let Some(citations) = decisions::resolve(
+                    endpoint,
+                    book_id,
+                    fingerprint,
                     section,
-                    config,
                     start..end,
                     lo..hi,
-                    code_only,
-                )
-                .await
-                .map_err(|error| format!("window {start}..{end}: {error}"))?;
+                    &citation_candidates,
+                ).await
+            {
+                WindowResult {
+                    groups: Vec::new(),
+                    citations,
+                    formulas: Vec::new(),
+                    skipped_groups: 0,
+                }
+            } else {
+                let evidence = if config.captions && (vision_supported || figure_decision.is_some()) {
+                    book_source.map_or_else(Vec::new, |source| {
+                        figure_captions::evidence(source, section, start..end, lo..hi)
+                    })
+                } else {
+                    Vec::new()
+                };
+                let decisions = if let Some(endpoint) = &figure_decision
+                    && !evidence.is_empty()
+                    && citation_candidates.is_empty()
+                {
+                    decisions::resolve_figures(endpoint, section, start..end, lo..hi, &evidence).await
+                } else {
+                    None
+                };
+                let groups = if let Some(groups) = decisions {
+                    WindowResult { groups, ..WindowResult::default() }
+                } else {
+                    let endpoint = (provider, model, settings.semantic_layout.reasoning_effort);
+                    let evidence = if vision_supported { evidence.as_slice() } else { &[] };
+                    let result = request_groups(
+                        client, endpoint, &input, section, config, start..end, lo..hi,
+                        code_only, evidence,
+                    ).await;
+                    if !evidence.is_empty()
+                        && result.as_ref().err().is_some_and(|error| request_images::unsupported(error))
+                    {
+                        vision_supported = false;
+                        request_groups(
+                            client, endpoint, &input, section, config, start..end, lo..hi,
+                            code_only, &[],
+                        ).await
+                    } else {
+                        result
+                    }.map_err(|error| format!("window {start}..{end}: {error}"))?
+                };
                 if let Some(path) = &path
                     && groups.skipped_groups == 0
                     && let Err(error) = crate::persistence::write_json_atomic(
@@ -1785,19 +1873,6 @@ async fn recognize_windows(
         start = end;
     }
     Ok((annotations, skipped_groups))
-}
-
-async fn request_window_groups(
-    client: &reqwest::Client,
-    endpoint: (&super::AiProvider, &str, ReasoningEffort),
-    input: &Value,
-    section: &Section,
-    config: &RecognitionRoles,
-    target: std::ops::Range<usize>,
-    context: std::ops::Range<usize>,
-    code_only: bool,
-) -> Result<WindowResult, String> {
-    request_groups(client, endpoint, input, section, config, target, context, code_only).await
 }
 
 #[cfg(test)]
@@ -1947,6 +2022,7 @@ async fn request_groups(
     target: std::ops::Range<usize>,
     context: std::ops::Range<usize>,
     code_only: bool,
+    evidence: &[(usize, String)],
 ) -> Result<WindowResult, String> {
     crate::plugins::llm::budgeted(async {
     let (provider, model, reasoning_effort) = endpoint;
@@ -1966,7 +2042,7 @@ async fn request_groups(
     }
     let mut messages = vec![
         json!({"role":"system","content":wire::instructions(&prompt, std::iter::once(input))}),
-        json!({"role":"user","content":wire::encode(input).to_string()}),
+        json!({"role":"user","content":figure_captions::content(input, evidence)}),
     ];
     let candidates = citations::window_candidates(section, target.clone());
     let mut fallback: Option<WindowResult> = None;
@@ -2434,6 +2510,10 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         );
         return;
     }
+    if let Annotation::ImageChart { href, svg } = annotation {
+        image_charts::compose(blocks, href, svg);
+        return;
+    }
     if let Annotation::ImageTable { href, table } = annotation {
         image_tables::compose(blocks, href, table);
         return;
@@ -2495,6 +2575,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
+        | Annotation::ImageChart { .. }
         | Annotation::ImageTable { .. }
         | Annotation::ImageText { .. }
         | Annotation::ImageFormula { .. }
@@ -2586,6 +2667,7 @@ fn compose(blocks: &mut Vec<Block>, annotation: &Annotation) {
         | Annotation::QuoteInline { .. }
         | Annotation::InlineCitations { .. }
         | Annotation::TextFormulas { .. }
+        | Annotation::ImageChart { .. }
         | Annotation::ImageTable { .. }
         | Annotation::ImageText { .. }
         | Annotation::ImageFormula { .. }

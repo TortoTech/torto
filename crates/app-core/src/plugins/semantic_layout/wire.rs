@@ -108,6 +108,7 @@ const ENUMS: &[(&str, &str)] = &[
     ("quote_missing_attribution", "qm"),
     ("attribution_candidate", "ac"),
     ("recognized_table", "tb"),
+    ("recognized_chart", "tc"),
     ("recognized_text", "tx"),
     ("unreadable_text", "ut"),
     ("recognized", "ok"),

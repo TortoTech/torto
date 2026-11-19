@@ -12,6 +12,7 @@ struct CloudSheet: View {
     @State private var saving = false
     @State private var error: String?
     @State private var choice: ChoiceRequest?
+    @State private var syncCompletion: UUID?
     private var changed: Bool { options != saved || !password.isEmpty }
     private var palette: MobilePalette { MobilePalette(scheme) }
 
@@ -52,6 +53,13 @@ struct CloudSheet: View {
         }
         .foregroundStyle(palette.ink).background(palette.background.ignoresSafeArea())
         .fullScreenCover(item: $choice) { request in request.page { choice = nil } }
+        .task(id: syncCompletion) {
+            guard let syncCompletion else { return }
+            try? await Task.sleep(for: .seconds(3))
+            if !Task.isCancelled && self.syncCompletion == syncCompletion {
+                self.syncCompletion = nil
+            }
+        }
         .task {
             do {
                 let loaded = try await core.cloudOptions()
@@ -66,24 +74,20 @@ struct CloudSheet: View {
     private var actions: some View {
         let status = cloud.status
         return VStack(alignment: .leading, spacing: 12) {
-            if cloud.running || status.error != nil || status.retry != nil {
+            let retry = status.retry.flatMap { $0 > Date() ? $0 : nil }
+            if cloud.running || status.error != nil || retry != nil || syncCompletion != nil {
                 VStack(alignment: .leading, spacing: 6) {
-                    if status.booksTotal > 0 {
-                        Text(mobileText("已就绪 \(status.booksCompleted)/\(status.booksTotal) 本",
-                                        "\(status.booksCompleted)/\(status.booksTotal) books ready"))
-                            .font(.subheadline.weight(.medium))
-                    }
                     if cloud.running {
-                        Text(stageTitle(status.stage))
-                        if status.booksTotal > 0 {
-                            ProgressView(value: Double(status.booksCompleted), total: Double(status.booksTotal))
-                        } else if status.total > 0 {
-                            ProgressView(value: Double(status.completed), total: Double(status.total))
-                        } else { ProgressView().progressViewStyle(.linear) }
-                    } else if let retry = status.retry {
-                        Text(mobileText("同步已暂停，最早重试时间：", "Sync paused; retry no earlier than: ") + timestamp(retry))
+                        syncProgress(status)
+                    } else if let retry {
+                        let time = retryTime(retry)
+                        Text(mobileText("同步暂缓 · 最早可重试时间 \(time)", "Sync paused · Earliest retry \(time)"))
+                    } else if let error = status.error {
+                        Text(mobileText("同步失败", "Sync failed")).foregroundStyle(.red)
+                        Text(error).foregroundStyle(.red)
+                    } else if syncCompletion != nil {
+                        Text(mobileText("同步完成", "Sync complete"))
                     }
-                    if let error = status.error { Text(error).foregroundStyle(.red) }
                 }
                 .font(.footnote).frame(maxWidth: .infinity, alignment: .leading).padding(12)
                 .background(palette.subtle, in: .rect(cornerRadius: 8))
@@ -99,10 +103,40 @@ struct CloudSheet: View {
                     .buttonStyle(.borderedProminent).disabled(saving || !changed)
                 Button(mobileText("同步", "Sync")) {
                     guard let saved else { return }
-                    Task { await cloud.synchronize(saved) }
+                    syncCompletion = nil
+                    Task {
+                        if await cloud.synchronize(saved) { syncCompletion = UUID() }
+                    }
                 }.buttonStyle(.bordered).disabled(saved?.enabled != true || saving || changed || cloud.running)
             }
         }.padding(16)
+    }
+
+    @ViewBuilder
+    private func syncProgress(_ status: CloudSyncCoordinator.Status) -> some View {
+        if status.stage == "uploading", status.total > 0 {
+            Text(mobileText("已上传 \(status.completed)/\(status.total) 本",
+                            "\(status.completed)/\(status.total) books uploaded"))
+                .font(.subheadline.weight(.medium))
+            ProgressView(value: Double(min(status.completed, status.total)), total: Double(status.total))
+        } else {
+            if status.booksTotal > 0 {
+                Text(mobileText("已就绪 \(status.booksCompleted)/\(status.booksTotal) 本",
+                                "\(status.booksCompleted)/\(status.booksTotal) books ready"))
+                    .font(.subheadline.weight(.medium))
+            }
+            Text(stageTitle(status.stage))
+            if status.stage == "downloading", status.booksTotal > 0 {
+                ProgressView(value: Double(min(status.booksCompleted, status.booksTotal)), total: Double(status.booksTotal))
+            } else {
+                ProgressView().progressViewStyle(.linear)
+            }
+        }
+    }
+
+    private func retryTime(_ date: Date) -> String {
+        let time = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return String(format: "%02d:%02d", time.hour ?? 0, time.minute ?? 0)
     }
 
     private func timestamp(_ date: Date) -> String { date.formatted(date: .numeric, time: .shortened) }

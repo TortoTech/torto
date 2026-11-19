@@ -344,6 +344,7 @@ fn page(
             pixels,
             PageInfo {
                 regions,
+                focus_fade_color: background,
                 ..Default::default()
             },
         ),

@@ -11,7 +11,19 @@ pub struct Layout<B: Brush> {
     parts: Vec<Part<B>>,
     paint: Vec<(f32, f32)>,
     spacing: Vec<LineSpacing>,
+    initial: Option<Initial<B>>,
+    side_float: bool,
 }
+#[derive(Clone, Debug)]
+struct Initial<B: Brush> {
+    layout: parley::Layout<B>,
+    x: f32,
+    y: f32,
+    top: f32,
+    bottom: f32,
+    occupied_bottom: f32,
+}
+
 #[derive(Clone, Debug)]
 struct Part<B: Brush> {
     layout: parley::Layout<B>,
@@ -35,6 +47,8 @@ impl<B: Brush> From<parley::Layout<B>> for Layout<B> {
             }],
             paint: vec![],
             spacing: vec![],
+            initial: None,
+            side_float: false,
         }
     }
 }
@@ -135,8 +149,55 @@ impl<B: Brush> Layout<B> {
                 .collect(),
             paint: vec![],
             spacing: vec![],
+            initial: None,
+            side_float: false,
         }
     }
+    /// The initial paints with the first line, but does not change the body's line strut.
+    pub(crate) fn with_initial(
+        body: parley::Layout<B>,
+        initial: parley::Layout<B>,
+        x: f32,
+        y: f32,
+        ink: Range<f32>,
+        float_bottom: f32,
+    ) -> Self {
+        let mut layout = Self::from(body);
+        layout.parts[0].start = initial.text_len();
+        layout.initial = Some(Initial {
+            layout: initial,
+            x,
+            y,
+            occupied_bottom: float_bottom.max(ink.end),
+            top: ink.start,
+            bottom: ink.end,
+        });
+        layout
+    }
+
+    /// Whether the first glyph is a separate floating initial.
+    pub fn has_floating_initial(&self) -> bool {
+        self.initial.is_some()
+    }
+
+    pub fn has_flow_exclusion(&self) -> bool {
+        self.side_float || self.has_floating_initial()
+    }
+
+    pub(crate) fn initial_line_count(&self) -> usize {
+        self.initial.as_ref().map_or(0, |i| {
+            self.lines()
+                .take_while(|line| line.metrics().block_min_coord < i.occupied_bottom)
+                .count()
+        })
+    }
+
+    fn initial_at(&self, x: f32, y: f32) -> Option<&Initial<B>> {
+        self.initial
+            .as_ref()
+            .filter(|i| x >= i.x && x <= i.x + i.layout.width() && y >= i.top && y <= i.bottom)
+    }
+
     fn part_len(part: &Part<B>) -> usize {
         part.layout.len()
             - usize::from(
@@ -189,8 +250,9 @@ impl<B: Brush> Layout<B> {
         }
     }
     pub fn height(&self) -> f32 {
-        self.parts.iter().map(Self::part_height).sum::<f32>()
-            + self.paint.iter().map(|(a, b)| a + b).sum::<f32>()
+        let height = self.parts.iter().map(Self::part_height).sum::<f32>()
+            + self.paint.iter().map(|(a, b)| a + b).sum::<f32>();
+        height.max(self.initial.as_ref().map_or(0.0, |i| i.occupied_bottom))
     }
     pub fn calculate_content_widths(&self) -> parley::ContentWidths {
         self.parts
@@ -217,12 +279,37 @@ impl<B: Brush> Layout<B> {
         }
     }
     pub fn break_all_lines(&mut self, width: Option<f32>) {
+        debug_assert!(
+            self.initial.is_none(),
+            "an initial requires its shaped line exclusions"
+        );
         self.paint.clear();
         self.spacing.clear();
         for p in &mut self.parts {
             p.layout.break_all_lines(width);
         }
     }
+    pub(crate) fn break_side_float(&mut self, measure: f32, width: f32, depth: f32, right: bool) {
+        debug_assert!(self.initial.is_none());
+        self.side_float = true;
+        self.paint.clear();
+        self.spacing.clear();
+        let mut depth = f64::from(depth);
+        for part in &mut self.parts {
+            let mut breaker = part.layout.break_lines();
+            breaker.state_mut().set_layout_max_advance(measure);
+            loop {
+                let wraps = breaker.committed_y() < depth;
+                let state = breaker.state_mut();
+                state.set_line_max_advance(if wraps { measure - width } else { measure });
+                state.set_line_x(if wraps && !right { width } else { 0.0 });
+                if breaker.break_next().is_none() { break; }
+            }
+            breaker.finish();
+            depth -= f64::from(part.layout.height());
+        }
+    }
+
     /// The custom paragraph optimizer is restricted to one LTR paragraph.
     ///
     /// # Panics
@@ -242,6 +329,24 @@ impl<B: Brush> Layout<B> {
     /// # Panics
     /// Panics if native justification is requested after optimizer spacing.
     pub fn align(&mut self, alignment: Alignment, options: AlignmentOptions) {
+        self.align_parts(alignment, options, Alignment::Left);
+    }
+
+    pub(crate) fn align_table_column(&mut self, alignment: Alignment, options: AlignmentOptions) {
+        let translated = if alignment == Alignment::Right {
+            Alignment::Right
+        } else {
+            Alignment::Left
+        };
+        self.align_parts(alignment, options, translated);
+    }
+
+    fn align_parts(
+        &mut self,
+        alignment: Alignment,
+        options: AlignmentOptions,
+        translated: Alignment,
+    ) {
         let old_offsets: Vec<_> = if self.spacing.is_empty() {
             vec![]
         } else {
@@ -250,7 +355,7 @@ impl<B: Brush> Layout<B> {
         for part in &mut self.parts {
             part.layout.align(
                 if part.translated {
-                    Alignment::Left
+                    translated
                 } else {
                     alignment
                 },
@@ -356,7 +461,14 @@ impl<B: Brush> Layout<B> {
                     .take(index)
                     .map(|(a, b)| a + b)
                     .sum::<f32>();
+                let initial = self.initial.as_ref().filter(|_| index == 0);
+                let initial_bottom = self
+                    .initial
+                    .as_ref()
+                    .filter(|_| index + 1 == self.len())
+                    .map_or(0.0, |i| i.occupied_bottom);
                 return Some(Line {
+                    initial,
                     raw,
                     start: part.start,
                     index,
@@ -372,9 +484,11 @@ impl<B: Brush> Layout<B> {
                         inline_min_coord: m.inline_min_coord,
                         inline_max_coord: m.inline_max_coord,
                         block_min_coord: m.block_min_coord + shift,
-                        block_max_coord: m.block_max_coord + shift + above + below,
+                        block_max_coord: (m.block_max_coord + shift + above + below)
+                            .max(initial_bottom),
                         content_block_min_coord: m.content_block_min_coord + shift + above,
-                        content_block_max_coord: m.content_block_max_coord + shift + above,
+                        content_block_max_coord: (m.content_block_max_coord + shift + above)
+                            .max(initial.map_or(0.0, |i| i.bottom)),
                     },
                 });
             }
@@ -453,6 +567,7 @@ impl<B: Brush> Layout<B> {
 #[derive(Clone)]
 pub struct Line<'a, B: Brush> {
     raw: parley::layout::Line<'a, B>,
+    initial: Option<&'a Initial<B>>,
     start: usize,
     index: usize,
     y: f32,
@@ -477,9 +592,28 @@ impl<'a, B: Brush> Line<'a, B> {
     }
     pub fn text_range(&self) -> Range<usize> {
         let r = self.raw.text_range();
-        r.start + self.start..r.end + self.start
+        if self.initial.is_some() {
+            0..r.end + self.start
+        } else {
+            r.start + self.start..r.end + self.start
+        }
     }
     pub fn runs(&self) -> impl Iterator<Item = Run<'a, B>> + 'a + use<'a, B> {
+        self.initial
+            .into_iter()
+            .flat_map(|initial| initial.layout.get(0).into_iter())
+            .flat_map(|line| line.runs())
+            .map(|raw| Run {
+                raw,
+                start: 0,
+                spacing: &EMPTY_SPACING,
+            })
+            .chain(self.body_runs())
+    }
+
+    /// Runs participating in the line's normal strut (so an initial does not
+    /// enlarge note markers elsewhere in the first line).
+    pub fn body_runs(&self) -> impl Iterator<Item = Run<'a, B>> + 'a + use<'a, B> {
         let start = self.start;
         let spacing = self.spacing;
         self.raw.runs().map(move |raw| Run {
@@ -488,15 +622,36 @@ impl<'a, B: Brush> Line<'a, B> {
             spacing,
         })
     }
+
     pub fn items(&self) -> impl Iterator<Item = PositionedLayoutItem<'a, B>> + 'a + use<'a, B> {
         let start = self.start;
         let y = self.y;
         let spacing = self.spacing;
-        self.raw.items().map(move |item| match item {
+        let initial_items = self.initial.into_iter().flat_map(|initial| {
+            initial
+                .layout
+                .get(0)
+                .into_iter()
+                .flat_map(|line| line.items())
+                .filter_map(move |item| match item {
+                    parley::PositionedLayoutItem::GlyphRun(raw) => {
+                        Some(PositionedLayoutItem::GlyphRun(GlyphRun {
+                            raw,
+                            start: 0,
+                            x: initial.x,
+                            y: initial.y,
+                            spacing: &EMPTY_SPACING,
+                        }))
+                    }
+                    _ => None,
+                })
+        });
+        initial_items.chain(self.raw.items().map(move |item| match item {
             parley::PositionedLayoutItem::GlyphRun(raw) => {
                 PositionedLayoutItem::GlyphRun(GlyphRun {
                     raw,
                     start,
+                    x: 0.0,
                     y,
                     spacing,
                 })
@@ -506,7 +661,7 @@ impl<'a, B: Brush> Line<'a, B> {
                 b.x = spacing.glyph_x(b.x);
                 PositionedLayoutItem::InlineBox(b)
             }
-        })
+        }))
     }
 }
 pub struct Run<'a, B: Brush> {
@@ -580,6 +735,19 @@ impl<'a, B: Brush> Cluster<'a, B> {
         self.raw.advance() + self.spacing.delta(self.text_range())
     }
     pub fn from_point_exact(layout: &'a Layout<B>, x: f32, y: f32) -> Option<(Self, ClusterSide)> {
+        if let Some(i) = layout.initial_at(x, y) {
+            let native_y = i.layout.height() * 0.5;
+            let (raw, side) =
+                parley::layout::Cluster::from_point_exact(&i.layout, x - i.x, native_y)?;
+            return Some((
+                Self {
+                    raw,
+                    start: 0,
+                    spacing: &EMPTY_SPACING,
+                },
+                side,
+            ));
+        }
         let l = layout.line_at_y(y)?;
         if y < l.metrics.block_min_coord || y > l.metrics.block_max_coord {
             return None;
@@ -607,6 +775,7 @@ pub enum PositionedLayoutItem<'a, B: Brush> {
 pub struct GlyphRun<'a, B: Brush> {
     raw: parley::layout::GlyphRun<'a, B>,
     start: usize,
+    x: f32,
     y: f32,
     spacing: &'a LineSpacing,
 }
@@ -622,10 +791,10 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
         self.raw.style()
     }
     pub fn offset(&self) -> f32 {
-        self.spacing.glyph_x(self.raw.offset())
+        self.spacing.glyph_x(self.raw.offset()) + self.x
     }
     pub fn advance(&self) -> f32 {
-        self.spacing.glyph_x(self.raw.offset() + self.raw.advance()) - self.offset()
+        self.spacing.glyph_x(self.raw.offset() + self.raw.advance()) + self.x - self.offset()
     }
     pub fn baseline(&self) -> f32 {
         self.raw.baseline() + self.y
@@ -643,12 +812,13 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
     }
     pub fn positioned_glyphs(&'a self) -> impl Iterator<Item = parley::Glyph> + 'a {
         let baseline = self.baseline();
+        let x = self.x;
         let spacing = self.spacing;
         self.raw
             .glyphs()
             .scan(self.raw.offset(), move |pen, mut g| {
                 let end = *pen + g.advance;
-                g.x += spacing.glyph_x(*pen);
+                g.x += spacing.glyph_x(*pen) + x;
                 g.y += baseline;
                 g.advance += spacing.delta_before(end) - spacing.delta_before(*pen);
                 *pen = end;
@@ -667,6 +837,15 @@ impl Cursor {
         self.index
     }
     pub fn from_byte_index<B: Brush>(layout: &Layout<B>, index: usize, affinity: Affinity) -> Self {
+        if let Some(i) = &layout.initial
+            && (index < i.layout.text_len()
+                || (index == i.layout.text_len() && affinity == Affinity::Upstream))
+        {
+            return Self {
+                index: parley::editing::Cursor::from_byte_index(&i.layout, index, affinity).index(),
+                affinity,
+            };
+        }
         let index = layout.locate(index, affinity).map_or(0, |(p, _)| {
             p.start
                 + parley::editing::Cursor::from_byte_index(
@@ -679,6 +858,14 @@ impl Cursor {
         Self { index, affinity }
     }
     pub fn from_point<B: Brush>(layout: &Layout<B>, x: f32, y: f32) -> Self {
+        if let Some(i) = layout.initial_at(x, y) {
+            let cursor =
+                parley::editing::Cursor::from_point(&i.layout, x - i.x, i.layout.height() * 0.5);
+            return Self {
+                index: cursor.index(),
+                affinity: cursor.affinity(),
+            };
+        }
         let Some(line) = layout.line_at_y(y) else {
             return Self {
                 index: 0,
@@ -702,6 +889,19 @@ impl Cursor {
         }
     }
     pub fn geometry<B: Brush>(&self, layout: &Layout<B>, width: f32) -> parley::BoundingBox {
+        if let Some(i) = &layout.initial
+            && (self.index < i.layout.text_len()
+                || (self.index == i.layout.text_len() && self.affinity == Affinity::Upstream))
+        {
+            let cursor =
+                parley::editing::Cursor::from_byte_index(&i.layout, self.index, self.affinity);
+            let mut rect = cursor.geometry(&i.layout, width);
+            rect.x0 += f64::from(i.x);
+            rect.x1 += f64::from(i.x);
+            rect.y0 = f64::from(i.top);
+            rect.y1 = f64::from(i.bottom);
+            return rect;
+        }
         let Some((p, first)) = layout.locate(self.index, self.affinity) else {
             return parley::BoundingBox {
                 x0: 0.,
@@ -760,6 +960,26 @@ impl Selection {
     pub fn geometry<B: Brush>(&self, layout: &Layout<B>) -> Vec<(parley::BoundingBox, usize)> {
         let selected = self.text_range();
         let mut result = vec![];
+        if let Some(i) = &layout.initial
+            && selected.start < i.layout.text_len()
+        {
+            let end = selected.end.min(i.layout.text_len());
+            let selection = parley::editing::Selection::new(
+                parley::editing::Cursor::from_byte_index(
+                    &i.layout,
+                    selected.start,
+                    Affinity::Downstream,
+                ),
+                parley::editing::Cursor::from_byte_index(&i.layout, end, Affinity::Upstream),
+            );
+            for (mut rect, _) in selection.geometry(&i.layout) {
+                rect.x0 += f64::from(i.x);
+                rect.x1 += f64::from(i.x);
+                rect.y0 = f64::from(i.top);
+                rect.y1 = f64::from(i.bottom);
+                result.push((rect, 0));
+            }
+        }
         let mut first = 0;
         for p in &layout.parts {
             let start = selected.start.max(p.start);
@@ -789,11 +1009,13 @@ impl Selection {
                                 .block_min_coord
                                 .min(line.metrics.content_block_min_coord),
                         );
-                        r.y1 = f64::from(
-                            line.metrics
-                                .block_max_coord
-                                .max(line.metrics.content_block_max_coord),
-                        );
+                        r.y1 = f64::from(line.metrics.block_max_coord.max(
+                            if line.initial.is_some() {
+                                line.raw.metrics().content_block_max_coord + line.y
+                            } else {
+                                line.metrics.content_block_max_coord
+                            },
+                        ));
                         result.push((r, first + index));
                     }
                 }

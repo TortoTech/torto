@@ -54,8 +54,8 @@ fn live_text_entry_image_replacement_fidelity() {
         .unwrap();
     let mut mismatches = Vec::new();
     for (items, expected) in pending
-        .chunks(batch::MAX_IMAGES)
-        .zip(expected.chunks(batch::MAX_IMAGES))
+        .chunks(request_images::MAX_IMAGES)
+        .zip(expected.chunks(request_images::MAX_IMAGES))
     {
         let results = runtime
             .block_on(batch::request_batch(
@@ -110,6 +110,7 @@ fn literal_radicals_strokes_and_punctuation_are_text_without_normalization() {
         "⼀",
     ] {
         let response = Response {
+            chart_trace: None,
             table_html: None,
             revision: TEXT_REVISION,
             replacement_safe: true,
@@ -133,6 +134,7 @@ fn text_results_preserve_images_and_do_not_become_formulas() {
     let original = section(vec![image("text")]);
     let candidate = candidates(&original).pop().unwrap();
     let response = Response {
+        chart_trace: None,
         table_html: None,
         revision: TEXT_REVISION,
         replacement_safe: true,
@@ -259,20 +261,12 @@ fn local_book_unicode_image_text_layout() {
 fn formula_request_keeps_threefold_enlargement_and_white_padding() {
     let pixels = RgbaImage::from_pixel(3, 7, Rgba([0, 0, 0, 128]));
     let url = image_url(pixels.into()).unwrap();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(url.split_once(',').unwrap().1)
-        .unwrap();
-    let image = image::load_from_memory(&bytes).unwrap().into_rgba8();
-    assert_eq!([image.width(), image.height()], [25, 37]);
-    assert_eq!(image.get_pixel(0, 0).0, [255; 4]);
-    let center = image.get_pixel(12, 18).0;
-    // Image's floating-point compositing may round opaque alpha down by one.
-    assert!((254..=255).contains(&center[3]));
-    assert!(
-        center[..3]
-            .iter()
-            .all(|channel| (126..=128).contains(channel))
-    );
+    assert!(url.starts_with(request_images::JPEG_PREFIX));
+    let image = request_images::decode_url(&url).unwrap().into_rgb8();
+    assert_eq!([image.width(), image.height()], [280, 280]);
+    let center = image.get_pixel(140, 140).0;
+    assert!(center.iter().all(|channel| (123..=131).contains(channel)));
+    assert!(image.get_pixel(124, 140).0.iter().all(|channel| *channel >= 252));
 }
 
 #[test]
@@ -300,6 +294,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
     }
     assert!(
         Response {
+            chart_trace: None,
             table_html: None,
             revision: TEXT_REVISION,
             replacement_safe: true,
@@ -316,6 +311,7 @@ fn formula_transcriptions_must_render_and_keep_negative_results_empty() {
     );
     assert!(
         Response {
+            chart_trace: None,
             table_html: None,
             revision: TEXT_REVISION,
             replacement_safe: true,
@@ -696,6 +692,7 @@ fn table_results_require_safe_complete_grid_and_preserve_captioned_candidates() 
     let original = section(vec![image("table")]);
     let href = candidates(&original)[0].image.href.clone();
     let mut response = Response {
+        chart_trace: None,
         table_html: Some("<table><tr><th rowspan='2'>Category</th><th colspan='2'>Value</th></tr><tr><th>2023</th><th>2024</th></tr><tr><td>A</td><td>-1.2</td><td>3.4%</td></tr></table>".into()),
         revision: TEXT_REVISION, replacement_safe: true, text: None, literal: false, transient: false,
         status: "recognized_table".into(), latex: None, equation_number: None,

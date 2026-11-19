@@ -26,6 +26,18 @@
     </dict>
     <dict>
         <key>CFBundleTypeName</key>
+        <string>Plain text book</string>
+        <key>CFBundleTypeRole</key>
+        <string>Viewer</string>
+        <key>LSHandlerRank</key>
+        <string>Alternate</string>
+        <key>LSItemContentTypes</key>
+        <array>
+            <string>public.plain-text</string>
+        </array>
+    </dict>
+    <dict>
+        <key>CFBundleTypeName</key>
         <string>Torto e-book</string>
         <key>CFBundleTypeRole</key>
         <string>Viewer</string>
@@ -84,6 +96,7 @@
                 <string>fbz</string>
                 <string>cbz</string>
                 <string>chm</string>
+                <string>lit</string>
             </array>
         </dict>
     </dict>

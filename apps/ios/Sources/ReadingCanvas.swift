@@ -238,7 +238,9 @@ struct ReadingCanvas: UIViewRepresentable {
             }
             if let selection {
                 ctx.setFillColor(Self.color(0x55448967).cgColor)
-                for area in selection.bounds { ctx.fill(rectangle(area)) }
+                ctx.beginPath()
+                for area in selection.bounds { ctx.addRect(rectangle(area)) }
+                ctx.fillPath(using: .winding)
                 ctx.setFillColor(Self.color(0xff448967).cgColor)
                 for point in handlePoints(selection) {
                     ctx.fillEllipse(in: CGRect(x: point.x - 6, y: point.y - 4, width: 12, height: 12))

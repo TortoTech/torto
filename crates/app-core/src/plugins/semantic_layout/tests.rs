@@ -550,6 +550,7 @@ fn figure_composition_preserves_order_and_all_images() {
 struct TestSource {
     book: Book,
     section: Section,
+    picture: Option<Arc<[u8]>>,
 }
 impl BookSource for TestSource {
     fn book(&self) -> &Book {
@@ -559,12 +560,27 @@ impl BookSource for TestSource {
         Ok(self.section.clone())
     }
     fn resource(&self, href: &PublicationUrl) -> Result<Resource, PublicationError> {
-        Err(PublicationError::ResourceNotFound(href.to_string()))
+        self.picture.as_ref().map(|bytes| Resource {
+            href: href.clone(), media_type: "image/png".into(), bytes: bytes.clone()
+        }).ok_or_else(|| PublicationError::ResourceNotFound(href.to_string()))
     }
 }
 
 pub(super) fn original_source(section: Section) -> Arc<dyn BookSource> {
-    Arc::new(TestSource {
+    Arc::new(test_source(section))
+}
+
+pub(super) fn picture_source(section: Section) -> Arc<dyn BookSource> {
+    let mut source = test_source(section);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    let red_square = image::RgbImage::from_pixel(42, 42, image::Rgb([212, 24, 20]));
+    red_square.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    source.picture = Some(bytes.into_inner().into());
+    Arc::new(source)
+}
+
+fn test_source(section: Section) -> TestSource {
+    TestSource {
         book: Book {
             id: PublicationId::new("semantic-test").unwrap(),
             metadata: Metadata::default(),
@@ -579,7 +595,8 @@ pub(super) fn original_source(section: Section) -> Arc<dyn BookSource> {
             table_of_contents: vec![],
         },
         section,
-    })
+        picture: None,
+    }
 }
 
 #[test]
@@ -1347,6 +1364,7 @@ fn semantic_request_sends_json_schema_and_structured_instructions() {
             0..1,
             0..1,
             false,
+            &[],
         ));
     server.join().unwrap();
     assert_eq!(result.unwrap().groups.len(), 1);
@@ -1605,6 +1623,10 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
     heading.kind = TextBlockKind::Heading(2);
     let candidates = citations::window_candidates(&section, 0..4);
     assert_eq!(candidates.len(), 1);
+    let source = picture_source(section.clone());
+    let evidence = figure_captions::evidence(source.as_ref(), &section, 0..4, 0..5);
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].0, 2);
     let roles = RecognitionRoles::default();
     let input = unified_window_input(&section, &roles, 0..4, 0..5, &candidates);
     assert_eq!(input["targets"]["classify_citations"], json!(["c0_0_0"]));
@@ -1649,7 +1671,13 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from(["c", "f", "g"])
         );
-        let input: Value = serde_json::from_str(&wire_text(&request["messages"][1])).unwrap();
+        let content = &request["messages"][1]["content"];
+        assert!(content[1]["text"].as_str().unwrap().contains("block ID 2"));
+        let picture = content[2]["image_url"]["url"].as_str().unwrap();
+        let image = request_images::decode_url(picture).unwrap().into_rgb8();
+        let [red, green, blue] = image.get_pixel(image.width() / 2, image.height() / 2).0;
+        assert!(red > 200 && green < 40 && blue < 40);
+        let input: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
         let input = wire::decode(&input);
         assert_eq!(input["blocks"][0]["citation_candidates"][0]["id"], "c0_0_0");
         assert_eq!(input["quotes_enabled"], true);
@@ -1676,7 +1704,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
     };
     let result = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(request_window_groups(
+        .block_on(request_groups(
             &crate::http::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
@@ -1689,6 +1717,7 @@ fn unified_request_returns_groups_and_citations_in_one_call() {
             0..4,
             0..5,
             false,
+            &evidence,
         ))
         .unwrap();
     server.join().unwrap();
@@ -1852,4 +1881,60 @@ fn manual_scope_reopens_with_automatic_ai_disabled_and_preserves_model_identity(
     reopened.configure_presentation(&id,&settings,true);
     assert!(!matches!(reopened.parse_section(0).unwrap().blocks[0],Block::Quote(_)),"another model cannot reuse manual results");
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn caption_window_retries_with_text_for_a_text_only_model() {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        for attempt in 0..2 {
+            let mut socket = loop {
+                if let Ok((socket, _)) = listener.accept() {
+                    break socket;
+                }
+                assert!(std::time::Instant::now() < deadline, "no caption request");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = std::io::BufReader::new(&mut socket);
+            let length = reader.by_ref().lines().take_while(|line| !line.as_ref().unwrap().is_empty())
+                .filter_map(|line| line.unwrap().to_ascii_lowercase().strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap()))
+                .last().unwrap();
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let content = &request["messages"][1]["content"];
+            let (status, body) = if attempt == 0 {
+                assert!(content[2]["image_url"]["url"].as_str().unwrap().starts_with(request_images::JPEG_PREFIX));
+                ("400 Bad Request", json!({"error":{"message":"This model does not support image input"}}))
+            } else {
+                assert!(content.is_string());
+                let result = json!({"groups":[{"kind":"figure","images":[0],"captions":[1]}],"citations":[],"formulas":[]});
+                ("200 OK", json!({"choices":[{"index":0,"finish_reason":"stop","message":{"content":wire::encode(&result).to_string()}}]}))
+            };
+            let body = body.to_string();
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let mut settings = PluginSettings::default().with_test_model();
+    let provider = &mut settings.providers[0];
+    provider.base_url = format!("http://{address}/v1");
+    settings.semantic_layout.enabled = true;
+    settings.semantic_layout.provider = provider.id.clone();
+    settings.semantic_layout.model = provider.models[0].id.clone();
+    let section = section(vec![image("img"), text("caption", "Figure 1. A red square")]);
+    let source = picture_source(section.clone());
+    let client = crate::http::builder().build().unwrap();
+    let (groups, skipped) = tokio::runtime::Runtime::new().unwrap().block_on(recognize_windows(
+        &client, &settings, &section, "caption-text-fallback", &fingerprint(&section), 0..1, true,
+        None, None, Some(source.as_ref()),
+    )).unwrap();
+    server.join().unwrap();
+    assert_eq!(skipped, 0);
+    assert!(matches!(groups.as_slice(), [Annotation::Figure { captions, .. }] if captions[0].start.node == "caption"));
 }

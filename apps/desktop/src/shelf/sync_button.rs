@@ -13,6 +13,7 @@ pub(super) enum SyncButtonState {
         stage: SyncStage,
         completed: u64,
         total: u64,
+        ready_books: (u64, u64),
     },
     Complete {
         expires_at: Instant,
@@ -24,6 +25,41 @@ pub(super) enum SyncButtonState {
 }
 
 impl SyncButtonState {
+    pub(super) fn starting() -> Self {
+        Self::Running {
+            stage: SyncStage::Preparing,
+            completed: 0,
+            total: 0,
+            ready_books: (0, 0),
+        }
+    }
+
+    pub(super) fn update_stage(&mut self, stage: SyncStage, completed: u64, total: u64) {
+        let Self::Running { ready_books, .. } = self else {
+            return;
+        };
+        if matches!(stage, SyncStage::ReadingApplied | SyncStage::Uploading) {
+            return;
+        }
+        let ready_books = if stage == SyncStage::Books {
+            (completed, total)
+        } else {
+            *ready_books
+        };
+        *self = Self::Running {
+            stage,
+            completed,
+            total,
+            ready_books,
+        };
+    }
+
+    pub(super) fn book_ready(&mut self, total: u64) {
+        if let Self::Running { ready_books, .. } = self {
+            *ready_books = (ready_books.0.saturating_add(1).min(total), total);
+        }
+    }
+
     pub(super) fn completed(now: Instant) -> Self {
         Self::Complete {
             expires_at: now + Duration::from_secs(3),
@@ -43,7 +79,8 @@ impl SyncButtonState {
                 stage,
                 completed,
                 total,
-            } => sync_progress_text(language, *stage, *completed, *total),
+                ready_books,
+            } => sync_progress_text(language, *stage, *completed, *total, *ready_books),
             Self::Complete { expires_at } if Instant::now() < *expires_at => {
                 language.text("同步完成", "Sync complete").into()
             }
@@ -52,18 +89,19 @@ impl SyncButtonState {
                 retry_at: Some(deadline),
                 ..
             } if *deadline > Instant::now() => {
-                let seconds = deadline.saturating_duration_since(Instant::now()).as_secs() + 1;
-                format!(
-                    "{} · {} {}",
-                    language.text("云端请求限流（429）", "Cloud request limit (429)"),
-                    seconds,
-                    language.text("秒后自动重试", "seconds until automatic retry")
-                )
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let now = chrono::Local::now();
+                let retry = chrono::Duration::from_std(remaining)
+                    .ok()
+                    .and_then(|duration| now.checked_add_signed(duration))
+                    .unwrap_or(now);
+                let title =
+                    language.text("同步暂缓 · 最早可重试时间", "Sync paused · Earliest retry");
+                format!("{title} {}", retry.format("%H:%M"))
             }
-            Self::Failed { detail, .. } => format!(
-                "{}\n{detail}",
-                language.text("同步失败，点击重试", "Sync failed. Click to retry")
-            ),
+            Self::Failed { detail, .. } => {
+                format!("{}\n{detail}", language.text("同步失败", "Sync failed"))
+            }
         }
     }
 
@@ -107,41 +145,54 @@ impl SyncButtonState {
     }
 }
 
-pub(super) fn sync_progress_text(
+fn sync_progress_text(
     language: AppLanguage,
     stage: SyncStage,
     completed: u64,
     total: u64,
+    (ready, books_total): (u64, u64),
 ) -> String {
-    let direction = match stage {
-        SyncStage::Uploading => language.text("上传", "Uploading"),
-        SyncStage::Downloading => {
-            return language.text("正在下载书籍…", "Downloading books…").into();
+    let chinese = language.resolved() == AppLanguage::SimplifiedChinese;
+    let phase = match stage {
+        SyncStage::UploadingBooks if total > 0 => {
+            return if chinese {
+                format!("已上传 {completed}/{total} 本")
+            } else {
+                format!("{completed}/{total} books uploaded")
+            };
         }
-        SyncStage::Books => {
-            return format!(
-                "{} {completed}/{total} {}",
-                language.text("书籍已就绪", "Books ready"),
-                language.text("本", "books")
-            );
+        SyncStage::Uploading | SyncStage::UploadingBooks => {
+            language.text("上传书籍", "Uploading books")
+        }
+        SyncStage::PreparingDownload | SyncStage::Downloading | SyncStage::Books => {
+            language.text("下载书籍", "Downloading books")
         }
         SyncStage::DerivedUploading
         | SyncStage::DerivedDownloading
         | SyncStage::CheckingDerivedData => {
-            return language
-                .text("正在同步 PDF 处理数据…", "Syncing PDF processing data…")
-                .into();
+            language.text("同步 PDF 处理数据", "Syncing PDF processing data")
         }
-        _ => return language.text("正在同步…", "Syncing…").into(),
+        SyncStage::Statistics => language.text("同步阅读统计", "Syncing reading statistics"),
+        SyncStage::ReadingData => {
+            language.text("同步进度与批注", "Syncing progress and annotations")
+        }
+        SyncStage::Checking | SyncStage::Discovering => {
+            language.text("检查云端变更", "Checking cloud changes")
+        }
+        SyncStage::Preparing => language.text("准备同步", "Preparing sync"),
+        SyncStage::ReadingApplied => {
+            language.text("同步进度与批注", "Syncing progress and annotations")
+        }
     };
-    if total == 0 {
-        return language.text("正在同步…", "Syncing…").into();
+    if books_total == 0 {
+        return phase.into();
     }
-    let percent = (u128::from(completed) * 100 / u128::from(total)).min(100);
-    format!(
-        "{} · {direction} {percent}%",
-        language.text("正在同步", "Syncing")
-    )
+    let readiness = if chinese {
+        format!("已就绪 {ready}/{books_total} 本")
+    } else {
+        format!("{ready}/{books_total} books ready")
+    };
+    format!("{readiness}\n{phase}")
 }
 
 #[cfg(test)]
@@ -149,30 +200,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn book_readiness_and_pdf_processing_have_distinct_progress_labels() {
+    fn book_counts_survive_transfer_and_later_sync_phases() {
+        let mut state = SyncButtonState::starting();
+        state.update_stage(SyncStage::UploadingBooks, 1, 3);
+        state.update_stage(SyncStage::Uploading, 40, 100);
+        assert_eq!(state.hover_text(AppLanguage::English), "1/3 books uploaded");
+
+        state.update_stage(SyncStage::Books, 8, 11);
         assert_eq!(
-            sync_progress_text(AppLanguage::English, SyncStage::Books, 8, 11),
-            "Books ready 8/11 books"
+            state.hover_text(AppLanguage::English),
+            "8/11 books ready\nDownloading books"
         );
+        state.update_stage(SyncStage::Downloading, 100, 500);
+        assert_eq!(
+            state.hover_text(AppLanguage::English),
+            "8/11 books ready\nDownloading books"
+        );
+        state.book_ready(11);
         for stage in [
             SyncStage::DerivedUploading,
             SyncStage::DerivedDownloading,
             SyncStage::CheckingDerivedData,
         ] {
-            let label = sync_progress_text(AppLanguage::English, stage, 300, 400);
-            assert!(label.contains("PDF"));
-            assert!(!label.contains('%'));
+            state.update_stage(stage, 300, 400);
+            assert_eq!(
+                state.hover_text(AppLanguage::English),
+                "9/11 books ready\nSyncing PDF processing data"
+            );
         }
+        state.update_stage(SyncStage::Statistics, 0, 0);
+        assert_eq!(
+            state.hover_text(AppLanguage::English),
+            "9/11 books ready\nSyncing reading statistics"
+        );
     }
 
     #[test]
     fn running_sync_schedules_a_timer_after_layout_settles() {
         let ctx = egui::Context::default();
-        let state = SyncButtonState::Running {
-            stage: SyncStage::Checking,
-            completed: 0,
-            total: 70,
-        };
+        let state = SyncButtonState::starting();
         let mut repaint_delay = Duration::ZERO;
         for pass in 0..5 {
             let mut output = ctx.run_ui(
@@ -199,16 +265,14 @@ mod tests {
     fn sync_completion_expires_without_resetting_a_new_sync_or_error() {
         let now = Instant::now();
         let mut state = SyncButtonState::completed(now);
+        assert_eq!(state.hover_text(AppLanguage::SimplifiedChinese), "同步完成");
         state.expire(now + Duration::from_secs(2));
         assert!(matches!(state, SyncButtonState::Complete { .. }));
         state.expire(now + Duration::from_secs(3));
         assert!(matches!(state, SyncButtonState::Idle));
         assert_eq!(state.hover_text(AppLanguage::English), "Cloud sync");
-        state = SyncButtonState::Running {
-            stage: SyncStage::Uploading,
-            completed: 2,
-            total: 10,
-        };
+        state = SyncButtonState::starting();
+        state.update_stage(SyncStage::UploadingBooks, 2, 10);
         state.expire(now + Duration::from_secs(10));
         assert!(matches!(state, SyncButtonState::Running { .. }));
         state = SyncButtonState::Failed {
@@ -229,12 +293,12 @@ mod tests {
         assert!(
             state
                 .hover_text(AppLanguage::English)
-                .contains("Cloud request limit (429)")
+                .contains("Sync paused · Earliest retry")
         );
         assert!(
             state
                 .hover_text(AppLanguage::SimplifiedChinese)
-                .contains("秒后自动重试")
+                .contains("同步暂缓 · 最早可重试时间")
         );
         let mut repaint_delay = Duration::ZERO;
         for pass in 0..6 {
@@ -302,11 +366,8 @@ mod tests {
     #[test]
     fn sync_loading_button_only_shows_progress_on_hover() {
         let ctx = egui::Context::default();
-        let mut state = SyncButtonState::Running {
-            stage: SyncStage::Uploading,
-            completed: 35,
-            total: 100,
-        };
+        let mut state = SyncButtonState::starting();
+        state.update_stage(SyncStage::UploadingBooks, 2, 5);
         let (text, rect, enabled) = frame(&ctx, &state, 0.0, Vec::new());
         assert!(
             text.is_empty(),
@@ -318,14 +379,14 @@ mod tests {
         frame(&ctx, &state, 1.0, vec![egui::Event::PointerMoved(position)]);
         frame(&ctx, &state, 2.0, Vec::new());
         let (text, _, _) = frame(&ctx, &state, 3.0, Vec::new());
-        assert!(text.iter().any(|text| text == "Syncing · Uploading 35%"));
-        state = SyncButtonState::Running {
-            stage: SyncStage::Downloading,
-            completed: 62,
-            total: 100,
-        };
+        assert!(text.iter().any(|text| text == "2/5 books uploaded"));
+        state.update_stage(SyncStage::Books, 3, 6);
+        state.update_stage(SyncStage::Downloading, 62, 100);
         let (text, _, _) = frame(&ctx, &state, 4.0, Vec::new());
-        assert!(text.iter().any(|text| text == "Downloading books…"));
+        assert!(
+            text.iter()
+                .any(|text| text.contains("3/6 books ready") && text.contains("Downloading books"))
+        );
         for (index, pressed) in [true, false].into_iter().enumerate() {
             frame(
                 &ctx,

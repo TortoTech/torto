@@ -2,7 +2,7 @@
 Recognizing the characters is not enough to replace an image. Set
 replacement_safe=true only when the complete meaning of the original can be
 preserved in the proposed representation under ordinary reader reflow and
-typography. This requirement applies equally to Unicode text, LaTeX and XHTML tables.
+typography. This requirement applies equally to Unicode text, LaTeX, XHTML tables and the explicit line chart trace.
 
 Judge the exact representation returned, not a hypothetical richer
 reconstruction. Ordinary Unicode text is rendered as prose. Pure source-code transcriptions enter the shared code/quotation classifier, which can retain literal preformatted text and syntax highlighting; indentation and line breaks must already be faithful. Preserving the character sequence alone is

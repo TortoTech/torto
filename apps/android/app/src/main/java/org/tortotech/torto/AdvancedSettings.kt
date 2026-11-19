@@ -105,6 +105,11 @@ import org.tortotech.torto.core.*
         SettingChoice(tr("提供商","Provider"),provider,state.providers.map {it.id to it.name},!state.busy){id->val first=state.providers.firstOrNull {it.id==id}?.models?.firstOrNull().orEmpty();changeOptions {value->when{layout->value.copy(layoutProvider=id,layoutModel=first);translation->value.copy(translationProvider=id,translationModel=first);else->value.copy(chatProvider=id,chatModel=first)}}}
         SettingChoice(if(layout)tr("排版模型","Layout model")else if(translation)tr("翻译模型","Translation model")else tr("对话模型","Chat model"),selectedModel,selected?.models.orEmpty().map {it to it},!state.busy,searchable=true){id->changeOptions {value->when{layout->value.copy(layoutModel=id);translation->value.copy(translationModel=id);else->value.copy(chatModel=id)}}}
         SettingChoice(tr("思考等级","Reasoning effort"),reasoning,levels.map {it to(levelNames[it] ?: it)},!state.busy){effort->changeOptions {value->when{layout->value.copy(layoutReasoning=effort);translation->value.copy(translationReasoning=effort);else->value.copy(chatReasoning=effort)}}}
+        if (layout && draft.layoutEnabled && selected?.citationDecisionsAvailable == true) {
+            SettingToggle(tr("文献引用预判（试验）","Citation screening (experimental)"),draft.layoutCitationDecisions,!state.busy){enabled->
+                changeOptions {it.copy(layoutCitationDecisions=enabled)}
+            }
+        }
         }
         SettingsNote(if(layout)tr("使用能识图、速度快的模型（gemini/deepseek/qwen的flash系列）\n思考等级设置“不思考”","Use a fast model with vision\nReasoning effort: none")else if(translation)tr("使用文字能力强、速度快模型（gemini的flash系列）\n思考等级设置“低”或“不思考”","Use a fast model with strong language abilities\nReasoning effort: low or none")else tr("使用能识图的模型","Use a model with vision"))
         if(translation){
@@ -131,6 +136,7 @@ internal fun mergeAiRoleDraft(latest:AiOptions,original:AiOptions,edited:AiOptio
         layoutProvider=if(edited.layoutProvider!=original.layoutProvider)edited.layoutProvider else latest.layoutProvider,
         layoutModel=if(edited.layoutModel!=original.layoutModel)edited.layoutModel else latest.layoutModel,
         layoutReasoning=if(edited.layoutReasoning!=original.layoutReasoning)edited.layoutReasoning else latest.layoutReasoning,
+        layoutCitationDecisions=if(edited.layoutCitationDecisions!=original.layoutCitationDecisions)edited.layoutCitationDecisions else latest.layoutCitationDecisions,
     )
     "translation"->latest.copy(
         translationProvider=if(edited.translationProvider!=original.translationProvider)edited.translationProvider else latest.translationProvider,

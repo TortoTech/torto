@@ -546,14 +546,18 @@ fn automatic_check_enabled() -> bool {
 }
 
 pub(crate) fn manual_updates_supported() -> bool {
-    std::env::current_exe().map_or(true, |path| {
+    #[cfg(target_os = "windows")]
+    return std::env::current_exe().map_or(true, |path| {
         !path.components().any(|component| {
             component
                 .as_os_str()
                 .to_string_lossy()
                 .eq_ignore_ascii_case("WindowsApps")
         })
-    })
+    });
+
+    #[cfg(not(target_os = "windows"))]
+    cfg!(target_os = "macos")
 }
 
 async fn check_for_update() -> Result<Option<UpdateRelease>, String> {

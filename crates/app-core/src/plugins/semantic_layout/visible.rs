@@ -56,7 +56,8 @@ fn annotation_blocks(section: &Section, annotation: &Annotation) -> Vec<usize> {
         Annotation::QuoteAttribution {
             quote, attribution, ..
         } => vec![quote, attribution],
-        Annotation::ImageTable { href, .. }
+        Annotation::ImageChart { href, .. }
+        | Annotation::ImageTable { href, .. }
         | Annotation::ImageText { href, .. }
         | Annotation::ImageFormula { href, .. }
         | Annotation::UnreadableFormula { href } => {

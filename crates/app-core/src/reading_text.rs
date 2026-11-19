@@ -197,25 +197,16 @@ pub fn focus_footnote_text_in_section(
     target: &PublicationUrl,
     marker: &str,
 ) -> Option<String> {
-    let fragment = target.fragment()?;
-    let anchor = section
-        .anchors
-        .iter()
-        .find(|anchor| anchor.fragment == fragment)?
-        .source
-        .clone();
-    if let Some(note) = section
-        .blocks
-        .iter()
-        .find_map(|block| note_definition_containing_anchor(block, &anchor))
-    {
-        return normalize_resolved_footnote_text(&block_focus_text(note), marker);
-    }
-    let block = section
-        .blocks
-        .iter()
-        .find_map(|block| find_block_containing_anchor(block, &anchor))?;
+    let block = resolved_footnote_block(section, target)?;
     normalize_resolved_footnote_text(&block_focus_text(block), marker)
+}
+
+fn resolved_footnote_block<'a>(section: &'a Section, target: &PublicationUrl) -> Option<&'a Block> {
+    let fragment = target.fragment()?;
+    let anchor = &section.anchors.iter().find(|a| a.fragment == fragment)?.source;
+    section.blocks.iter()
+        .find_map(|block| note_definition_containing_anchor(block, anchor))
+        .or_else(|| section.blocks.iter().find_map(|block| find_block_containing_anchor(block, anchor)))
 }
 
 pub fn find_block_containing_anchor<'a>(
@@ -257,19 +248,36 @@ pub fn note_definition_containing_anchor<'a>(
 
 pub fn normalize_resolved_footnote_text(text: &str, marker: &str) -> Option<String> {
     let text = text.trim();
-    if text.is_empty() {
+    let body = strip_note_marker(text, marker).unwrap_or(text);
+    (!body.is_empty()).then(|| body.to_owned())
+}
+
+fn note_marker_value(marker: &str) -> &str {
+    marker.trim().trim_matches(['[', ']', '(', ')', '（', '）', '【', '】', '.', '．']).trim()
+}
+
+fn after_note_marker(text: &str) -> &str {
+    text.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '.' | '．' | '，' | '、' | ')' | '）' | ']' | '】')
+    })
+}
+
+fn strip_note_marker<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let value = note_marker_value(marker);
+    if value.is_empty() {
         return None;
     }
-    let without_marker = text.strip_prefix(marker.trim()).map_or(text, |rest| {
-        rest.trim_start_matches(|character: char| {
-            character.is_whitespace()
-                || matches!(
-                    character,
-                    '.' | '．' | '，' | '、' | ')' | '）' | ']' | '】'
-                )
-        })
-    });
-    Some(without_marker.to_owned())
+    let text = text.trim_start();
+    if let Some((open, close)) = [('[' , ']'), ('(', ')'), ('（', '）'), ('【', '】')]
+        .into_iter()
+        .find(|(open, _)| text.starts_with(*open))
+    {
+        let (label, rest) = text.strip_prefix(open)?.split_once(close)?;
+        return (label.trim() == value).then(|| after_note_marker(rest));
+    }
+    let rest = text.strip_prefix(value)?;
+    (rest.is_empty() || after_note_marker(rest).len() < rest.len())
+        .then(|| after_note_marker(rest))
 }
 
 pub fn text_block_focus_text(block: &TextBlock) -> String {
@@ -492,24 +500,54 @@ pub fn note_block_markdown(block: &Block) -> String {
 pub fn focus_footnote_markdown_in_section(
     section: &Section,
     target: &PublicationUrl,
+    marker: &str,
+    unified: bool,
 ) -> Option<String> {
-    let fragment = target.fragment()?;
-    let anchor = &section
-        .anchors
-        .iter()
-        .find(|a| a.fragment == fragment)?
-        .source;
-    let block = section
-        .blocks
-        .iter()
-        .find_map(|b| note_definition_containing_anchor(b, anchor))
-        .or_else(|| {
-            section
-                .blocks
-                .iter()
-                .find_map(|b| find_block_containing_anchor(b, anchor))
-        })?;
-    Some(note_block_markdown(block))
+    let block = resolved_footnote_block(section, target)?;
+    let mut paragraphs = Vec::new();
+    let mut removed_marker = false;
+    for text in block.text_blocks() {
+        let mut content = text.content.clone();
+        if paragraphs.is_empty() {
+            // Remove the leading backlink before escaping Markdown or introducing
+            // emphasis syntax. A normal link whose label is the marker is a
+            // legacy backlink; other links in the note body remain selectable.
+            let first = content.iter_mut().position(|inline| match inline {
+                Inline::Text(run) => {
+                    if run.text.trim().is_empty() {
+                        return false;
+                    }
+                    if run.style.link_role == LinkRole::FootnoteBacklink
+                        || (!removed_marker && run.link.is_some()
+                            && !note_marker_value(marker).is_empty()
+                            && note_marker_value(&run.text) == note_marker_value(marker))
+                    {
+                        removed_marker = true;
+                        return false;
+                    }
+                    if !removed_marker && let Some(body) = strip_note_marker(&run.text, marker) {
+                        run.text = body.to_owned();
+                        removed_marker = true;
+                    } else if removed_marker {
+                        run.text = after_note_marker(&run.text).to_owned();
+                    }
+                    !run.text.is_empty()
+                }
+                Inline::Break => false,
+                _ => true,
+            });
+            let Some(first) = first else { continue };
+            content.drain(..first);
+        }
+        if unified {
+            rebook_layout::apply_translated_note_emphasis(&mut content);
+        }
+        let markup = note_inline_markdown(&content);
+        if !markup.trim().is_empty() {
+            paragraphs.push(markup);
+        }
+    }
+    (!paragraphs.is_empty()).then(|| paragraphs.join("\n\n"))
 }
 #[cfg(test)]
 mod popup_tests {
@@ -536,6 +574,38 @@ mod popup_tests {
         assert!(value.contains("**Bold \\[literal\\]**"));
         assert!(value.contains("https://example.com/note"));
         assert!(value.contains(r"$\frac{1}{2}$"));
+    }
+
+    #[test]
+    fn popup_removes_linked_marker_and_applies_unified_translation_emphasis() {
+        let href = PublicationUrl::parse("notes.xhtml").unwrap();
+        let descriptor = rebook_publication::SpineItem {
+            id: rebook_publication::SpineItemId::new("notes").unwrap(),
+            href: href.clone(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let mut section = rebook_html::parse_section(
+            r#"<html><body><p id="note"><a href="chapter.xhtml#ref"><b>11</b></a>. <em>译文</em> <a href="https://example.com">来源</a></p></body></html>"#,
+            &descriptor, |_| None,
+        ).unwrap();
+        let target = href.resolve("#note").unwrap();
+        let original = focus_footnote_markdown_in_section(&section, &target, "[11]", true).unwrap();
+        assert!(original.starts_with("*译文*"), "{original}");
+        if let Block::Text(block) = &mut section.blocks[0] {
+            for inline in &mut block.content {
+                if let Inline::Text(run) = inline {
+                    run.style.display_writing_system = Some(rebook_publication::WritingSystem::Cjk);
+                }
+            }
+        }
+        let unified = focus_footnote_markdown_in_section(&section, &target, "[11]", true).unwrap();
+        assert!(unified.starts_with("**译文**"), "{unified}");
+        assert!(unified.contains("https://example.com"));
+        assert!(!unified.contains("chapter.xhtml"));
+        assert_eq!(normalize_resolved_footnote_text("11", "11"), None);
+        assert_eq!(normalize_resolved_footnote_text("110 is the total", "11").as_deref(), Some("110 is the total"));
     }
 }
 
@@ -622,28 +692,7 @@ pub fn focus_footnote_translation_ranges_in_section(
     section: &Section,
     target: &PublicationUrl,
 ) -> Vec<SourceRange> {
-    let Some(fragment) = target.fragment() else {
-        return Vec::new();
-    };
-    let Some(anchor) = section
-        .anchors
-        .iter()
-        .find(|anchor| anchor.fragment == fragment)
-        .map(|anchor| &anchor.source)
-    else {
-        return Vec::new();
-    };
-    let target_block = section
-        .blocks
-        .iter()
-        .find_map(|block| note_definition_containing_anchor(block, anchor))
-        .or_else(|| {
-            section
-                .blocks
-                .iter()
-                .find_map(|block| find_block_containing_anchor(block, anchor))
-        });
-    let Some(target_block) = target_block else {
+    let Some(target_block) = resolved_footnote_block(section, target) else {
         return Vec::new();
     };
     let mut ranges = Vec::new();

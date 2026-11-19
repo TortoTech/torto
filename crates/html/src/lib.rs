@@ -16,6 +16,7 @@ use roxmltree::{Document, Node};
 use thiserror::Error;
 
 mod font_size;
+mod drop_caps;
 mod page_markers;
 mod offscreen;
 mod recognized_tables;
@@ -54,7 +55,7 @@ pub enum HtmlError {
 }
 
 /// Publication-level semantic hints that cannot be derived reliably from one HTML resource.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default)]
 pub struct SectionParseHints<'a> {
     /// Reader-owned page spacing replaces body margins, leaving child styles intact.
     pub ignore_body_margins: bool,
@@ -65,7 +66,11 @@ pub struct SectionParseHints<'a> {
     pub ancestor_targets: &'a [PublicationUrl],
     /// Explicit TOC destinations must never be absorbed into a media caption.
     pub heading_targets: &'a [PublicationUrl],
+    /// On-demand access to adjacent content referenced by legacy footnote links.
+    pub linked_footnote_document: Option<&'a dyn Fn(&PublicationUrl) -> Option<String>>,
 }
+
+mod linked_footnotes;
 
 fn classify_footnote_links(
     document: &Document<'_>,
@@ -374,7 +379,10 @@ pub fn parse_section_with_resource_metadata(
         .descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "body")
         .unwrap_or_else(|| document.root_element());
-    let footnote_links = classify_footnote_links(&document, &descriptor.href);
+    let mut footnote_links = classify_footnote_links(&document, &descriptor.href);
+    if let Some(load) = hints.linked_footnote_document {
+        linked_footnotes::classify(&document, &descriptor.href, load, &mut footnote_links);
+    }
     #[cfg(debug_assertions)]
     let links_finished = profile_started.elapsed();
     let mut parser = ReadingIrParser::new(
@@ -757,6 +765,7 @@ impl<'a> ReadingIrParser<'a> {
             && node_has_visible_text(container);
 
         let children = container.children().collect::<Vec<_>>();
+        let mut clears = Vec::new();
         let mut index = 0;
         while index < children.len() {
             let child = children[index];
@@ -772,6 +781,10 @@ impl<'a> ReadingIrParser<'a> {
                     style,
                     std::mem::replace(&mut collector, InlineCollector::new(false)),
                 );
+                if !node_has_visible_text(child) && !has_descendant_image(child) {
+                    let clear = clear_float_value(&self.styles.cascaded_properties(child));
+                    if clear != 0 { clears.push((self.blocks.len(), clear)); }
+                }
                 if let Some(consumed) = self.try_parse_text_figure(&children[index..])? {
                     index += consumed;
                     continue;
@@ -850,8 +863,18 @@ impl<'a> ReadingIrParser<'a> {
             index += 1;
         }
         self.push_collected_text_block(TextBlockKind::Paragraph, style, collector);
+        for (at, clear) in clears {
+            if let Some(Block::Text(text)) = self.blocks.get_mut(at) { text.style.clear_floats |= clear; }
+        }
         if group_candidate {
             paragraph_groups::mark(&mut self.blocks[group_start..], container.range().start as u64 + 1);
+        }
+        if let Some(label) = floating_label(container, &self.styles)
+            && let [Block::Text(first), Block::Text(second), ..] = &mut self.blocks[group_start..]
+            && first.kind == TextBlockKind::Paragraph && second.kind == TextBlockKind::Paragraph
+            && text_block_text_for_label(first) == label
+        {
+            first.style.floating_label = Some(label.chars().count() as u32);
         }
         Ok(())
     }
@@ -1920,6 +1943,8 @@ impl<'a> ReadingIrParser<'a> {
                 }) == Some(table)
         }) {
             let mut cells = Vec::new();
+            let in_thead = row.ancestors().take_while(|node| *node != table)
+                .any(|node| node.has_tag_name("thead"));
             for cell in row.children().filter(|node| {
                 node.is_element()
                     && matches!(
@@ -1931,6 +1956,12 @@ impl<'a> ReadingIrParser<'a> {
                 self.queue_descendant_anchors(cell);
                 let header = cell.tag_name().name().eq_ignore_ascii_case("th");
                 let mut style = self.styles.block_style(cell, BlockStyle::default());
+                style.keep_table_alignment = in_thead
+                    || attribute_local(cell, "role").is_some_and(|role| {
+                        role.split_ascii_whitespace().any(|role| {
+                            matches!(role, "rowheader" | "columnheader")
+                        })
+                    });
                 style.indent = 0.0;
                 style.margin_before = 0.0;
                 style.margin_after = 0.0;
@@ -2169,6 +2200,14 @@ impl<'a> ReadingIrParser<'a> {
             &mut collector,
         );
         collector.finish();
+        if kind == TextBlockKind::Paragraph {
+            self.styles.apply_first_letter(node, &mut collector.content);
+            style.right_equation_number = collector.content.iter().any(|i| matches!(i, Inline::Image(_)))
+                && node.descendants().skip(1).filter(Node::is_element).any(|element| {
+                    element.text().is_some_and(is_equation_label)
+                        && self.styles.cascaded_properties(element).get("float").is_some_and(|value| value == "right")
+                });
+        }
         if let Some(marker_chars) = style.authored_list_marker {
             style.authored_list_marker = Some(paragraph_lists::prefix_length(
                 &collector.content,
@@ -3280,6 +3319,9 @@ fn collect_inline_node_with_block_boundaries(
             .styles
             .apply_inline_text_node(node, &mut style, inherited);
     }
+    if collector.content.is_empty() && link.is_none() && !is_block_boundary(&name) && name != "a" {
+        context.styles.mark_floating_initial(node, &mut style, inherited.size_scale);
+    }
     if name == "span" {
         let classes = attribute_local(node, "class").unwrap_or_default();
         if classes
@@ -3753,6 +3795,8 @@ impl QuoteLayoutMetrics {
 struct StyleSheet {
     ignore_body_margins: bool,
     rules: Vec<StyleRule>,
+    first_letter_rules: Vec<StyleRule>,
+    first_letter_index: RuleIndex,
     marker_rules: Vec<(Selector, Option<rebook_publication::ListMarkerFormat>)>,
     rule_index: RuleIndex,
     // A sheet belongs to one parsed document. Never retain node IDs across
@@ -3895,6 +3939,19 @@ impl StyleSheet {
                 self.has_font_families |= declarations.iter().chain(&important_declarations)
                     .any(|(name,_)| name == "font-family" || name == "font");
                 for raw_selector in prelude.split(',') {
+                    if let Some(raw) = raw_selector.trim().strip_suffix("::first-letter")
+                        .or_else(|| raw_selector.trim().strip_suffix(":first-letter"))
+                    {
+                        if let Some(selector) = Selector::parse(raw) {
+                            self.first_letter_index.insert(self.first_letter_rules.len(), &selector);
+                            self.first_letter_rules.push(StyleRule {
+                                specificity: selector.specificity(), selector, order: self.next_order,
+                                declarations: declarations.clone(),
+                                important_declarations: important_declarations.clone(),
+                            });
+                        }
+                        continue;
+                    }
                     // Generated list counters are read separately: pseudo-element
                     // styles must never leak onto an ordinary text run.
                     if let Some(parent) = raw_selector.trim().strip_suffix("::before")
@@ -3939,6 +3996,9 @@ impl StyleSheet {
                 style.direction = direction;
             }
             apply_block_properties(&mut style, &properties, inherited_only);
+            if !inherited_only {
+                style.clear_floats = clear_float_value(&properties);
+            }
             if let Some(alignment) =
                 attribute_local(ancestor, "align").and_then(parse_text_alignment)
             {
@@ -4255,6 +4315,23 @@ impl StyleSheet {
             height: image_context::dimension(self, node, &properties, "height"),
             ..ImageStyle::default()
         };
+        for element in node.ancestors().filter(Node::is_element).take(5) {
+            if element != node && !matches!(element.tag_name().name(), "figure" | "span" | "a" | "div") { break; }
+            let props = self.cascaded_properties(element);
+            let side = match props.get("float").map(String::as_str) {
+                Some("left") => Some(false),
+                Some("right") => Some(true),
+                _ => None,
+            };
+            if let Some(right) = side {
+                style.float_right = side;
+                let adjacent = if right { "left" } else { "right" };
+                style.float_gap = ["margin", "padding"].iter()
+                    .filter_map(|k| props.get(&format!("{k}-{adjacent}")).and_then(|v| css_length(v)))
+                    .sum::<f32>().max(0.0);
+                break;
+            }
+        }
         style.min_width = properties.get("min-width").and_then(|v| image_length(v));
         style.min_height = properties.get("min-height").and_then(|v| image_length(v));
         if let Some(value) = properties
@@ -4746,6 +4823,42 @@ fn split_declarations(style: &str) -> (CssDeclarations, CssDeclarations) {
         if priority { important.push((name, value)); } else { normal.push((name, value)); }
     }
     (normal, important)
+}
+
+fn clear_float_value(properties: &HashMap<String, String>) -> u8 {
+    match properties.get("clear").map(String::as_str) {
+        Some("left") => 1,
+        Some("right") => 2,
+        Some("both") => 3,
+        _ => 0,
+    }
+}
+
+fn text_block_text_for_label(text: &TextBlock) -> String {
+    text.content.iter().flat_map(Inline::text_runs).map(|run| run.text.as_str()).collect()
+}
+
+fn is_equation_label(text: &str) -> bool {
+    let text = text.trim();
+    ((text.starts_with('(') && text.ends_with(')')) || (text.starts_with('（') && text.ends_with('）')))
+        && text.chars().count() <= 24 && text.chars().any(|c| c.is_ascii_digit())
+}
+
+fn floating_label(container: Node<'_, '_>, styles: &StyleSheet) -> Option<String> {
+    let mut children = container.children().filter(|n| n.is_element() || n.is_text() && !n.text().unwrap_or_default().trim().is_empty());
+    let first = children.next()?;
+    let body = children.next()?;
+    if !first.is_element() || !body.is_element()
+        || !matches!(first.tag_name().name(), "span" | "a")
+        || !matches!(body.tag_name().name(), "div" | "p")
+        || styles.cascaded_properties(first).get("float").map(String::as_str) != Some("left")
+        || !node_has_visible_text(body)
+    { return None; }
+    let value = first.descendants().filter_map(|n| n.is_text().then(|| n.text()).flatten()).collect::<String>();
+    let value = value.trim();
+    let number = value.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '.' | ':' | '（' | '）'));
+    (!number.is_empty() && number.len() <= 6 && number.chars().all(|c| c.is_ascii_digit()))
+        .then(|| value.to_owned())
 }
 
 fn css_length(value: &str) -> Option<f32> {
@@ -5415,6 +5528,28 @@ mod tests {
 
         assert_eq!(breaks, 2);
         assert_eq!(lines, "• First item\n• Second item\n• Third item");
+    }
+
+    #[test]
+    fn table_data_cells_in_header_groups_and_with_header_roles_keep_their_alignment() {
+        let descriptor = SpineItem {
+            id: SpineItemId::new("chapter").unwrap(),
+            href: PublicationUrl::parse("chapter.xhtml").unwrap(),
+            media_type: "application/xhtml+xml".into(),
+            linear: true,
+            properties: Vec::new(),
+        };
+        let section = parse_section(
+            "<html><body><table><thead><tr><td>Header</td><td>Value</td></tr></thead>
+             <tbody><tr><td role='rowheader'>Row heading</td><td>123</td></tr></tbody></table></body></html>",
+            &descriptor,
+            |_| None,
+        ).unwrap();
+        let [Block::Table(table)] = section.blocks.as_slice() else { panic!("expected table"); };
+        assert!(!table.rows[0].cells[0].header, "preserve existing header styling");
+        assert!(table.rows[0].cells.iter().all(|cell| cell.text.style.keep_table_alignment));
+        assert!(table.rows[1].cells[0].text.style.keep_table_alignment);
+        assert!(!table.rows[1].cells[1].text.style.keep_table_alignment);
     }
 
     #[test]
