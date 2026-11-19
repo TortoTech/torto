@@ -3,6 +3,7 @@ package org.tortotech.torto
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.os.Bundle
 import android.view.GestureDetector
@@ -58,6 +59,7 @@ class ReaderView(context: Context) : View(context) {
     private var referenceIndicator:org.tortotech.torto.core.Rect?=null
     private var frame: ReaderFrame? = null
     private var selected: SelectedText? = null
+    private val selectionPath = Path()
     private val density get() = resources.displayMetrics.density
     private var anchorX = 0f; private var anchorY = 0f
     private var selecting = false
@@ -415,6 +417,12 @@ class ReaderView(context: Context) : View(context) {
         }
         previousPage=previous;nextPage=following
         val changed=old!==next||confirmed||selected!=selection
+        if (selected != selection) {
+            selectionPath.rewind()
+            selection?.bounds?.forEach { area ->
+                selectionPath.addRect(area.x, area.y, area.x + area.width, area.y + area.height, Path.Direction.CW)
+            }
+        }
         selected=selection
         if(changed)invalidate()
         if(replayUnit!=null)requestQueuedUnitTurn(replayUnit!!)
@@ -490,7 +498,13 @@ class ReaderView(context: Context) : View(context) {
                 bounds.forEach {r->canvas.clipOutRect(((r.x-8)*density).coerceAtLeast(0f),(r.y+focusShift-2)*density,((r.x+r.width+8)*density).coerceAtMost(width.toFloat()),(r.y+focusShift+r.height+2)*density)}
                 canvas.drawRect(0f,pendingOffset,width.toFloat(),height+pendingOffset,focusShade);canvas.restore()}
         }
-        selected?.bounds?.forEach {canvas.drawRect(it.x*density,it.y*density,(it.x+it.width)*density,(it.y+it.height)*density,highlight)}
+        if (!selectionPath.isEmpty) {
+            // Fill overlapping line boxes together so the selection alpha is applied once.
+            val layer = canvas.save()
+            canvas.scale(density, density)
+            canvas.drawPath(selectionPath, highlight)
+            canvas.restoreToCount(layer)
+        }
         referenceIndicator?.let {r->canvas.drawRoundRect(r.x*density,r.y*density,(r.x+r.width)*density,(r.y+r.height)*density,density,density,referencePaint)}
         canvas.restore()
         handlePoints().forEach {(x,y)->if(y>=0&&y<=height)canvas.drawCircle(x,y+6*density,7*density,handlePaint)}

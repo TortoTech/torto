@@ -4314,6 +4314,45 @@ fn unified_body_line_height(system: WritingSystem) -> f32 {
     }
 }
 
+const UNIFIED_HEADING_LINE_HEIGHT: f32 = 1.3;
+
+fn unified_heading_line_height(block: &TextBlock, fallback: WritingSystem) -> f32 {
+    // Inline annotations, raised glyphs and objects can extend above the
+    // normal text line. Keep the existing leading for those titles.
+    if block.content.iter().any(|inline| match inline {
+        Inline::Text(run) => run.style.baseline != TextBaseline::Normal,
+        Inline::Break => false,
+        _ => true,
+    }) {
+        return UNIFIED_HEADING_LINE_HEIGHT;
+    }
+
+    let mut system = None;
+    for ch in block
+        .content
+        .iter()
+        .flat_map(Inline::text_runs)
+        .flat_map(|run| run.text.chars())
+    {
+        match ch.script() {
+            Script::Han | Script::Hiragana | Script::Katakana | Script::Hangul | Script::Bopomofo => {
+                system = Some(WritingSystem::Cjk);
+            }
+            Script::Latin => {
+                system.get_or_insert(WritingSystem::Latin);
+            }
+            Script::Common | Script::Inherited | Script::Unknown => {}
+            _ if ch.is_alphabetic() => return UNIFIED_HEADING_LINE_HEIGHT,
+            _ => {}
+        }
+    }
+    match system.unwrap_or(fallback) {
+        WritingSystem::Latin => 1.15,
+        WritingSystem::Cjk => 1.20,
+        WritingSystem::Other | WritingSystem::Unknown => UNIFIED_HEADING_LINE_HEIGHT,
+    }
+}
+
 fn resolve_text_block<'a>(
     block: &'a TextBlock,
     reader_style: &ReaderStyle,
@@ -4405,7 +4444,7 @@ fn resolve_text_block_with_caption_emphasis<'a>(
         TextContext::Flow => match block.kind {
             TextBlockKind::Heading(level) => (
                 unified_heading_scale(profile.heading_scale, level),
-                1.3,
+                UNIFIED_HEADING_LINE_HEIGHT,
                 base_size * profile.heading_body_gap_em,
             ),
             TextBlockKind::HeadingOrdinal(level) => (
@@ -4502,7 +4541,13 @@ fn resolve_text_block_with_caption_emphasis<'a>(
     } else {
         0.0
     };
-    resolved.style.line_height = line_height;
+    // The title's internal leading and authored gaps after the title are independent.
+    resolved.style.line_height =
+        if context == TextContext::Flow && matches!(block.kind, TextBlockKind::Heading(_)) {
+            unified_heading_line_height(&resolved, display_system)
+        } else {
+            line_height
+        };
     if block.style.paragraph_group.is_some()
         && matches!(resolved.style.align, TextAlignment::Center | TextAlignment::End)
     {
@@ -8294,13 +8339,87 @@ mod tests {
         assert!(resolved.style.margin_before.abs() < 0.001);
         assert!((resolved.style.margin_after - 14.0).abs() < 0.001);
         assert!(resolved.style.indent.abs() < 0.001);
-        assert!((resolved.style.line_height - 1.3).abs() < 0.001);
+        assert!((resolved.style.line_height - 1.15).abs() < 0.001);
         let Inline::Text(run) = &resolved.content[0] else {
             panic!("expected text run");
         };
         assert!((run.style.size_scale - 1.432).abs() < 0.001);
         assert!(run.style.bold);
         assert!(!run.style.italic);
+    }
+
+    #[test]
+    fn unified_wrapped_headings_use_the_displayed_script_and_keep_the_trailing_gap() {
+        let style = ReaderStyle {
+            // Either a heading in another language or a translation can
+            // differ from the book's declared language.
+            writing_system: WritingSystem::Cjk,
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let mut engine = LayoutEngine::new();
+        for (title, leading) in [
+            ("Élévation des idées et mémoire", 1.15),
+            ("AI時代のデータと記憶を読み解く", 1.20),
+        ] {
+            let block = TextBlock {
+                kind: TextBlockKind::Heading(1),
+                content: vec![Inline::Text(TextRun {
+                    text: title.into(),
+                    style: TextStyle::default(),
+                    link: None,
+                })],
+                style: BlockStyle {
+                    hard_break_after: true,
+                    ..BlockStyle::default()
+                },
+                source: None,
+            };
+            let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+            assert_eq!(resolved.style.line_height, leading);
+            assert!((resolved.style.margin_after - 40.0).abs() < 0.01);
+
+            let prepared = engine.shape_text(&resolved, &style, 190.0);
+            assert!(prepared.layout.len() >= 2);
+            let line_height = style.typography.font_size * style.typesetting.heading_scale * leading;
+            let first = prepared.layout.get(0).unwrap().metrics().baseline;
+            let second = prepared.layout.get(1).unwrap().metrics().baseline;
+            assert!((second - first - line_height).abs() < 0.5);
+
+            let mut book_style = style.clone();
+            book_style.typesetting.mode = TypesettingMode::Book;
+            assert_eq!(
+                resolve_text_block(&block, &book_style, TextContext::Flow).style.line_height,
+                block.style.line_height
+            );
+        }
+    }
+
+    #[test]
+    fn unified_heading_with_ruby_retains_annotation_room() {
+        let text = |value: &str| TextRun {
+            text: value.into(),
+            style: TextStyle::default(),
+            link: None,
+        };
+        let block = TextBlock {
+            kind: TextBlockKind::Heading(1),
+            content: vec![Inline::Ruby(Box::new(rebook_publication::RubyRun {
+                base: vec![text("漢字")],
+                annotation: vec![text("かんじ")],
+                below: false,
+            }))],
+            style: BlockStyle::default(),
+            source: None,
+        };
+        let style = ReaderStyle {
+            typesetting: ReaderTypesetting::unified(),
+            ..ReaderStyle::default()
+        };
+        let resolved = resolve_text_block(&block, &style, TextContext::Flow);
+        assert_eq!(resolved.style.line_height, UNIFIED_HEADING_LINE_HEIGHT);
+        let shaped = LayoutEngine::new().shape_text(&resolved, &style, 190.0);
+        assert_eq!(shaped.ruby.len(), 1);
     }
 
     #[test]
