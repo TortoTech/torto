@@ -53,6 +53,8 @@
               <uap:FileType>.fb2</uap:FileType>
               <uap:FileType>.fbz</uap:FileType>
               <uap:FileType>.cbz</uap:FileType>
+              <uap:FileType>.lit</uap:FileType>
+              <uap:FileType>.txt</uap:FileType>
               <uap:FileType>.pdf</uap:FileType>
             </uap:SupportedFileTypes>
           </uap:FileTypeAssociation>

@@ -1,0 +1,9 @@
+LIT tag and attribute mappings (maps.rs)
+  calibre: Copyright (c) 2008 Marshall T. Vandegrift, GPL-3.0-only.
+  https://github.com/kovidgoyal/calibre/tree/master/src/calibre/ebooks/lit/maps
+  Rust table port: eruditio, Ryker Zhu, Apache-2.0.
+  https://github.com/DevExzh/eruditio/tree/c517504356fcf1ec68a72be5a5005dff393da3f8/crates/eruditio/src/formats/lit
+
+LZX decoder (lzx.rs)
+  libchm 0.2.0: Copyright (c) 2025 Quin Gillespie, MIT.
+  https://github.com/trypsynth/libchm

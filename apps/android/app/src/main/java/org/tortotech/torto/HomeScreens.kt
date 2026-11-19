@@ -25,7 +25,7 @@ import org.tortotech.torto.core.*
 @Composable fun ShelfScreen(state: ScreenState,model: ReaderModel,onActions:(BookSummary)->Unit) {
     if(!state.loaded) { Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){CircularProgressIndicator()};return }
     if(state.books.isEmpty()) { Box(Modifier.fillMaxSize().padding(24.dp),contentAlignment=Alignment.Center) {
-        Text(tr("书架还是空的。\n点击 + 导入 EPUB、FB2、CBZ、\nMOBI、CHM 或 PDF。","No books yet.\nTap + to import an EPUB, FB2, CBZ,\nMOBI, CHM or PDF."),textAlign=TextAlign.Center)
+        Text(tr("书架还是空的。\n点击 + 导入 EPUB、PDF、TXT、LIT 等电子书。","No books yet.\nTap + to import EPUB, PDF, TXT, LIT, and other e-books."),textAlign=TextAlign.Center)
     };return }
     LazyVerticalGrid(columns=GridCells.Fixed(3),contentPadding=PaddingValues(start=18.dp,end=18.dp,top=20.dp,bottom=32.dp),horizontalArrangement=Arrangement.spacedBy(14.dp),verticalArrangement=Arrangement.spacedBy(22.dp)) {
         items(state.books,key={it.id}) { book ->

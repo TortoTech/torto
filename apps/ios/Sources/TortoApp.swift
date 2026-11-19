@@ -157,7 +157,7 @@ private struct HomeView: View {
             if library.working || library.core == nil && library.error == nil {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Text(mobileText("书架还是空的。\n点击 + 导入 EPUB、FB2、CBZ、\nMOBI、CHM 或 PDF。", "No books yet.\nTap + to import an EPUB, FB2, CBZ,\nMOBI, CHM or PDF."))
+                Text(mobileText("书架还是空的。\n点击 + 导入 EPUB、PDF、TXT、LIT 等电子书。", "No books yet.\nTap + to import EPUB, PDF, TXT, LIT, and other e-books."))
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(.horizontal, 24)

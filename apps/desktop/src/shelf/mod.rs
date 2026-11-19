@@ -774,7 +774,7 @@ impl ShelfFeature {
                     .add_filter(
                         "E-books",
                         &[
-                            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "pdf",
+                            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "lit", "txt", "pdf",
                         ],
                     )
                     .pick_files()
