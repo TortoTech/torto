@@ -1213,7 +1213,7 @@ impl DesktopReader {
                     let viewport_changed = self.semantic_layout.pending_viewport.take().is_some();
                     self.semantic_layout.viewport_reflow_at = None;
                     let anchor = self.semantic_layout.viewport_anchor.take().or_else(|| {
-                        self.capture_focus_reflow_anchor(super::FocusReflowKind::DocumentLayout)
+                        self.capture_reflow_anchor(super::FocusReflowKind::DocumentLayout)
                     });
                     let old = std::mem::replace(&mut self.reader, prepared);
                     runtime.spawn_blocking(move || drop(old));
