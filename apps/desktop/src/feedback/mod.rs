@@ -253,12 +253,23 @@ impl FeedbackFeature {
         }
     }
 
+    /// Read the clipboard on the event-loop thread; the worker only encodes.
+    ///
+    /// egui-winit reads the same clipboard for the paste event on this thread,
+    /// and two threads reading the Windows clipboard at once corrupt its heap.
     pub(crate) fn paste_images(&mut self) {
         if self.accepts_images() {
             self.image_error = None;
             self.pasted_image = None;
-            self.image_task.begin(screenshots::Source::Clipboard);
+            self.begin_paste_images(crate::platform::feedback_content());
         }
+    }
+
+    fn begin_paste_images(&mut self, content: crate::platform::ClipboardContent) {
+        if matches!(content, crate::platform::ClipboardContent::None) {
+            return;
+        }
+        self.image_task.begin(screenshots::Source::Clipboard(content));
     }
 
     pub(crate) fn complete_images(&mut self, message: screenshots::Message) {
@@ -266,7 +277,7 @@ impl FeedbackFeature {
             return;
         };
         let restoring = matches!(source, screenshots::Source::Restore(_));
-        if matches!(source, screenshots::Source::Clipboard) {
+        if matches!(source, screenshots::Source::Clipboard(_)) {
             // The same clipboard can expose both image pixels and a filename/URL.
             // Delay egui's text paste until the worker decides which representation wins.
             self.pasted_image = Some(message.result.as_ref().map_or(true, |images| !images.is_empty()));
@@ -334,7 +345,7 @@ impl FeedbackFeature {
         let mut send = false;
         let mut close = false;
         let mut prepare = false;
-        if matches!(self.image_task.active(), Some(screenshots::Source::Clipboard)) || self.pasted_image.is_some() {
+        if matches!(self.image_task.active(), Some(screenshots::Source::Clipboard(_))) || self.pasted_image.is_some() {
             ctx.input_mut(|input| {
                 input.events.retain(|event| {
                     if matches!(event, egui::Event::Paste(_)) {

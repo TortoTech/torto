@@ -1,5 +1,5 @@
 use super::*;
-use crate::reader::{AssistantPresentation, ChatStreamMessage, ChatStreamingState, Motion};
+use crate::reader::{AssistantPresentation, ChatStreamMessage, ChatStreamingState, Motion, ScrollViewportState};
 
 fn reader() -> DesktopReader {
     let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
@@ -131,53 +131,61 @@ fn key_event(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
     }
 }
 
+/// Focus mode keeps one conversation per paragraph and the classic mode keeps
+/// the book's own one, so a draft and a hidden stream survive every switch.
 #[test]
-fn shortcuts_use_independent_book_and_paragraph_sessions_and_keep_hidden_streams() {
+fn paragraphs_and_the_book_keep_independent_sessions_and_hidden_streams() {
     let mut reader = reader();
     let ctx = egui::Context::default();
-    let sidebar = reader.shortcuts.toggle_right_sidebar;
-    let popup = reader.shortcuts.focus_chat;
-    shortcut(&mut reader, &ctx, sidebar);
-    assert!(reader.assistant_is_docked());
-    assert!(reader.focus_chat_session_key.is_none());
-    let book_session = reader.chat.session_id;
-    reader.chat.input = "Book draft".into();
+    let panel = reader.shortcuts.focus_chat;
+    shortcut(&mut reader, &ctx, panel);
+    assert!(reader.focus_assistant_popup_visible());
+    assert!(reader.focus_chat_session_key.is_some());
+    let first_session = reader.chat.session_id;
+    reader.chat.input = "First draft".into();
     reader.chat.streaming = Some(ChatStreamingState {
         thinking_seconds: None,
         started: Instant::now(),
         task_id: 77,
-        content: "First book answer".into(),
+        content: "First answer".into(),
         progress: Vec::new(),
         reasoning_index: None,
         tools: Default::default(),
     });
-    shortcut(&mut reader, &ctx, sidebar);
-    shortcut(&mut reader, &ctx, popup);
-    assert!(reader.focus_assistant_popup_visible());
-    assert_ne!(reader.chat.session_id, book_session);
+    // Turning a paragraph swaps in that paragraph's own, empty conversation.
+    reader.select_focus_unit(1);
+    assert_eq!(reader.focus_unit_index, 1);
+    assert_ne!(reader.chat.session_id, first_session);
     assert!(reader.chat.input.is_empty());
     assert!(reader.chat.streaming.is_none());
-    reader.chat.input = "Paragraph draft".into();
-    let paragraph_session = reader.chat.session_id;
+    reader.chat.input = "Second draft".into();
+    let second_session = reader.chat.session_id;
+    // A stream that belongs to the first session never lands in this one.
     reader.update_chat_stream(ChatStreamMessage {
         id: 77,
-        session_id: book_session,
-        content: crate::plugins::ChatStreamEvent::Content("Book answer continued".into()),
+        session_id: first_session,
+        content: crate::plugins::ChatStreamEvent::Content("First answer continued".into()),
     });
     assert!(reader.chat.streaming.is_none());
-    shortcut(&mut reader, &ctx, sidebar);
-    assert_eq!(reader.chat.session_id, book_session);
-    assert_eq!(reader.chat.input, "Book draft");
-    assert!(reader.chat.references.is_empty());
+    // Going back restores the first paragraph's draft and its stream.
+    reader.select_focus_unit(0);
+    assert_eq!(reader.chat.session_id, first_session);
+    assert_eq!(reader.chat.input, "First draft");
     assert_eq!(
         reader.chat.streaming.as_ref().unwrap().content,
-        "Book answer continued"
+        "First answer continued"
     );
-    shortcut(&mut reader, &ctx, sidebar);
-    assert!(reader.ui.assistant_panel.is_none());
-    shortcut(&mut reader, &ctx, popup);
-    assert_eq!(reader.chat.session_id, paragraph_session);
-    assert_eq!(reader.chat.input, "Paragraph draft");
+    // The classic mode shows the book's conversation instead, and the paragraph
+    // conversations are still there when focus mode comes back.
+    reader.reading_mode = crate::preferences::ReadingMode::Classic;
+    reader.restore_book_chat_session();
+    assert!(reader.focus_chat_session_key.is_none());
+    assert_ne!(reader.chat.session_id, first_session);
+    assert_ne!(reader.chat.session_id, second_session);
+    reader.reading_mode = crate::preferences::ReadingMode::Focus;
+    reader.select_focus_unit(1);
+    assert_eq!(reader.chat.session_id, second_session);
+    assert_eq!(reader.chat.input, "Second draft");
 }
 
 #[test]
@@ -809,4 +817,194 @@ fn sidebar_wheel_does_not_steal_body_or_footnote_scroll() {
         assert_eq!(routed, if should_route { -60.0 } else { 0.0 });
         assert_eq!(untouched, if should_route { 0.0 } else { -60.0 });
     }
+}
+
+/// A closed panel and an empty panel both leave the arrows to the reader; a
+/// session with messages takes them from the moment it has one.
+#[test]
+fn arrows_follow_the_panel_state_and_its_messages() {
+    for panel_open in [false, true] {
+        for has_messages in [false, true] {
+            let mut reader = reader();
+            reader.ui.assistant_panel = panel_open.then_some(AssistantPanel::Chat);
+            if has_messages {
+                reader.chat.messages.push(crate::plugins::ChatTurn {
+                    thinking_seconds: None,
+                    progress: Vec::new(),
+                    images: Vec::new(),
+                    role: ChatRole::Assistant,
+                    content: "An answer.".into(),
+                    display_content: None,
+                });
+            }
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(0.0),
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::ArrowDown,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |_| reader.keyboard_shortcuts(&ctx, false),
+            );
+            output.textures_delta.clear();
+            assert_eq!(
+                reader.chat.pending_keyboard_scroll_delta != 0.0,
+                panel_open && has_messages,
+                "panel_open={panel_open}, has_messages={has_messages}"
+            );
+        }
+    }
+}
+
+/// Handing the keyboard back to the page returns the arrows to the reader, and
+/// an empty conversation does not take them away again.
+#[test]
+fn arrows_return_to_the_reader_when_the_composer_loses_the_keyboard() {
+    let mut reader = reader();
+    reader.toggle_assistant_panel(AssistantPanel::Chat);
+    let ctx = egui::Context::default();
+    sidebar_frame(&mut reader, &ctx, Vec::new());
+    sidebar_frame(&mut reader, &ctx, Vec::new());
+    assert!(ctx.text_edit_focused());
+    let unit = reader.focus_unit_index;
+    // An empty conversation keeps the arrows in the composer.
+    sidebar_frame(
+        &mut reader,
+        &ctx,
+        vec![key_event(egui::Key::ArrowDown, true, false)],
+    );
+    assert_eq!(reader.focus_unit_index, unit);
+    sidebar_frame(
+        &mut reader,
+        &ctx,
+        vec![key_event(egui::Key::ArrowDown, false, false)],
+    );
+    ctx.memory_mut(egui::Memory::stop_text_input);
+    sidebar_frame(&mut reader, &ctx, Vec::new());
+    assert!(!ctx.text_edit_focused());
+    sidebar_frame(
+        &mut reader,
+        &ctx,
+        vec![key_event(egui::Key::ArrowDown, true, false)],
+    );
+    assert_eq!(reader.focus_unit_index, unit + 1);
+}
+
+/// A conversation with messages keeps the arrows even while the composer holds
+/// the keyboard.
+#[test]
+fn a_conversation_with_messages_keeps_the_arrows_with_the_keyboard() {
+    let mut reader = reader();
+    reader.toggle_assistant_panel(AssistantPanel::Chat);
+    reader.chat.messages.push(crate::plugins::ChatTurn {
+        thinking_seconds: None,
+        progress: Vec::new(),
+        images: Vec::new(),
+        role: ChatRole::Assistant,
+        content: "Paragraph answer".into(),
+        display_content: None,
+    });
+    let ctx = egui::Context::default();
+    sidebar_frame(&mut reader, &ctx, Vec::new());
+    sidebar_frame(&mut reader, &ctx, Vec::new());
+    assert!(ctx.text_edit_focused());
+    let unit = reader.focus_unit_index;
+    sidebar_frame(
+        &mut reader,
+        &ctx,
+        vec![key_event(egui::Key::ArrowDown, true, false)],
+    );
+    assert_eq!(reader.focus_unit_index, unit);
+    sidebar_frame(
+        &mut reader,
+        &ctx,
+        vec![key_event(egui::Key::ArrowDown, false, false)],
+    );
+}
+
+
+fn classic_reader() -> DesktopReader {
+    let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+    reader.reading_mode = crate::preferences::ReadingMode::Classic;
+    let mut style = reader.reader.style();
+    style.spread = rebook_layout::SpreadMode::Scroll;
+    reader.reader.set_style(style).unwrap();
+    reader.scroll_viewport = Some(ScrollViewportState {
+        size: egui::vec2(800.0, 800.0),
+        offset_y: 0.0,
+    });
+    reader
+}
+
+/// The classic mode summons the same chat panel with Tab, docked like the
+/// focus-mode panel. Opening it leaves the conversation context untouched:
+/// only a paragraph click attaches one.
+#[test]
+fn classic_tab_opens_the_chat_panel_without_touching_the_context() {
+    let mut reader = classic_reader();
+    let ctx = egui::Context::default();
+    let binding = reader.shortcuts.focus_chat;
+    shortcut(&mut reader, &ctx, binding);
+    assert!(reader.assistant_panel_is_open());
+    assert_eq!(reader.ui.assistant_panel, Some(AssistantPanel::Chat));
+    assert!(reader.assistant_is_docked());
+    assert!(
+        reader.chat.references.is_empty(),
+        "{:?}",
+        reader.chat.references
+    );
+    // Another Tab hands the keyboard to the composer instead of closing.
+    shortcut(&mut reader, &ctx, binding);
+    assert!(reader.assistant_panel_is_open());
+}
+
+/// Clicking a paragraph with the panel open hands that paragraph to the
+/// conversation; another click replaces it, and a closed panel keeps the
+/// context as it is.
+#[test]
+fn classic_click_attaches_the_paragraph_under_the_pointer() {
+    let mut reader = classic_reader();
+    let _layout = reader.current_scroll_layout().unwrap();
+    let ctx = egui::Context::default();
+    let binding = reader.shortcuts.focus_chat;
+    shortcut(&mut reader, &ctx, binding);
+    assert!(reader.assistant_panel_is_open());
+    let point = (0u32..64)
+        .find_map(|row| {
+            let y = 24.0 + row as f32 * 12.0;
+            (1u32..64).find_map(|column| {
+                let x = 40.0 + column as f32 * 12.0;
+                reader
+                    .hit_test_canvas(x, y, true)
+                    .ok()
+                    .flatten()
+                    .map(|_| (x, y))
+            })
+        })
+        .expect("the fixture page paints text to click");
+    reader.attach_clicked_paragraph_reference(point.0, point.1);
+    assert_eq!(
+        reader.chat.references.len(),
+        1,
+        "{:?}",
+        reader.chat.references
+    );
+    let reference = &reader.chat.references[0];
+    assert!(reference.id.starts_with("focus:"), "{}", reference.id);
+    assert!(!reference.label.is_empty());
+    assert!(reference.excerpt.is_some());
+    // Another click replaces the context instead of stacking references.
+    reader.attach_clicked_paragraph_reference(point.0, point.1);
+    assert_eq!(reader.chat.references.len(), 1);
+    // A closed panel leaves the context alone.
+    reader.close_assistant_panel();
+    assert!(!reader.assistant_panel_is_open());
+    reader.attach_clicked_paragraph_reference(point.0, point.1);
+    assert_eq!(reader.chat.references.len(), 1);
 }

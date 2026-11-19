@@ -12,8 +12,9 @@ pub(crate) use reader_layers::tests::LayerAudit;
 mod repaint;
 
 pub(crate) use application::run;
-pub(crate) use clipboard::images_without_text;
-pub(crate) use clipboard::feedback_images;
+pub(crate) use clipboard::{
+    ClipboardContent, ClipboardImage, chat_content, feedback_content, read_image_files,
+};
 
 pub(crate) enum UserEvent {
     ExitReady,

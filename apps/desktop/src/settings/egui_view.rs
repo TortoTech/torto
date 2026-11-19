@@ -285,8 +285,8 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 language.text("切换左侧栏", "Toggle left sidebar"),
             ),
             (
-                ShortcutAction::ToggleRightSidebar,
-                language.text("切换对话框", "Toggle chat panel"),
+                ShortcutAction::FocusChat,
+                language.text("唤起对话框", "Open chat panel"),
             ),
         ],
     );
@@ -392,10 +392,6 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             (
                 ShortcutAction::FocusActions,
                 language.text("唤起工具栏", "Open action toolbar"),
-            ),
-            (
-                ShortcutAction::FocusChat,
-                language.text("唤起对话框", "Open chat panel"),
             ),
             (
                 ShortcutAction::FocusHighlight,

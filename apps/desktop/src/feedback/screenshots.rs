@@ -5,7 +5,8 @@ pub(super) use rebook_app_core::feedback::images::MAX_IMAGES;
 
 #[derive(Clone)]
 pub(super) enum Source {
-    Clipboard,
+    /// Clipboard content read on the event-loop thread.
+    Clipboard(crate::platform::ClipboardContent),
     Pick,
     Restore(Vec<Screenshot>),
 }
@@ -54,24 +55,17 @@ pub(super) async fn prepare(source: Source) -> Result<Vec<Prepared>, String> {
         .map_err(|_| "image".to_owned())?;
     }
     tokio::task::spawn_blocking(move || match source {
-        Source::Clipboard => {
-            let images = crate::platform::feedback_images();
-            if images.len() > MAX_IMAGES {
-                return Err("limit".into());
-            }
-            images
-                .into_iter()
-                .map(|pixels| {
-                    if u64::from(pixels.width) * u64::from(pixels.height) > 16 * 1024 * 1024 {
-                        return Err("image".into());
-                    }
-                    let image =
-                        image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.rgba)
-                            .ok_or("image")?;
-                    encode(image::DynamicImage::ImageRgba8(image))
-                })
-                .collect()
+        Source::Clipboard(crate::platform::ClipboardContent::Images(images)) => {
+            encode_clipboard(images)
         }
+        Source::Clipboard(crate::platform::ClipboardContent::Files(paths)) => {
+            // Reading copied files does not touch the clipboard, so it can run
+            // here instead of blocking the event loop.
+            encode_clipboard(crate::platform::read_image_files(&paths))
+        }
+        Source::Clipboard(
+            crate::platform::ClipboardContent::Text | crate::platform::ClipboardContent::None,
+        ) => Ok(Vec::new()),
         Source::Restore(images) => {
             if images.len() > MAX_IMAGES {
                 return Err("image".into());
@@ -82,6 +76,24 @@ pub(super) async fn prepare(source: Source) -> Result<Vec<Prepared>, String> {
     })
     .await
     .map_err(|_| "image".to_owned())?
+}
+
+/// Encode clipboard pixels as feedback screenshots.
+fn encode_clipboard(images: Vec<crate::platform::ClipboardImage>) -> Result<Vec<Prepared>, String> {
+    if images.len() > MAX_IMAGES {
+        return Err("limit".into());
+    }
+    images
+        .into_iter()
+        .map(|pixels| {
+            if u64::from(pixels.width) * u64::from(pixels.height) > 16 * 1024 * 1024 {
+                return Err("image".into());
+            }
+            let image = image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.rgba)
+                .ok_or("image")?;
+            encode(image::DynamicImage::ImageRgba8(image))
+        })
+        .collect()
 }
 
 pub(super) fn restore(screenshot: Screenshot) -> Result<Prepared, String> {
