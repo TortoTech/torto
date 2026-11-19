@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use egui::emath::GuiRounding;
 use egui::{
-    Align2, Color32, ColorImage, CornerRadius, Rect, Response, RichText, Sense, Stroke, TextStyle,
+    Align2, Color32, CornerRadius, Rect, Response, RichText, Sense, Stroke, TextStyle,
     Ui, Vec2, WidgetInfo, Role,
 };
 
@@ -753,12 +753,6 @@ pub(crate) fn dialog_danger_button(ui: &mut Ui, label: &str) -> Response {
         .stroke(Stroke::NONE);
     ui.add(button)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-pub(crate) fn decode_color_image(bytes: &[u8]) -> Result<ColorImage, image::ImageError> {
-    let image = image::load_from_memory(bytes)?.into_rgba8();
-    let size = [image.width() as usize, image.height() as usize];
-    Ok(ColorImage::from_rgba_unmultiplied(size, image.as_raw()))
 }
 
 #[cfg(test)]

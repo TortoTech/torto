@@ -894,7 +894,6 @@ fn context_row(ui: &mut egui::Ui, width: f32, label: &str, value: &str) {
     ui.add_space(2.0);
 }
 
-fn now_seconds()->u64 {rebook_app_core::feedback::store::now_seconds()}
 fn remaining_retry(draft:&Draft)->Option<Duration> {rebook_app_core::feedback::store::remaining_retry(draft)}
 
 fn draft_path() -> Result<PathBuf, String> {
@@ -981,6 +980,3 @@ async fn execute(work: Work) -> Result<Output, String> {
     }
 }
 
-fn save_draft(path:&std::path::Path,draft:&Draft)->std::io::Result<()> {
-    rebook_app_core::feedback::store::save(path,draft)
-}

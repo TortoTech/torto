@@ -3,7 +3,7 @@
 use anyrender::ImageRenderer;
 use rebook_layout::{LayoutEngine, LayoutViewport, ReaderStyle, SpreadMode};
 use rebook_publication::{
-    Block, BookSource, Inline, PublicationUrl, Section, SourceRange, TableBlock, TextBlock,
+    Block, BookSource, Section, SourceRange, TableBlock, TextBlock,
     media_references::{self, MediaKey, MediaKind},
 };
 use std::{

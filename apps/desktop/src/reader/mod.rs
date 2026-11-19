@@ -1,4 +1,4 @@
-use rebook_app_core::reading_text::{FocusFootnoteSource, focus_block_structure_ranges, block_source_range, text_block_focus_footnotes, block_focus_footnotes, focus_footnote_text_in_section, find_block_containing_anchor, note_definition_containing_anchor, normalize_resolved_footnote_text, text_block_focus_text, block_focus_text, focus_block_paint_ranges, source_range_contains_anchor};
+use rebook_app_core::reading_text::{FocusFootnoteSource, focus_block_structure_ranges, block_source_range, text_block_focus_footnotes, block_focus_footnotes, focus_footnote_text_in_section, find_block_containing_anchor, text_block_focus_text, block_focus_text, focus_block_paint_ranges, source_range_contains_anchor};
 use crate::plugins::semantic_layout::SemanticLayoutSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1196,10 +1196,6 @@ fn focus_footnote_text(
 }
 
 
-
-fn focus_footnote_translation_ranges_in_section(section: &Section, target: &PublicationUrl) -> Vec<SourceRange> {
-    rebook_app_core::reading_text::focus_footnote_translation_ranges_in_section(section, target)
-}
 
 
 fn markdown_table_cell(text: &str) -> String {

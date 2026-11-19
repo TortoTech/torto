@@ -2,7 +2,7 @@
 use base64::Engine as _;
 use rebook_layout::text_layout::PositionedLayoutItem;
 use rebook_layout::{
-    LayoutEngine, LayoutViewport, PageItem, ReaderStyle, SpreadMode, TypesettingMode,
+    LayoutEngine, LayoutViewport, PageItem, ReaderStyle, TypesettingMode,
 };
 use rebook_publication::{
     Block, BlockStyle, BookSource, Inline, TextAlignment, TextBlock, TextBlockKind, TextLanguage,
