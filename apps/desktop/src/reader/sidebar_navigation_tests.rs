@@ -987,6 +987,103 @@ fn starting_a_toc_jump_clears_the_focus_while_layout_catches_up() {
     );
 }
 
+/// Runs a reader frame with an explicit egui clock: egui only advances its
+/// animation time through the input's `time` field, so tests that scroll
+/// through egui's animated keyboard delta must supply it.
+fn timed_frame(ctx: &egui::Context, reader: &mut DesktopReader, time: f64) {
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            time: Some(time),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+            ..Default::default()
+        },
+        |root| {
+            reader.ui(root, None, false);
+        },
+    );
+    output.textures_delta.clear();
+    // The desktop shell builds the Vello scene right after the UI pass.
+    drop(reader.page_scene());
+}
+
+#[test]
+fn closing_the_left_sidebar_keeps_classic_scroll_text_stationary() {
+    let ctx = egui::Context::default();
+    let (mut reader, section) = chapter_book(ReadingMode::Classic);
+    let mut time = 0.0;
+    let mut frame = |reader: &mut DesktopReader| {
+        time += 1.0 / 60.0;
+        timed_frame(&ctx, reader, time);
+    };
+
+    // Park the viewport top in the middle of a paragraph the way reading
+    // leaves it: the paragraph's start sits above the top edge.
+    frame(&mut reader);
+    issue75_frame(&ctx, &mut reader);
+    let layout = reader.current_scroll_layout().unwrap();
+    let inside = range_at(&section, "p5");
+    let top = layout.source_top(&inside).unwrap();
+    let viewport = reader
+        .scroll_viewport
+        .expect("scroll viewport after settling");
+    let padding = reader.scroll_content_padding(viewport.size.y);
+    // Park relative to wherever the settle left the view, so the parked depth
+    // into the paragraph does not depend on the initial restore strategy.
+    let current_visible_top = viewport.offset_y - padding;
+    reader.pending_keyboard_scroll_delta = current_visible_top - (top + 60.0);
+    // egui integrates the keyboard delta through a time-based scroll
+    // animation that lasts at most 0.3 s of egui clock; run past it.
+    for _ in 0..30 {
+        frame(&mut reader);
+    }
+
+    let before = reader.scroll_viewport.unwrap();
+    let visible_top = before.offset_y - reader.scroll_content_padding(before.size.y);
+    assert!(
+        (visible_top - (top + 60.0)).abs() < 1.0,
+        "setup must park the viewport inside the paragraph, got {visible_top}"
+    );
+    let anchor = reader
+        .capture_classic_reflow_anchor()
+        .expect("classic scroll reflow anchor");
+    assert_eq!(anchor.range.start.node, "p5");
+
+    // Closing the pinned sidebar reflows the text to a wider viewport.
+    reader.set_sidebar_open(false);
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        frame(&mut reader);
+        if !reader.ui.sidebar_motion.is_animating() {
+            break;
+        }
+    }
+    frames(&ctx, &mut reader, 2);
+    issue75_frame(&ctx, &mut reader);
+
+    let after_layout = reader.current_scroll_layout().unwrap();
+    let after = reader.scroll_viewport.unwrap();
+    let restored_top = if anchor.uses_baseline {
+        after_layout.source_baseline(&anchor.range)
+    } else {
+        after_layout.source_top(&anchor.range)
+    }
+    .unwrap();
+    let padding = reader.scroll_content_padding(after.size.y);
+    let drift = restored_top + padding - after.offset_y - anchor.screen_y;
+    assert!(
+        drift.abs() < 1.5,
+        "the anchored text must keep its screen position, drift={drift}"
+    );
+    assert!(
+        reader.scroll_target_source.is_none(),
+        "the source-top rewind must not linger after the anchor restore"
+    );
+    assert!(
+        after.offset_y > after_layout.source_top(&inside).unwrap() + padding + 1.0,
+        "the view must not rewind to the paragraph's start"
+    );
+}
+
 fn state_line(reader: &DesktopReader) -> String {
     let visible = visible_nodes(reader);
     format!(
