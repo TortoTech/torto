@@ -489,7 +489,7 @@ fn screenshot_batches_share_the_three_image_limit_and_reject_stale_completions()
         ))
         .unwrap()
     };
-    feature.paste_images();
+    feature.begin_paste_images(crate::platform::ClipboardContent::Images(Vec::new()));
     feature.send();
     assert!(
         feature.task.take_pending().is_none(),
@@ -501,7 +501,7 @@ fn screenshot_batches_share_the_three_image_limit_and_reject_stale_completions()
         result: Ok(vec![make(), make(), make()]),
     });
     assert_eq!(feature.draft.as_ref().unwrap().payload.screenshots.len(), 3);
-    feature.paste_images();
+    feature.begin_paste_images(crate::platform::ClipboardContent::Images(Vec::new()));
     let extra = feature.image_task.take_pending().unwrap();
     feature.complete_images(TaskResult {
         id: extra.id,
@@ -509,7 +509,11 @@ fn screenshot_batches_share_the_three_image_limit_and_reject_stale_completions()
     });
     assert_eq!(feature.image_error.as_deref(), Some("limit"));
     assert_eq!(feature.draft.as_ref().unwrap().payload.screenshots.len(), 3);
-    feature.image_task.begin(screenshots::Source::Clipboard);
+    feature
+        .image_task
+        .begin(screenshots::Source::Clipboard(
+            crate::platform::ClipboardContent::Images(Vec::new()),
+        ));
     let old = feature.image_task.take_pending().unwrap();
     feature.open(OpenContext::shelf(&egui::Context::default()));
     feature.complete_images(TaskResult {

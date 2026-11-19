@@ -1,11 +1,18 @@
-//! System clipboard image access for the chat composer.
+//! System clipboard image access for the chat composer and the feedback dialog.
 //!
 //! egui-winit turns the paste shortcut into `egui::Event::Paste` only when the
 //! clipboard holds text, so an image-only clipboard (a screenshot) produces no
-//! event at all and the composer can never see it. A blocking worker reads the
-//! pixels here while egui continues handling ordinary text paste.
+//! event at all and the composer can never see it. The clipboard is read here
+//! while egui continues handling ordinary text paste.
+//!
+//! Every clipboard read runs on the event-loop thread, which is the same thread
+//! egui-winit reads the clipboard on for that paste event. Reading the Windows
+//! clipboard from two threads at once corrupts its heap even though each read
+//! opens and closes it, so a read must never move to a worker. Decoding the
+//! image files of a copied file list does not touch the clipboard and stays on
+//! the worker.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A paste brings in at most one message's worth of images.
 const MAX_CLIPBOARD_FILES: usize = crate::plugins::chat_media::MAX_IMAGES_PER_MESSAGE;
@@ -14,53 +21,68 @@ const MAX_CLIPBOARD_FILES: usize = crate::plugins::chat_media::MAX_IMAGES_PER_ME
 const MAX_CLIPBOARD_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Straight (non-premultiplied) RGBA8 pixels taken from the clipboard.
+#[derive(Clone)]
 pub(crate) struct ClipboardImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) rgba: Vec<u8>,
 }
 
-/// Every image the clipboard carries, or an empty list when it holds text,
-/// holds no image, or cannot be read. Text wins so an ordinary text paste keeps
-/// reaching egui unchanged.
-///
-/// The clipboard carries an image either as pixels or as files: Explorer's Copy
-/// and screenshot tools that put the file they saved on the clipboard leave only
-/// a file list, which egui and `arboard::Clipboard::get_image` both ignore. Those
-/// files are read here, so a screenshot pasted from such a tool lands in the
-/// composer either way.
-pub(crate) fn images_without_text() -> Vec<ClipboardImage> {
-    images(false)
+/// What one clipboard read offers a paste handler.
+#[derive(Clone)]
+pub(crate) enum ClipboardContent {
+    /// The clipboard holds text, which egui pastes as usual.
+    Text,
+    /// Pixels the clipboard already decoded to RGBA.
+    Images(Vec<ClipboardImage>),
+    /// Image files a copied file list points at; a worker decodes them.
+    Files(Vec<PathBuf>),
+    /// Nothing a paste handler can use.
+    None,
+}
+
+/// Read the clipboard for the chat composer: text wins over an image.
+pub(crate) fn chat_content() -> ClipboardContent {
+    content(false)
 }
 
 /// Feedback accepts a screenshot even when a capture tool also supplies text.
-pub(crate) fn feedback_images() -> Vec<ClipboardImage> {
-    images(true)
+pub(crate) fn feedback_content() -> ClipboardContent {
+    content(true)
 }
 
-fn images(prefer_image: bool) -> Vec<ClipboardImage> {
+fn content(prefer_image: bool) -> ClipboardContent {
     let Ok(mut clipboard) = arboard::Clipboard::new() else {
-        return Vec::new();
+        return ClipboardContent::None;
     };
     if !prefer_image && clipboard.get_text().is_ok_and(|text| !text.is_empty()) {
-        return Vec::new();
+        return ClipboardContent::Text;
     }
     if let Ok(image) = clipboard.get_image() {
         let width = u32::try_from(image.width).ok();
         let height = u32::try_from(image.height).ok();
         if let (Some(width), Some(height)) = (width, height) {
-            return vec![ClipboardImage {
+            return ClipboardContent::Images(vec![ClipboardImage {
                 width,
                 height,
                 rgba: image.bytes.into_owned(),
-            }];
+            }]);
         }
-        return Vec::new();
+        return ClipboardContent::None;
     }
     let Ok(files) = clipboard.get().file_list() else {
-        return Vec::new();
+        return ClipboardContent::None;
     };
-    files
+    if files.is_empty() {
+        ClipboardContent::None
+    } else {
+        ClipboardContent::Files(files)
+    }
+}
+
+/// The images among copied file paths. Runs on a worker: no clipboard access.
+pub(crate) fn read_image_files(paths: &[PathBuf]) -> Vec<ClipboardImage> {
+    paths
         .iter()
         .filter_map(|path| read_image_file(path))
         .take(MAX_CLIPBOARD_FILES)

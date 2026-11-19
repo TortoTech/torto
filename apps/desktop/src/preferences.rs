@@ -98,8 +98,6 @@ pub(crate) struct ShortcutPreferences {
     pub(crate) fullscreen: egui::KeyboardShortcut,
     #[serde(default = "default_toggle_left_sidebar_shortcut")]
     pub(crate) toggle_left_sidebar: egui::KeyboardShortcut,
-    #[serde(default = "default_toggle_right_sidebar_shortcut")]
-    pub(crate) toggle_right_sidebar: egui::KeyboardShortcut,
     #[serde(default = "default_toggle_translation_shortcut")]
     pub(crate) toggle_translation: egui::KeyboardShortcut,
     #[serde(default = "default_search_shortcut")]
@@ -165,11 +163,10 @@ impl ShortcutPreferences {
             .any(|binding| shortcut_chord_key_count(binding.modifiers) > MAX_SHORTCUT_KEYS)
     }
 
-    fn bindings(&self) -> [egui::KeyboardShortcut; 27] {
+    fn bindings(&self) -> [egui::KeyboardShortcut; 26] {
         [
             self.fullscreen,
             self.toggle_left_sidebar,
-            self.toggle_right_sidebar,
             self.toggle_translation,
             self.search,
             self.copy,
@@ -219,7 +216,6 @@ impl Default for ShortcutPreferences {
         Self {
             fullscreen: default_fullscreen_shortcut(),
             toggle_left_sidebar: default_toggle_left_sidebar_shortcut(),
-            toggle_right_sidebar: default_toggle_right_sidebar_shortcut(),
             toggle_translation: default_toggle_translation_shortcut(),
             search: default_search_shortcut(),
             copy: default_copy_shortcut(),
@@ -254,10 +250,6 @@ const fn default_fullscreen_shortcut() -> egui::KeyboardShortcut {
 
 const fn default_toggle_left_sidebar_shortcut() -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B)
-}
-
-const fn default_toggle_right_sidebar_shortcut() -> egui::KeyboardShortcut {
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::E)
 }
 
 const fn default_toggle_translation_shortcut() -> egui::KeyboardShortcut {
@@ -877,10 +869,6 @@ mod tests {
         assert_eq!(
             shortcuts.toggle_left_sidebar,
             egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B)
-        );
-        assert_eq!(
-            shortcuts.toggle_right_sidebar,
-            egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::E)
         );
         assert_eq!(
             shortcuts.toggle_translation,

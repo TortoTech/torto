@@ -1403,7 +1403,7 @@ impl DesktopReader {
         if self.focus_image_preview_shortcut(ctx, interaction_blocked) {
             return;
         }
-        if self.focus_chat_shortcut(ctx, interaction_blocked) {
+        if self.chat_panel_shortcut(ctx, interaction_blocked) {
             return;
         }
         if self.layout_shortcut(ctx, interaction_blocked) {
@@ -1862,18 +1862,12 @@ impl DesktopReader {
         let action = ctx.input_mut(|input| {
             if !typing && input.consume_shortcut(&self.shortcuts.toggle_left_sidebar) {
                 Some(0)
-            } else if input.consume_shortcut(&self.shortcuts.toggle_right_sidebar) {
-                Some(1)
             } else {
                 None
             }
         });
         match action {
             Some(0) => self.set_sidebar_open(!self.ui.sidebar_open),
-            Some(1) => {
-                self.toggle_assistant_panel(AssistantPanel::Chat);
-                ctx.memory_mut(egui::Memory::stop_text_input);
-            }
             Some(_) => unreachable!(),
             None => return false,
         }
@@ -1914,11 +1908,12 @@ impl DesktopReader {
         true
     }
 
-    fn focus_chat_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
-        if !self.is_focus_mode()
-            || interaction_blocked
+    /// Tab summons the chat panel in both reading modes. Focus mode opens it
+    /// on the focused paragraph; the classic mode keeps the book's own
+    /// conversation and whatever paragraph references a click attached.
+    fn chat_panel_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if interaction_blocked
             || self.ui.overlay_visible()
-            || self.ui.sidebar_open
             || self.preview_is_open()
             || self.annotation_note_draft.is_some()
         {
@@ -1926,6 +1921,16 @@ impl DesktopReader {
         }
         let open = self.focus_assistant_popup_visible() && self.ui.assistant_motion.target > 0.5;
         let input_focused = ctx.text_edit_focused();
+        // A field outside the composer keeps Tab for itself; the composer
+        // hands it to this shortcut through the suggestion check below.
+        if input_focused
+            && self
+                .chat
+                .composer_id
+                .is_none_or(|id| !ctx.memory(|memory| memory.has_focus(id)))
+        {
+            return false;
+        }
         let suggestions_active = if self.ui.assistant_panel.is_some() && input_focused {
             let (references, commands) = self.assistant_suggestions(self.chat.task.is_pending());
             active_suggestion_count(&references, &commands) > 0
@@ -1965,11 +1970,14 @@ impl DesktopReader {
             } else if action == FocusChatShortcutAction::Close && open {
                 self.close_assistant_panel();
                 ctx.memory_mut(egui::Memory::stop_text_input);
-            } else {
+            } else if self.is_focus_mode() {
                 self.close_focus_footnotes();
                 self.ui.assistant_presentation = super::AssistantPresentation::Popup;
                 self.attach_current_focus_reference();
                 self.open_focus_assistant();
+            } else {
+                self.toggle_assistant_panel(AssistantPanel::Chat);
+                ctx.memory_mut(egui::Memory::stop_text_input);
             }
             ctx.request_repaint();
         }
@@ -5186,7 +5194,11 @@ impl DesktopReader {
             }
             self.finish_text_selection(x, y, false);
             if self.selected_highlight_id.is_none() {
-                self.focus_clicked_unit(x, y);
+                if self.is_focus_mode() {
+                    self.focus_clicked_unit(x, y);
+                } else {
+                    self.attach_clicked_paragraph_reference(x, y);
+                }
             }
         }
     }

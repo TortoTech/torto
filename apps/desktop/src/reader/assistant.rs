@@ -1,4 +1,4 @@
-use rebook_app_core::reading_text::source_range_for_node;
+use rebook_app_core::reading_text::{block_source_range, source_range_for_node};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,6 +28,12 @@ use crate::plugins::{
     extract_pdf_metadata, recognize_pdf, resolve_chat_command, search_book, section_title,
     set_pdf_ocr_view_mode,
 };
+
+/// Clipboard images one paste brings, read before the worker starts.
+enum ChatClipboard {
+    Pixels(Vec<crate::platform::ClipboardImage>),
+    Files(Vec<std::path::PathBuf>),
+}
 
 impl DesktopReader {
     pub(super) fn start_pdf_native(&mut self, action: super::PdfNativeAction) {
@@ -232,6 +238,83 @@ impl DesktopReader {
             self.language.resolved() == crate::preferences::AppLanguage::English,
         );
         self.chat.references.push(ChatReference { id, ..reference });
+        self.chat.move_cursor_to_end = true;
+    }
+
+    /// A classic-mode click hands the paragraph under the pointer to the open
+    /// conversation, the way turning to a paragraph does in focus mode. A
+    /// closed panel and an active selection keep the context as it is: the
+    /// selection toolbar already carries its own chat actions.
+    pub(super) fn attach_clicked_paragraph_reference(&mut self, x: f32, y: f32) {
+        if self.is_focus_mode() || !self.assistant_panel_is_open() || self.selection.is_some() {
+            return;
+        }
+        let Some(hit) = self.hit_test_canvas(x, y, true).ok().flatten() else {
+            return;
+        };
+        let Some(paragraph) = self
+            .reader
+            .selection_between_with_granularity(
+                &hit,
+                &hit,
+                rebook_reader::SelectionGranularity::Paragraph,
+            )
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let Some(range) = paragraph.ranges.first() else {
+            return;
+        };
+        let Some(section_index) = self
+            .source
+            .book()
+            .sections
+            .iter()
+            .position(|section| section.id == range.start.spine)
+        else {
+            return;
+        };
+        let node = range.start.node.clone();
+        let text = normalize_chat_reference_text(&paragraph.text);
+        if text.chars().count() < 2 {
+            return;
+        }
+        let Ok(section) = self.source.parse_section(section_index) else {
+            return;
+        };
+        let paragraph_index = section
+            .blocks
+            .iter()
+            .position(|block| {
+                block_source_range(block).is_some_and(|source| source.start.node == node)
+                    || block.text_blocks().any(|part| {
+                        part.source
+                            .as_ref()
+                            .is_some_and(|source| source.start.node == node)
+                    })
+            })
+            .map_or(1, |index| index + 1);
+        let title = section_title(self.source.as_ref(), section_index, &section.blocks);
+        let english = self.language.resolved() == crate::preferences::AppLanguage::English;
+        let reference = paragraph_reference(
+            section_index,
+            paragraph_index,
+            &title,
+            &node,
+            0,
+            &text,
+            english,
+        );
+        self.sync_focus_chat_session();
+        self.chat.references.retain(|reference| {
+            !reference.id.starts_with("focus:") && !reference.id.starts_with("selection:")
+        });
+        self.chat.references.push(ChatReference {
+            id: format!("focus:{section_index}:{node}"),
+            ..reference
+        });
         self.chat.move_cursor_to_end = true;
     }
 
@@ -1469,7 +1552,7 @@ impl DesktopReader {
 
     /// Whether the assistant panel is open. Closing keeps the panel in place until the
     /// motion settles, so the target has to be checked as well.
-    fn assistant_panel_is_open(&self) -> bool {
+    pub(super) fn assistant_panel_is_open(&self) -> bool {
         self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5
     }
 
@@ -1490,7 +1573,11 @@ impl DesktopReader {
         ctx.memory(|memory| memory.has_focus(id) || memory.focused().is_none())
     }
 
-    /// Coalesce paste shortcuts while a bounded batch is being prepared.
+    /// Read the clipboard on the event-loop thread, then prepare the paste off it.
+    ///
+    /// The read stays on this thread because egui-winit reads the same clipboard
+    /// for the paste event right after this handler, and two threads reading the
+    /// Windows clipboard at once corrupt its heap.
     pub(crate) fn paste_chat_images(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -1499,6 +1586,13 @@ impl DesktopReader {
         if self.chat.paste_task.is_pending() {
             return;
         }
+        let pasted = match crate::platform::chat_content() {
+            crate::platform::ClipboardContent::Images(images) => ChatClipboard::Pixels(images),
+            crate::platform::ClipboardContent::Files(paths) => ChatClipboard::Files(paths),
+            crate::platform::ClipboardContent::Text | crate::platform::ClipboardContent::None => {
+                return;
+            }
+        };
         let ordinal = self.chat.pending_images.len();
         self.chat.paste_task.begin(ordinal);
         let request = self.chat.paste_task.take_pending().unwrap();
@@ -1506,7 +1600,10 @@ impl DesktopReader {
         let proxy = proxy.clone();
         let worker = runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let images = crate::platform::images_without_text();
+                let images = match pasted {
+                    ChatClipboard::Pixels(images) => images,
+                    ChatClipboard::Files(paths) => crate::platform::read_image_files(&paths),
+                };
                 crate::plugins::chat_media::validate_image_count(ordinal + images.len())?;
                 images
                     .into_iter()
