@@ -77,6 +77,8 @@ pub struct Provider {
     pub base_url: String,
     pub models: Vec<String>,
     pub key_saved: bool,
+    #[uniffi(default = false)]
+    pub citation_decisions_available: bool,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct AiOptions {
@@ -98,6 +100,8 @@ pub struct AiOptions {
     // ignored on save. These are no longer user settings.
     pub chat_steps: u16,
     pub chat_history: u16,
+    #[uniffi(default = false)]
+    pub layout_citation_decisions: bool,
 }
 fn wire<T: Serialize>(v: &T) -> String {
     serde_json::to_value(v)
@@ -117,6 +121,7 @@ fn dto(s: &PluginSettings) -> AiOptions {
         layout_provider: s.semantic_layout.provider.clone(),
         layout_model: s.semantic_layout.model.clone(),
         layout_reasoning: wire(&s.semantic_layout.reasoning_effort),
+        layout_citation_decisions: s.semantic_layout.citation_decisions,
         translation_provider: s.translation_provider.clone(),
         translation_model: s.translation_model.clone(),
         translation_reasoning: wire(&s.translation_reasoning_effort),
@@ -215,6 +220,7 @@ impl MobileCore {
                     base_url: p.base_url.clone(),
                     models: p.models.iter().map(|m| m.id.clone()).collect(),
                     key_saved: !p.api_key.is_empty(),
+                    citation_decisions_available: plugins::semantic_layout::supports_citation_decisions(p),
                 })
                 .collect())
         })
@@ -353,6 +359,7 @@ impl MobileCore {
             s.semantic_layout.provider = options.layout_provider;
             s.semantic_layout.model = options.layout_model;
             s.semantic_layout.reasoning_effort = effort(&options.layout_reasoning)?;
+            s.semantic_layout.citation_decisions = options.layout_citation_decisions;
             s.translation_provider = options.translation_provider;
             s.translation_model = options.translation_model;
             s.translation_reasoning_effort = effort(&options.translation_reasoning)?;

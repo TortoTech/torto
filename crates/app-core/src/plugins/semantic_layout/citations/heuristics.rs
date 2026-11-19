@@ -203,6 +203,12 @@ fn numeric_reference(block: &TextBlock, citation: &Citation) -> bool {
     cue || linked
 }
 
+pub(super) fn is_known(block: &TextBlock, citation: &Citation) -> bool {
+    author_date(&citation.text)
+        || numeric_reference(block, citation)
+        || rebook_publication::media_references::is_citation(&citation.text)
+}
+
 pub(in crate::plugins::semantic_layout) fn annotations(section: &Section) -> Vec<Annotation> {
     let mut paragraphs = Vec::new();
     texts(&section.blocks, &mut paragraphs);
@@ -211,11 +217,7 @@ pub(in crate::plugins::semantic_layout) fn annotations(section: &Section) -> Vec
         .filter_map(|block| {
             let spans: Vec<_> = candidates(block)
                 .into_iter()
-                .filter(|c| {
-                    author_date(&c.text)
-                        || numeric_reference(block, c)
-                        || rebook_publication::media_references::is_citation(&c.text)
-                })
+                .filter(|c| is_known(block, c))
                 .collect();
             (!spans.is_empty()).then(|| Annotation::InlineCitations {
                 source: block.source.clone().unwrap(),
@@ -248,11 +250,7 @@ pub(in crate::plugins::semantic_layout) fn apply_display_fallback(section: &mut 
             let available = candidate_spans(text);
             let spans: Vec<_> = available
                 .iter()
-                .filter(|c| {
-                    author_date(&c.text)
-                        || numeric_reference(text, c)
-                        || rebook_publication::media_references::is_citation(&c.text)
-                })
+                .filter(|c| is_known(text, c))
                 .cloned()
                 .collect();
             apply_available(text, &spans, &available);

@@ -987,6 +987,7 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
                 base_url: "http://127.0.0.1:1/v1".into(),
                 models: vec!["test-model".into()],
                 key_saved: false,
+                citation_decisions_available: false,
             },
             Some("test-only-secret".into()),
             false,

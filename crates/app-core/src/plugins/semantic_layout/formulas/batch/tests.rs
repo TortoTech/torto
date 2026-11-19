@@ -189,7 +189,7 @@ fn batch_retries_only_missing_items_without_reviewing_valid_siblings() {
             key: i.to_string(),
             path: None,
             aliases: vec![],
-            url: "data:image/png;base64,fixture".into(),
+            url: "data:image/jpeg;base64,fixture".into(),
             candidate: Candidate {
                 image: ImageBlock {
                     ocr_text: None,
@@ -313,7 +313,7 @@ fn run_batch_fixture(replies: Vec<(Value, Vec<usize>)>) -> Vec<Option<Response>>
             key: i.to_string(),
             path: None,
             aliases: vec![],
-            url: "data:image/png;base64,fixture".into(),
+            url: "data:image/jpeg;base64,fixture".into(),
             candidate: Candidate {
                 image: ImageBlock {
                     ocr_text: None,

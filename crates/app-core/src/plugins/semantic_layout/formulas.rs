@@ -1,8 +1,10 @@
 use super::*;
+use super::request_images::{self, decode, image_url};
+#[cfg(test)]
 use base64::Engine as _;
-use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+#[cfg(test)]
+use image::{DynamicImage, Rgba, RgbaImage};
 use rebook_publication::{ImageBlock, ImageFormula, ImageText};
-use std::io::Cursor;
 
 pub(super) const CHAPTER_PROMPT: &str = include_str!("formulas/chapter-v5-prompt.md");
 pub(super) const PROMPT: &str = include_str!("formulas/prompt.md");
@@ -301,60 +303,6 @@ pub(super) fn validate_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
-    if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()
-        && let Ok((width, height)) = reader.into_dimensions()
-        && u64::from(width) * u64::from(height) > 16_000_000
-    {
-        return Err("Image exceeds formula decoding limits".into());
-    }
-    if let Ok(image) = image::load_from_memory(bytes) {
-        return Ok(image);
-    }
-    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default())
-        .map_err(|e| e.to_string())?;
-    let scale = (1600.0 / tree.size().width().max(tree.size().height())).min(1.0);
-    let w = (tree.size().width() * scale).ceil().max(1.0) as u32;
-    let h = (tree.size().height() * scale).ceil().max(1.0) as u32;
-    let mut pixels = resvg::tiny_skia::Pixmap::new(w, h).ok_or("Invalid SVG dimensions")?;
-    pixels.fill(resvg::tiny_skia::Color::WHITE);
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixels.as_mut(),
-    );
-    Ok(DynamicImage::ImageRgba8(
-        RgbaImage::from_raw(w, h, pixels.take()).ok_or("Invalid raster")?,
-    ))
-}
-
-fn image_url(image: DynamicImage) -> Result<String, String> {
-    let scale = (1600.0 / image.width().max(image.height()) as f32).min(3.0);
-    let size = [
-        (image.width() as f32 * scale).round().max(1.0) as u32,
-        (image.height() as f32 * scale).round().max(1.0) as u32,
-    ];
-    let enlarged = rebook_layout::image_processing::resize_exact(
-        image,
-        size,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let mut canvas = RgbaImage::from_pixel(
-        enlarged.width() + 16,
-        enlarged.height() + 16,
-        Rgba([255, 255, 255, 255]),
-    );
-    image::imageops::overlay(&mut canvas, &enlarged, 8, 8);
-    let mut bytes = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(canvas)
-        .write_to(&mut bytes, ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
-    ))
-}
-
 fn record(
     response: Option<&Response>,
     href: &PublicationUrl,
@@ -436,20 +384,7 @@ async fn flush(
                     "formula.batch.failed",
                     json!({"images":batch.len(),"error":error}),
                 );
-                let lower = error.to_lowercase();
-                unsupported = (lower.contains("image")
-                    || lower.contains("vision")
-                    || lower.contains("text-only"))
-                    && [
-                        "not support",
-                        "doesn't support",
-                        "unsupported",
-                        "only supported",
-                        "not allowed",
-                        "text-only",
-                    ]
-                    .iter()
-                    .any(|s| lower.contains(s));
+                unsupported = request_images::unsupported(&error);
                 vec![None; batch.len()]
             }
         };
@@ -457,11 +392,10 @@ async fn flush(
         if let Some(response) = result.as_mut()
             && let Some(trace) = response.chart_trace.take()
         {
-            let encoded = item.url.strip_prefix("data:image/png;base64,").unwrap_or_default().to_owned();
+            let url = item.url;
             let checked = if !item.candidate.inline {
                 tokio::task::spawn_blocking(move || {
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-                    let image = image::load_from_memory(&bytes).ok()?.into_luma8();
+                    let image = request_images::decode_url(&url)?.into_luma8();
                     trace.matches_raster(&image).then_some(trace)
                 }).await.ok().flatten()
             } else { None };
@@ -510,7 +444,7 @@ pub(super) async fn recognize(
                 continue;
             }
         };
-        if resource.bytes.len() > 12 * 1024 * 1024 {
+        if resource.bytes.len() > request_images::MAX_RESOURCE_BYTES {
             log::event(
                 provider,
                 model,
@@ -523,6 +457,7 @@ pub(super) async fn recognize(
         let key = digest(
             &serde_json::to_vec(&json!([
                 "replacement-fidelity-v1",
+                request_images::REVISION,
                 PROMPT,
                 TRANSCRIBE_PROMPT,
                 SYMBOL_PROMPT,
@@ -588,7 +523,7 @@ pub(super) async fn recognize(
             }
         };
         let size = url.len() + candidate.context.len() + 512;
-        if size > batch::MAX_BYTES {
+        if size > request_images::MAX_BYTES {
             log::event(
                 provider,
                 model,
@@ -598,7 +533,7 @@ pub(super) async fn recognize(
             failed += 1;
             continue;
         }
-        if pending.len() == batch::MAX_IMAGES || bytes + size > batch::MAX_BYTES {
+        if pending.len() == request_images::MAX_IMAGES || bytes + size > request_images::MAX_BYTES {
             if flush(
                 client,
                 provider,

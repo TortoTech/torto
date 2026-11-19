@@ -979,6 +979,9 @@ fn semantic_layout_rows(
     plugin_settings: &mut PluginSettings,
     model_options: &[ConfiguredModel],
 ) {
+    let decisions_available = plugin_settings.providers.iter()
+        .find(|provider| provider.id == plugin_settings.semantic_layout.provider)
+        .is_some_and(rebook_app_core::plugins::semantic_layout::supports_citation_decisions);
     let settings = &mut plugin_settings.semantic_layout;
     settings_row_label(ui, language.text("AI排版", "AI layout"));
     settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
@@ -1019,6 +1022,17 @@ fn semantic_layout_rows(
             );
         });
         ui.end_row();
+        if decisions_available {
+            settings_row_label(ui, language.text("文献引用预判（试验）", "Citation screening (experimental)"));
+            settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                toggle_switch(ui, &mut settings.citation_decisions);
+                settings_help_icon(ui, language.text(
+                    "批量验证文献引用候选。判别不确定时使用排版模型。",
+                    "Batch-check citation candidates. Uncertain batches use the layout model.",
+                ));
+            });
+            ui.end_row();
+        }
     }
 }
 

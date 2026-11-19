@@ -1,8 +1,5 @@
 use super::*;
 
-pub(super) const MAX_IMAGES: usize = 5;
-pub(super) const MAX_BYTES: usize = 6 * 1024 * 1024;
-
 pub(super) struct Pending {
     pub key: String,
     pub path: Option<PathBuf>,
