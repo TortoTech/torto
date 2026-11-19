@@ -160,7 +160,14 @@ class MainActivity : ComponentActivity() {
         ChoicePageHost(choicePages){
         val resumeNotice=state.notice=="发现其他设备进度"&&state.cloudResume!=null
         val fontNotice=state.notice=="新字体已下载完成"
-        val notice=state.notice?.let {if(fontNotice)tr(it,"New fonts downloaded")else if(resumeNotice)tr(it,"Reading progress found on another device")else it}
+        val notice = state.notice?.let {
+            when {
+                fontNotice -> tr(it, "New fonts downloaded")
+                resumeNotice -> tr(it, "Reading progress found on another device")
+                it == "同步完成" -> tr(it, "Sync complete")
+                else -> it
+            }
+        }
         val applyFonts=fontNotice&&state.active!=null&&state.fontApplyAvailable
         val applyLabel=tr("应用","Apply")
         val resumeLabel=tr("跳转","Go to")

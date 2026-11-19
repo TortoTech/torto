@@ -36,19 +36,64 @@ internal fun localDateTime(ms:Long):String=if(ms<=0)"—" else DateTimeFormatter
     }
 }
 
-@Composable internal fun CloudSyncSummary(status:CloudStatus,modifier:Modifier=Modifier){
-    if(!status.running && status.error==null && status.retryAt==0L)return
-    Surface(modifier.fillMaxWidth(),shape=MaterialTheme.shapes.medium,color=MaterialTheme.colorScheme.surfaceContainerLow){
-        Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(6.dp)){
-            if(status.booksTotal>0u)Text(tr("已就绪 ${status.booksCompleted}/${status.booksTotal} 本","${status.booksCompleted}/${status.booksTotal} books ready"),style=MaterialTheme.typography.labelLarge)
-            if(status.running){
-                Text(cloudStage(status.stage),style=MaterialTheme.typography.bodySmall)
-                if(status.booksTotal>0u)LinearProgressIndicator(progress={status.booksCompleted.toFloat()/status.booksTotal.toFloat()},modifier=Modifier.fillMaxWidth())
-                else if(status.total>0u)LinearProgressIndicator(progress={status.completed.toFloat()/status.total.toFloat()},modifier=Modifier.fillMaxWidth())
-                else LinearProgressIndicator(Modifier.fillMaxWidth())
-            }else if(status.retryAt>0)Text(tr("同步已暂停，最早重试时间：","Sync paused; retry no earlier than: ")+localDateTime(status.retryAt),style=MaterialTheme.typography.bodySmall)
-            status.error?.let {Text(it,color=MaterialTheme.colorScheme.error,style=MaterialTheme.typography.bodySmall)}
+@Composable internal fun CloudSyncSummary(status: CloudStatus, modifier: Modifier = Modifier) {
+    val retryPending = status.retryAt > System.currentTimeMillis()
+    if (!status.running && status.error == null && !retryPending) return
+    Surface(
+        modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLow
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (status.running) {
+                val uploading = status.stage == "uploading" && status.total > 0u
+                val downloading = status.stage == "downloading" && status.booksTotal > 0u
+                if (uploading) {
+                    Text(
+                        tr("已上传 ${status.completed}/${status.total} 本",
+                            "${status.completed}/${status.total} books uploaded"),
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    LinearProgressIndicator(
+                        progress = { (status.completed.toFloat() / status.total.toFloat()).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    if (status.booksTotal > 0u) {
+                        Text(
+                            tr("已就绪 ${status.booksCompleted}/${status.booksTotal} 本",
+                                "${status.booksCompleted}/${status.booksTotal} books ready"),
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                    Text(cloudStage(status.stage), style = MaterialTheme.typography.bodySmall)
+                    if (downloading) {
+                        LinearProgressIndicator(
+                            progress = { (status.booksCompleted.toFloat() / status.booksTotal.toFloat()).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    }
+                }
+            } else if (retryPending) {
+                val time = DateTimeFormatter.ofPattern("HH:mm")
+                    .format(Instant.ofEpochMilli(status.retryAt).atZone(ZoneId.systemDefault()))
+                Text(tr("同步暂缓 · 最早可重试时间 $time", "Sync paused · Earliest retry $time"))
+            } else if (status.error != null) {
+                Text(tr("同步失败", "Sync failed"), color = MaterialTheme.colorScheme.error)
+                Text(status.error, color = MaterialTheme.colorScheme.error)
+            }
         }
     }
 }
-@Composable private fun cloudStage(stage:String)=when(stage){"preparing"->tr("准备同步","Preparing sync");"checking"->tr("检查云端变更","Checking cloud changes");"uploading"->tr("上传书籍","Uploading books");"downloading"->tr("下载书籍","Downloading books");"derived"->tr("同步 PDF 处理数据","Syncing PDF processing data");"statistics"->tr("同步阅读统计","Syncing reading statistics");else->tr("同步进度与批注","Syncing progress and annotations")}
+
+@Composable private fun cloudStage(stage: String) = when (stage) {
+    "preparing" -> tr("准备同步", "Preparing sync")
+    "checking" -> tr("检查云端变更", "Checking cloud changes")
+    "uploading" -> tr("上传书籍", "Uploading books")
+    "downloading" -> tr("下载书籍", "Downloading books")
+    "derived" -> tr("同步 PDF 处理数据", "Syncing PDF processing data")
+    "statistics" -> tr("同步阅读统计", "Syncing reading statistics")
+    else -> tr("同步进度与批注", "Syncing progress and annotations")
+}

@@ -175,16 +175,17 @@ final class CloudSyncCoordinator: ObservableObject {
         return updated
     }
 
-    func synchronize(_ options: CloudOptions) async {
-        guard foreground, options.enabled, !configuring else { return }
+    func synchronize(_ options: CloudOptions) async -> Bool {
+        guard foreground, options.enabled, !configuring else { return false }
         configuring = true
         defer { configuring = false; startLoop() }
         userStopped = false
         stopLoop(cancelRun: true)
         await loop?.value
         _ = await runTask?.value
-        guard foreground, !userStopped else { return }
-        _ = await perform(.manual, options: options)
+        guard foreground, !userStopped,
+              let result = await perform(.manual, options: options) else { return false }
+        return result.summary != nil && result.error == nil && result.retryAfterMs == nil
     }
 
     private func perform(_ trigger: CloudSyncTrigger, options: CloudOptions) async -> CloudSyncRun? {
@@ -193,7 +194,9 @@ final class CloudSyncCoordinator: ObservableObject {
         let request = ChatRequest()
         runID = id
         control = request
-        if trigger == .manual { running = true; status.stage = "preparing" }
+        status = Status(stage: trigger == .manual ? "preparing" : nil,
+                        lastSuccess: status.lastSuccess, retry: status.retry, error: status.error)
+        if trigger == .manual { running = true }
         request.observeAi(listener: CloudProgressSink { [weak self] stage, completed, total in
             DispatchQueue.main.async { [weak self] in
                 guard let self, runID == id else { return }

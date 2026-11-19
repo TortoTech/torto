@@ -698,6 +698,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 }
             });
         } else {
+            #[cfg(target_os = "windows")]
             ui.label(
                 RichText::new(state.draft_language.text(
                     "更新由 Microsoft Store 管理。",
@@ -742,7 +743,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         ui.label(
             RichText::new(state.draft_language.text(
                 "当前平台暂不支持应用内自动更新。",

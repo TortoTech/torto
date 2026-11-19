@@ -526,6 +526,8 @@ fn execute(
             .collect()
     };
     let mut import_error = None;
+    let mut ready_books = 0u64;
+    let mut last_stage = None;
     let result = runtime().block_on(services::cancellable(
         request,
         sync::run_sync(
@@ -534,33 +536,33 @@ fn execute(
             books,
             mode,
             |event| match event {
-                sync::SyncProgress::Stage {
-                    stage,
-                    completed,
-                    total,
-                } => request.report(
-                    match stage {
-                        sync::SyncStage::Preparing => "preparing",
-                        sync::SyncStage::Books => "books",
-                        sync::SyncStage::Checking => "checking",
-                        sync::SyncStage::Uploading => "uploading",
-                        sync::SyncStage::Downloading | sync::SyncStage::PreparingDownload => {
-                            "downloading"
+                sync::SyncProgress::Stage { stage, completed, total } => {
+                    use sync::SyncStage;
+                    let label = match stage {
+                        SyncStage::Preparing => "preparing",
+                        SyncStage::Books => {
+                            ready_books = completed;
+                            "books"
                         }
-                        sync::SyncStage::Statistics => "statistics",
-                        sync::SyncStage::DerivedUploading | sync::SyncStage::DerivedDownloading => {
-                            "derived"
-                        }
-                        sync::SyncStage::ReadingApplied => "reading_changed",
-                        _ => "merging",
-                    },
-                    completed as usize,
-                    total as usize,
-                ),
+                        SyncStage::Checking | SyncStage::Discovering => "checking",
+                        SyncStage::Uploading => return,
+                        SyncStage::UploadingBooks => "uploading",
+                        SyncStage::Downloading | SyncStage::PreparingDownload => "downloading",
+                        SyncStage::Statistics => "statistics",
+                        SyncStage::DerivedUploading | SyncStage::DerivedDownloading
+                        | SyncStage::CheckingDerivedData => "derived",
+                        SyncStage::ReadingApplied => "reading_changed",
+                        SyncStage::ReadingData => "merging",
+                    };
+                    if last_stage.replace(label) != Some(label)
+                        || matches!(stage, SyncStage::Books | SyncStage::UploadingBooks | SyncStage::ReadingApplied)
+                    {
+                        request.report(label, completed as usize, total as usize);
+                    }
+                }
                 sync::SyncProgress::Downloaded {
                     book,
                     cache_path,
-                    books_completed,
                     books_total,
                     ..
                 } => match (|| -> sync::SyncResult<_> {
@@ -572,9 +574,10 @@ fn execute(
                 })() {
                     Ok(_) => {
                         let _ = std::fs::remove_file(cache_path);
+                        ready_books = ready_books.saturating_add(1).min(books_total);
                         request.report(
                             "library_changed",
-                            books_completed as usize,
+                            ready_books as usize,
                             books_total as usize,
                         );
                     }
