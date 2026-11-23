@@ -35,6 +35,8 @@ pub(crate) enum CustomImportTarget {
     Cjk,
     CjkLatin,
     Latin,
+    LatinCjk,
+    Monospace,
 }
 
 #[derive(Clone, Debug)]

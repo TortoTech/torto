@@ -46,7 +46,7 @@ data class ScreenState(
     val statsPeriod:StatisticsPeriod?=null,val statsKind:String="week",val statsOffset:Int=0,val statsLoading:Boolean=false,val bookStatistics:BookStatistics?=null,val statsBookId:String?=null,
     val appVersion:String="",val checkingUpdate:Boolean=false,val appUpdate:AppUpdate?=null,val updateChecked:Boolean=false,val downloadingUpdate:Boolean=false,val updateProgress:UInt=0u,val updateError:String?=null,val downloadedUpdate:String?=null,val diagnosticFile:String?=null,
     val monoTypeface:android.graphics.Typeface=android.graphics.Typeface.MONOSPACE,
-    val reading:ReadingOptions?=null,val fontFamilies:FontFamilies?=null,val aiOptions:AiOptions?=null,
+    val reading:ReadingOptions?=null,val fontFamilies:FontFamilies?=null,val fontCatalog:ReaderFontCatalog?=null,val downloadingFontFamily:String?=null,val activeBookIsCjk:Boolean=true,val aiOptions:AiOptions?=null,
     val fontsDownloading:Boolean=false,val fontsReady:Boolean=false,val fontsError:String?=null,val fontApplyAvailable:Boolean=false,
     val fontNoticeUntil:Long=0,
     val providers:List<Provider> = emptyList(),val providerKinds:List<ProviderKind> = emptyList(),
@@ -216,8 +216,8 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         mutable.update {it.copy(providers=providers,providerKinds=kinds,cloud=cloud,cloudPresets=presets,aiOptions=ai,reading=reading,autoLayout=ai.layoutEnabled,services=services)}
     }
     fun loadServices() = runOperation {reloadSettings()}
-    fun loadFonts() {
-        if(state.value.fontFamilies!=null||fontFamiliesJob?.isActive==true)return
+    fun loadFonts(force:Boolean=false) {
+        if(!force&&state.value.fontCatalog!=null||fontFamiliesJob?.isActive==true)return
         // Font discovery is read-only metadata, not a user operation. Keep the
         // existing page interactive and share the result across settings visits.
         // Download completion refreshes this cache in the ReadingFonts collector.
@@ -225,10 +225,56 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             operations.withLock {withContext(NonCancellable){
                 try {
                     val fonts=core.fontFamilies()
-                    mutable.update {if(it.fontFamilies==null)it.copy(fontFamilies=fonts)else it}
+                    val catalog=core.readerFontCatalog()
+                    val langs=runCatching {reader?.bookLanguages().orEmpty()}.getOrDefault(emptyList())
+                    val isCjk=langs.isEmpty()||langs.any {val l=it.lowercase();l.startsWith("zh")||l.startsWith("ja")||l.startsWith("ko")}
+                    mutable.update {it.copy(fontFamilies=fonts,fontCatalog=catalog,activeBookIsCjk=isCjk)}
                 }catch(e:CancellationException){throw e}
                 catch(_:Exception){DiagnosticLog.record(getApplication(),"fonts.discovery_failed")}
             }}
+        }
+    }
+    fun selectFont(family:String,downloaded:Boolean,apply:(ReadingOptions)->ReadingOptions){
+        if(state.value.downloadingFontFamily!=null)return
+        if(downloaded){
+            state.value.reading?.let {saveReadingOptions(apply(it))}
+            return
+        }
+        viewModelScope.launch {
+            mutable.update {it.copy(downloadingFontFamily=family)}
+            try {
+                core.downloadFontFamily(family)
+                val catalog=core.readerFontCatalog()
+                mutable.update {it.copy(fontCatalog=catalog,downloadingFontFamily=null)}
+                state.value.reading?.let {saveReadingOptions(apply(it))}
+            }catch(e:CancellationException){
+                mutable.update {it.copy(downloadingFontFamily=null)}
+                throw e
+            }catch(e:Exception){
+                mutable.update {it.copy(downloadingFontFamily=null,notice=e.message ?: tr("字体下载失败","Font download failed"))}
+            }
+        }
+    }
+    fun importCustomFont(uri:Uri){
+        viewModelScope.launch {
+            val ctx=getApplication<Application>()
+            val result=withContext(Dispatchers.IO){
+                runCatching {
+                    val name=ctx.contentResolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use {c->
+                        if(c.moveToFirst())c.getString(0)else null
+                    } ?: "custom-font.ttf"
+                    val temp=File(ctx.cacheDir,"import-${System.currentTimeMillis()}-$name")
+                    ctx.contentResolver.openInputStream(uri)?.use {input->temp.outputStream().use {input.copyTo(it)}}
+                        ?: error("Cannot read file")
+                    try { core.importCustomFont(temp.absolutePath) } finally { temp.delete() }
+                }
+            }
+            result.onSuccess {imported->
+                val catalog=runCatching {core.readerFontCatalog()}.getOrNull()
+                mutable.update {it.copy(fontCatalog=catalog ?: it.fontCatalog,notice=tr("已导入字体：","Imported font: ")+imported.label)}
+            }.onFailure {e->
+                mutable.update {it.copy(notice=e.message ?: tr("导入字体失败","Failed to import font"))}
+            }
         }
     }
     private suspend fun updateMonospace(family:String){

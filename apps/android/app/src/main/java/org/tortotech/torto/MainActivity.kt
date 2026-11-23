@@ -111,6 +111,7 @@ class MainActivity : ComponentActivity() {
         else systemBars?.show(WindowInsetsCompat.Type.systemBars())
     }
     val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){it?.let(model::importBook)}
+    val fontPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){it?.let(model::importCustomFont)}
     fun open(route:String){ if(route=="ai")editingProvider=null;routes.add(route);if(route in listOf("ai","translation","assistant","sync","layout"))model.loadServices() }
     fun editProvider(provider:Provider){editingProvider=provider;open("provider")}
     fun closeProvider(){if(routes.lastOrNull()=="provider"){routes.removeAt(routes.lastIndex);editingProvider=null}}
@@ -184,7 +185,7 @@ class MainActivity : ComponentActivity() {
         val safe=readerSafePadding()
         val route=routes.lastOrNull()
         val title=when(route){
-            "settings"->tr("设置","Settings");"typography"->tr("排版","Typesetting")
+            "settings"->tr("设置","Settings")
             "dark-mode"->tr("界面主题","Interface theme");"language"->tr("界面语言","Interface language")
             "layout"->tr("AI 排版","AI layout");"ai"->tr("AI 提供商","AI providers");"translation"->tr("翻译","Translation");"assistant"->tr("阅读助手","Reading assistant")
             "provider"->if(editingProvider?.id.isNullOrEmpty())tr("添加 AI 提供商","Add AI provider")else tr("编辑 AI 提供商","Edit AI provider")
@@ -196,7 +197,7 @@ class MainActivity : ComponentActivity() {
             containerColor=if(state.active!=null)readerPaperColor(state)else if(route=="about")MaterialTheme.colorScheme.surfaceContainerLowest else MaterialTheme.colorScheme.background,
             contentWindowInsets=if(state.active!=null)WindowInsets(0,0,0,0)else ScaffoldDefaults.contentWindowInsets,
             snackbarHost={SnackbarHost(snackbar)},
-            topBar={if(state.active==null&&route in listOf("settings","dark-mode","language","typography","ai","provider","layout","translation","assistant","sync","about","statistics","book-statistics"))CenterAlignedTopAppBar(
+            topBar={if(state.active==null&&route in listOf("settings","dark-mode","language","ai","provider","layout","translation","assistant","sync","about","statistics","book-statistics"))CenterAlignedTopAppBar(
                 title={Text(title,fontSize=16.sp)},
                 navigationIcon={ActionIcon("back",tr("返回","Back"),route!="provider"||!state.busy){back()}},
                 actions={if(route=="ai")ActionIcon("add",tr("添加提供商","Add provider"),!state.busy){editProvider(Provider("","custom","","",emptyList(),false))}},
@@ -242,7 +243,6 @@ class MainActivity : ComponentActivity() {
                     "settings"->SettingsScreen(state,::open)
                     "dark-mode"->DarkModeScreen(state,model)
                     "language"->InterfaceLanguageScreen(state,model)
-                    "typography"->TypographyPanel(state,model,openLayout={open("layout")})
                     "ai"->ProviderManager(state,model,::editProvider)
                     "provider"->editingProvider?.let {ProviderEditor(it,state,model,::closeProvider)}
                     "translation","assistant","sync","layout"->ServiceSettingsPanel(state,model,route)
@@ -256,7 +256,7 @@ class MainActivity : ComponentActivity() {
                         when(name){
                             "navigation"->ReadingNavigation(state,panel=="navigation",model,::closePanel)
                             "typography"->ReadingTypographyPanel(state,model){next->panel=next;if(next=="layout-settings")model.loadServices()}
-                            "font-style"->ReadingFontStylePanel(state,model,{panel="typography"}){panel="font-choice-${it.name}"}
+                            "font-style"->ReadingFontStylePanel(state,model,{panel="typography"},onImportFont={fontPicker.launch(arrayOf("*/*"))})
                             "reading-mode"->ReadingModePanel(state,model){panel="typography"}
                             "selection"->ReadingSelectionPanel(state,model,::closePanel)
                             "theme"->ReadingThemePanel(state,model)

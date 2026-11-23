@@ -5141,64 +5141,94 @@ impl DesktopReader {
             self.request_settings_change(ReaderSettingsChange::FontSize(next));
         }
         ui.add_space(12.0);
-        if is_cjk_book {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(self.language.text("字体", "Font"))
-                        .size(crate::ui::scaled_font_size(13.5)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::Frame::new()
-                        .fill(palette().surface_muted)
-                        .corner_radius(egui::CornerRadius::same(12))
-                        .inner_margin(egui::Margin::same(2))
-                        .show(ui, |ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(128.0, 22.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                    for (tab_idx, tab_label) in [
-                                        (0u8, self.language.text("主要字体", "Primary")),
-                                        (1u8, self.language.text("拉丁字体", "Latin")),
-                                    ] {
-                                        let selected = active_tab == tab_idx;
-                                        let btn = egui::Button::new(
-                                            RichText::new(tab_label)
-                                                .size(crate::ui::scaled_font_size(11.5))
-                                                .color(if selected {
-                                                    palette().text
-                                                } else {
-                                                    palette().muted
-                                                }),
-                                        )
-                                        .fill(if selected {
-                                            palette().surface
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        })
-                                        .stroke(egui::Stroke::NONE)
-                                        .corner_radius(egui::CornerRadius::same(10));
-                                        if ui
-                                            .add_sized(egui::vec2(64.0, 22.0), btn)
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                            .clicked()
-                                        {
-                                            active_tab = tab_idx;
-                                        }
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(self.language.text("字体", "Font"))
+                    .size(crate::ui::scaled_font_size(13.5)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let secondary_label = if is_cjk_book {
+                    self.language.text("拉丁字体", "Latin")
+                } else {
+                    self.language.text("中日韩字体", "CJK")
+                };
+                let pill_w = if is_cjk_book { 192.0 } else { 204.0 };
+                let btn_w = pill_w / 3.0;
+                egui::Frame::new()
+                    .fill(palette().surface_muted)
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(2))
+                    .show(ui, |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(pill_w, 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for (tab_idx, tab_label) in [
+                                    (0u8, self.language.text("主要字体", "Primary")),
+                                    (1u8, secondary_label),
+                                    (2u8, self.language.text("代码字体", "Code")),
+                                ] {
+                                    let selected = active_tab == tab_idx;
+                                    let btn = egui::Button::new(
+                                        RichText::new(tab_label)
+                                            .size(crate::ui::scaled_font_size(11.5))
+                                            .color(if selected {
+                                                palette().text
+                                            } else {
+                                                palette().muted
+                                            }),
+                                    )
+                                    .fill(if selected {
+                                        palette().surface
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(egui::CornerRadius::same(10));
+                                    if ui
+                                        .add_sized(egui::vec2(btn_w, 22.0), btn)
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        active_tab = tab_idx;
                                     }
-                                },
-                            );
-                        });
-                });
+                                }
+                            },
+                        );
+                    });
             });
-            ui.data_mut(|data| data.insert_temp(picker_id, active_tab));
-            ui.add_space(6.0);
-            ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), 248.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_min_height(248.0);
+        });
+        ui.data_mut(|data| data.insert_temp(picker_id, active_tab));
+        ui.add_space(6.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 248.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_height(248.0);
+                if active_tab == 2 {
+                    match grouped_monospace_font_picker(
+                        ui,
+                        self.language,
+                        &typography.monospace_font,
+                    ) {
+                        Some(FontPickerAction::Select(chosen)) => {
+                            let change = ReaderSettingsChange::MonospaceFont(chosen.clone());
+                            if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                self.request_settings_change(change);
+                            } else {
+                                crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                            }
+                        }
+                        Some(FontPickerAction::OpenCustomSearch) => {
+                            crate::fonts::request_custom_import(
+                                ui.ctx(),
+                                crate::fonts::CustomImportTarget::Monospace,
+                            );
+                        }
+                        None => {}
+                    }
+                } else if is_cjk_book {
                     if active_tab == 0 {
                         match grouped_cjk_font_picker(
                             ui,
@@ -5210,7 +5240,11 @@ impl DesktopReader {
                                 if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
                                     self.request_settings_change(change);
                                 } else {
-                                    crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                                    crate::fonts::request_family_with_apply(
+                                        ui.ctx(),
+                                        &chosen,
+                                        change,
+                                    );
                                 }
                             }
                             Some(FontPickerAction::OpenCustomSearch) => {
@@ -5229,11 +5263,16 @@ impl DesktopReader {
                             .unwrap_or("Literata");
                         match grouped_latin_font_picker(ui, self.language, current) {
                             Some(FontPickerAction::Select(chosen)) => {
-                                let change = ReaderSettingsChange::CjkLatinFont(Some(chosen.clone()));
+                                let change =
+                                    ReaderSettingsChange::CjkLatinFont(Some(chosen.clone()));
                                 if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
                                     self.request_settings_change(change);
                                 } else {
-                                    crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                                    crate::fonts::request_family_with_apply(
+                                        ui.ctx(),
+                                        &chosen,
+                                        change,
+                                    );
                                 }
                             }
                             Some(FontPickerAction::OpenCustomSearch) => {
@@ -5245,37 +5284,56 @@ impl DesktopReader {
                             None => {}
                         }
                     }
-                },
-            );
-        } else {
-            ui.label(
-                RichText::new(self.language.text("字体", "Font"))
-                    .size(crate::ui::scaled_font_size(13.5)),
-            );
-            ui.add_space(6.0);
-            let current = match typography.default_font {
-                rebook_layout::ReaderDefaultFont::Serif => typography.serif_font.as_str(),
-                rebook_layout::ReaderDefaultFont::SansSerif => typography.sans_serif_font.as_str(),
-                rebook_layout::ReaderDefaultFont::Other => typography.other_font.as_str(),
-            };
-            match grouped_latin_font_picker(ui, self.language, current) {
-                Some(FontPickerAction::Select(chosen)) => {
-                    let change = ReaderSettingsChange::LatinFont(chosen.clone());
-                    if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
-                        self.request_settings_change(change);
-                    } else {
-                        crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                } else if active_tab == 0 {
+                    let current = match typography.default_font {
+                        rebook_layout::ReaderDefaultFont::Serif => typography.serif_font.as_str(),
+                        rebook_layout::ReaderDefaultFont::SansSerif => {
+                            typography.sans_serif_font.as_str()
+                        }
+                        rebook_layout::ReaderDefaultFont::Other => typography.other_font.as_str(),
+                    };
+                    match grouped_latin_font_picker(ui, self.language, current) {
+                        Some(FontPickerAction::Select(chosen)) => {
+                            let change = ReaderSettingsChange::LatinFont(chosen.clone());
+                            if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                self.request_settings_change(change);
+                            } else {
+                                crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                            }
+                        }
+                        Some(FontPickerAction::OpenCustomSearch) => {
+                            crate::fonts::request_custom_import(
+                                ui.ctx(),
+                                crate::fonts::CustomImportTarget::Latin,
+                            );
+                        }
+                        None => {}
+                    }
+                } else {
+                    let current = typography
+                        .latin_cjk_font
+                        .as_deref()
+                        .unwrap_or(&typography.default_cjk_font);
+                    match grouped_cjk_font_picker(ui, self.language, current) {
+                        Some(FontPickerAction::Select(chosen)) => {
+                            let change = ReaderSettingsChange::LatinCjkFont(Some(chosen.clone()));
+                            if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                self.request_settings_change(change);
+                            } else {
+                                crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                            }
+                        }
+                        Some(FontPickerAction::OpenCustomSearch) => {
+                            crate::fonts::request_custom_import(
+                                ui.ctx(),
+                                crate::fonts::CustomImportTarget::LatinCjk,
+                            );
+                        }
+                        None => {}
                     }
                 }
-                Some(FontPickerAction::OpenCustomSearch) => {
-                    crate::fonts::request_custom_import(
-                        ui.ctx(),
-                        crate::fonts::CustomImportTarget::Latin,
-                    );
-                }
-                None => {}
-            }
-        }
+            },
+        );
     }
 
     fn selection_mode_menu(&mut self, ui: &mut egui::Ui) {
@@ -5796,6 +5854,113 @@ fn grouped_latin_font_picker(
                                 egui::CornerRadius::same(7),
                                 palette().accent.gamma_multiply(0.18),
                             );
+                        }
+                        if !any_downloading && response.clicked() {
+                            chosen = Some(if is_custom {
+                                FontPickerAction::OpenCustomSearch
+                            } else {
+                                FontPickerAction::Select(family.clone())
+                            });
+                        }
+                        if idx % 3 == 2 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    chosen
+}
+
+fn system_monospace_font_families() -> &'static [String] {
+    static SYSTEM_MONO: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SYSTEM_MONO.get_or_init(|| {
+        let mut engine = rebook_layout::LayoutEngine::new();
+        let found = engine.available_reader_font_families_with_locale(false);
+        let default_mono = rebook_layout::default_monospace_font();
+        let mut seen = std::collections::HashSet::new();
+        let mut list = Vec::new();
+        for family in found.monospace {
+            if !family.starts_with('.')
+                && !family.eq_ignore_ascii_case(default_mono)
+                && seen.insert(family.clone())
+            {
+                list.push(family);
+            }
+        }
+        list.sort();
+        list
+    })
+}
+
+fn grouped_monospace_font_picker(
+    ui: &mut egui::Ui,
+    language: crate::preferences::AppLanguage,
+    current_family: &str,
+) -> Option<FontPickerAction> {
+    let default_mono = rebook_layout::default_monospace_font();
+    let mut items: Vec<(String, String)> = vec![(
+        default_mono.to_owned(),
+        default_mono.to_owned(),
+    )];
+    for family in system_monospace_font_families() {
+        items.push((family.clone(), family.clone()));
+    }
+    for (family, label) in crate::fonts::custom_latin_families(ui.ctx()) {
+        if !items.iter().any(|(f, _)| f.eq_ignore_ascii_case(&family)) {
+            items.push((family, label));
+        }
+    }
+    if !current_family.is_empty()
+        && !current_family.starts_with('.')
+        && !items
+            .iter()
+            .any(|(f, _)| f.eq_ignore_ascii_case(current_family))
+    {
+        items.push((current_family.to_owned(), current_family.to_owned()));
+    }
+    items.push((
+        "__custom__".to_owned(),
+        language.text("导入字体", "Import font").to_owned(),
+    ));
+
+    let mut chosen = None;
+    let card_width = ((ui.available_width() - 16.0) / 3.0).max(96.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .min_scrolled_height(232.0)
+        .max_height(232.0)
+        .show(ui, |ui| {
+            egui::Grid::new("reader-menu-mono-font-grid")
+                .num_columns(3)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    let any_downloading = crate::fonts::any_downloading(ui.ctx());
+                    for (idx, (family, label)) in items.iter().enumerate() {
+                        let is_custom = family == "__custom__";
+                        let selected = !is_custom && family.eq_ignore_ascii_case(current_family);
+                        let stroke = if selected {
+                            egui::Stroke::new(1.5, palette().accent)
+                        } else {
+                            egui::Stroke::new(1.0, palette().border)
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(label.as_str())
+                                .size(crate::ui::scaled_font_size(12.5))
+                                .color(if selected {
+                                    palette().accent
+                                } else {
+                                    palette().text
+                                }),
+                        )
+                        .truncate()
+                        .fill(palette().surface)
+                        .stroke(stroke)
+                        .corner_radius(egui::CornerRadius::same(8));
+                        let mut response = ui
+                            .add_sized(egui::vec2(card_width, 36.0), btn)
+                            .on_hover_text(label);
+                        if !any_downloading {
+                            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
                         }
                         if !any_downloading && response.clicked() {
                             chosen = Some(if is_custom {
@@ -9556,8 +9721,8 @@ mod reference_suggestion_label_tests {
                     .expect("preview covers the full window");
                 if !fullscreen {
                     let controls = Rect::from_min_size(
-                        Pos2::new(screen.right() - 138.0, 0.0),
-                        Vec2::new(138.0, window_chrome::HEIGHT),
+                        Pos2::new(screen.right() - window_chrome::CONTROLS_WIDTH, 0.0),
+                        Vec2::new(window_chrome::CONTROLS_WIDTH, window_chrome::HEIGHT),
                     );
                     let caption_index = output
                         .shapes

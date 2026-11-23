@@ -833,8 +833,8 @@ mod tests {
                 );
                 if !fullscreen {
                     let controls = Rect::from_min_size(
-                        egui::pos2(screen.right() - 138.0, 0.0),
-                        egui::vec2(138.0, window_chrome::HEIGHT),
+                        egui::pos2(screen.right() - window_chrome::CONTROLS_WIDTH, 0.0),
+                        egui::vec2(window_chrome::CONTROLS_WIDTH, window_chrome::HEIGHT),
                     );
                     let backdrop_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == screen && rect.fill == Color32::BLACK.gamma_multiply(0.46 * progress))).unwrap();
                     let caption_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == palette().background)).expect("opaque caption background");

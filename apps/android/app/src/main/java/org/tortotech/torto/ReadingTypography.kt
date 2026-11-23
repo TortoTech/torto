@@ -22,6 +22,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.tortotech.torto.core.FontOption
+import org.tortotech.torto.core.ReaderFontCatalog
 import org.tortotech.torto.core.ReadingOptions
 
 internal enum class ReadingFontSetting { Cjk, CjkLatin, Latin, LatinCjk, Code }
@@ -125,10 +127,136 @@ private fun ReadingOptions.withFont(setting:ReadingFontSetting,value:String)=whe
         })
 }
 
-@Composable internal fun ReadingFontStylePanel(state:ScreenState,model:ReaderModel,back:()->Unit,choose:(ReadingFontSetting)->Unit){
+@Composable internal fun ReadingFontStylePanel(state:ScreenState,model:ReaderModel,back:()->Unit,onImportFont:()->Unit={}){
+    LaunchedEffect(state.active?.id){model.loadFonts(force=true)}
+    val isCjkBook=state.activeBookIsCjk
+    val tabs=remember(isCjkBook){
+        if(isCjkBook) listOf(ReadingFontSetting.Cjk,ReadingFontSetting.CjkLatin,ReadingFontSetting.Code)
+        else listOf(ReadingFontSetting.Latin,ReadingFontSetting.LatinCjk,ReadingFontSetting.Code)
+    }
+    var activeTab by rememberSaveable(isCjkBook){mutableStateOf(tabs.first())}
+    if(activeTab !in tabs) activeTab=tabs.first()
+    val catalog=state.fontCatalog
+    val reading=state.reading
+
     ReadingPanelPage(tr("字体样式","Font styles"),back,fill=false){
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
-            TypographyFontGroups(state,model,choose)
+        Column(Modifier.fillMaxWidth().padding(horizontal=16.dp).padding(bottom=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
+            // Top 3 tabs
+            Surface(Modifier.fillMaxWidth(),shape=RoundedCornerShape(16.dp),color=MaterialTheme.colorScheme.surfaceContainerHigh){
+                Row(Modifier.fillMaxWidth().padding(3.dp)){
+                    tabs.forEach {tab->
+                        val selected=activeTab==tab
+                        val label=when(tab){
+                            ReadingFontSetting.Cjk->tr("中文字体","CJK")
+                            ReadingFontSetting.LatinCjk->tr("中日韩字体","CJK")
+                            ReadingFontSetting.Latin,ReadingFontSetting.CjkLatin->tr("拉丁字体","Latin")
+                            ReadingFontSetting.Code->tr("代码字体","Code")
+                        }
+                        Surface(
+                            modifier=Modifier.weight(1f).height(30.dp).clickable {activeTab=tab},
+                            shape=RoundedCornerShape(13.dp),
+                            color=if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,
+                        ){
+                            Box(contentAlignment=Alignment.Center){
+                                Text(label,fontSize=13.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                    color=if(selected)MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if(catalog==null||reading==null){
+                Box(Modifier.fillMaxWidth().height(160.dp),contentAlignment=Alignment.Center){
+                    CircularProgressIndicator(Modifier.size(24.dp),strokeWidth=2.dp)
+                }
+            } else {
+                val currentFamily=when(activeTab){
+                    ReadingFontSetting.Cjk->reading.cjkFont
+                    ReadingFontSetting.CjkLatin->reading.cjkLatinFont.ifEmpty {reading.latinFont}
+                    ReadingFontSetting.Latin->reading.latinFont
+                    ReadingFontSetting.LatinCjk->reading.latinCjkFont.ifEmpty {reading.cjkFont}
+                    ReadingFontSetting.Code->reading.monospaceFont
+                }
+                val groups=when(activeTab){
+                    ReadingFontSetting.Cjk,ReadingFontSetting.LatinCjk->catalog.cjkGroups
+                    ReadingFontSetting.Latin,ReadingFontSetting.CjkLatin->catalog.latinGroups
+                    ReadingFontSetting.Code->emptyList()
+                }
+                var activeGroupId by rememberSaveable(activeTab){
+                    mutableStateOf(groups.firstOrNull {g->g.items.any {it.family.equals(currentFamily,true)}}?.id ?: groups.firstOrNull()?.id ?: "")
+                }
+                if(groups.isNotEmpty()&&groups.none {it.id==activeGroupId}) activeGroupId=groups.first().id
+
+                if(groups.isNotEmpty()){
+                    Surface(Modifier.fillMaxWidth(),shape=RoundedCornerShape(14.dp),color=MaterialTheme.colorScheme.surfaceContainerHigh){
+                        Row(Modifier.fillMaxWidth().padding(3.dp)){
+                            groups.forEach {group->
+                                val selected=group.id==activeGroupId
+                                val extra=if(group.id=="system"||group.id=="builtin") 1 else 0
+                                val text="${tr(group.titleZh,group.titleEn)}(${group.items.size+extra})"
+                                Surface(
+                                    modifier=Modifier.weight(1f).height(26.dp).clickable {activeGroupId=group.id},
+                                    shape=RoundedCornerShape(11.dp),
+                                    color=if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,
+                                ){
+                                    Box(contentAlignment=Alignment.Center){
+                                        Text(text,fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                            color=if(selected)MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val showImport=activeTab==ReadingFontSetting.Code||activeGroupId=="system"||activeGroupId=="builtin"
+                val rawItems=if(activeTab==ReadingFontSetting.Code) catalog.monospace else groups.firstOrNull {it.id==activeGroupId}?.items.orEmpty()
+                val cards=buildList<Pair<String,FontOption?>> {
+                    rawItems.forEach {add(it.family to it)}
+                    if(showImport) add("__import__" to null)
+                }
+                val busy=state.busy||state.downloadingFontFamily!=null
+                Column(Modifier.fillMaxWidth().heightIn(max=240.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(8.dp)){
+                    cards.chunked(3).forEach {row->
+                        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){
+                            row.forEach {(key,option)->
+                                if(option==null){
+                                    Surface(
+                                        modifier=Modifier.weight(1f).height(40.dp).clickable(enabled=!busy,onClick=onImportFont),
+                                        shape=RoundedCornerShape(8.dp),
+                                        color=MaterialTheme.colorScheme.surface,
+                                        border=BorderStroke(1.dp,MaterialTheme.colorScheme.outlineVariant),
+                                    ){
+                                        Box(Modifier.padding(horizontal=6.dp),contentAlignment=Alignment.Center){
+                                            Text(tr("导入字体","Import font"),fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                                color=MaterialTheme.colorScheme.onSurface)
+                                        }
+                                    }
+                                } else {
+                                    val selected=option.family.equals(currentFamily,true)
+                                    val downloading=state.downloadingFontFamily==option.family
+                                    val label=if(downloading) tr("下载中","Downloading") else if(option.label=="系统字体") tr("系统字体","System font") else option.label
+                                    Surface(
+                                        modifier=Modifier.weight(1f).height(40.dp).clickable(enabled=!busy){
+                                            model.selectFont(option.family,option.downloaded){opts->opts.withFont(activeTab,option.family)}
+                                        },
+                                        shape=RoundedCornerShape(8.dp),
+                                        color=if(downloading)MaterialTheme.colorScheme.primary.copy(alpha=0.12f)else MaterialTheme.colorScheme.surface,
+                                        border=BorderStroke(if(selected)1.5.dp else 1.dp,if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
+                                    ){
+                                        Box(Modifier.padding(horizontal=6.dp),contentAlignment=Alignment.Center){
+                                            Text(label,fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                                color=if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                                        }
+                                    }
+                                }
+                            }
+                            repeat(3-row.size){Spacer(Modifier.weight(1f))}
+                        }
+                    }
+                }
+            }
             TypographyFontDownloads(state,model)
         }
     }

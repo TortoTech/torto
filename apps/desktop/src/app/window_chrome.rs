@@ -11,7 +11,7 @@ const BUTTON_SPACING: f32 = 4.0;
 #[cfg(target_os = "windows")]
 const RIGHT_PADDING: f32 = 12.0;
 #[cfg(target_os = "windows")]
-const CONTROLS_WIDTH: f32 = BUTTON_SIZE * 3.0 + BUTTON_SPACING * 2.0 + RIGHT_PADDING;
+pub(crate) const CONTROLS_WIDTH: f32 = BUTTON_SIZE * 3.0 + BUTTON_SPACING * 2.0 + RIGHT_PADDING;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct WindowState {
@@ -315,25 +315,28 @@ mod tests {
                 output.textures_delta.clear();
             }
             let geometry = geometry(&ctx);
+            let y = (HEIGHT - BUTTON_SIZE) * 0.5;
+            let x0 = width - CONTROLS_WIDTH;
+            let step = BUTTON_SIZE + BUTTON_SPACING;
             assert_eq!(
                 geometry.buttons[0],
                 Some(Rect::from_min_size(
-                    Pos2::new(width - 138.0, 0.0),
-                    Vec2::new(46.0, HEIGHT)
+                    Pos2::new(x0, y),
+                    Vec2::splat(BUTTON_SIZE)
                 ))
             );
             assert_eq!(
                 geometry.buttons[1],
                 Some(Rect::from_min_size(
-                    Pos2::new(width - 92.0, 0.0),
-                    Vec2::new(46.0, HEIGHT)
+                    Pos2::new(x0 + step, y),
+                    Vec2::splat(BUTTON_SIZE)
                 ))
             );
             assert_eq!(
                 geometry.buttons[2],
                 Some(Rect::from_min_size(
-                    Pos2::new(width - 46.0, 0.0),
-                    Vec2::new(46.0, HEIGHT)
+                    Pos2::new(x0 + step * 2.0, y),
+                    Vec2::splat(BUTTON_SIZE)
                 ))
             );
             assert!(
@@ -453,7 +456,10 @@ mod tests {
             let header_mask = Rect::from_min_max(Pos2::new(256.0, 0.0), Pos2::new(720.0, HEIGHT));
             assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == header_mask && rect.fill == Color32::BLACK.gamma_multiply(0.31))), "drawer backdrop covers the header and native controls: {:?}", output.shapes);
             if !fullscreen {
-                let controls = Rect::from_min_size(Pos2::new(582.0, 0.0), Vec2::new(138.0, HEIGHT));
+                let controls = Rect::from_min_size(
+                    Pos2::new(720.0 - CONTROLS_WIDTH, 0.0),
+                    Vec2::new(CONTROLS_WIDTH, HEIGHT),
+                );
                 assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == Color32::BLACK.gamma_multiply(0.46))), "settings backdrop also covers the three caption buttons");
                 let caption_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == crate::ui::palette().background)).expect("opaque caption background");
                 let mask_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == header_mask && rect.fill == Color32::BLACK.gamma_multiply(0.31))).unwrap();

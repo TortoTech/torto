@@ -65,6 +65,94 @@ pub struct FontFamilies {
     pub monospace: Vec<String>,
 }
 #[derive(Clone, uniffi::Record)]
+pub struct FontOption {
+    pub family: String,
+    pub label: String,
+    pub downloaded: bool,
+}
+#[derive(Clone, uniffi::Record)]
+pub struct FontGroup {
+    pub id: String,
+    pub title_zh: String,
+    pub title_en: String,
+    pub items: Vec<FontOption>,
+}
+#[derive(Clone, uniffi::Record)]
+pub struct ReaderFontCatalog {
+    pub cjk_groups: Vec<FontGroup>,
+    pub latin_groups: Vec<FontGroup>,
+    pub monospace: Vec<FontOption>,
+}
+#[derive(Clone, uniffi::Record)]
+pub struct ImportedFont {
+    pub family: String,
+    pub label: String,
+    pub is_cjk: bool,
+}
+
+struct CustomMobileFont {
+    family: String,
+    display_name: String,
+    is_cjk: bool,
+    data: peniko::Blob<u8>,
+}
+
+fn load_custom_fonts(root: &std::path::Path) -> Vec<CustomMobileFont> {
+    let dir = root.join("fonts").join("custom");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut list: Vec<CustomMobileFont> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if !matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc")) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Some((family, display_name, is_cjk)) = rebook_layout::inspect_font_bytes(&bytes) {
+            let data = peniko::Blob::new(Arc::new(bytes));
+            rebook_layout::register_font_blob_family_override(data.id(), family.clone());
+            if !list
+                .iter()
+                .any(|item| item.family.eq_ignore_ascii_case(&family))
+            {
+                list.push(CustomMobileFont {
+                    family,
+                    display_name,
+                    is_cjk,
+                    data,
+                });
+            }
+        }
+    }
+    list.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
+    list
+}
+
+pub(crate) fn load_all_reader_fonts(root: &std::path::Path) -> Arc<[peniko::Blob<u8>]> {
+    let fonts = rebook_app_core::fonts::store::load(&root.join("fonts"), Default::default());
+    rebook_app_core::fonts::install(Arc::new(fonts.clone()));
+    let custom = load_custom_fonts(root);
+    let mut blobs: Vec<peniko::Blob<u8>> = fonts.reader_fonts().iter().cloned().collect();
+    for font in custom {
+        rebook_layout::register_font_blob_family_override(font.data.id(), font.family.clone());
+        if !blobs.iter().any(|blob| blob.id() == font.data.id()) {
+            blobs.push(font.data);
+        }
+    }
+    blobs.into()
+}
+#[derive(Clone, uniffi::Record)]
 pub struct ProviderKind {
     pub id: String,
     pub name: String,
@@ -453,14 +541,12 @@ impl MobileReader {
                 } else {
                     SpreadMode::Single
                 };
-                let fonts =
-                    rebook_app_core::fonts::store::load(&s.root.join("fonts"), Default::default());
-                rebook_app_core::fonts::install(Arc::new(fonts.clone()));
+                let reader_fonts = load_all_reader_fonts(&s.root);
                 s.session = ReaderSession::open_with_fonts_at_locator(
                     s.source.clone(),
                     s.session.viewport(),
                     style,
-                    fonts.reader_fonts(),
+                    reader_fonts,
                     &locator,
                 )
                 .map_err(error)?;
@@ -538,6 +624,175 @@ impl MobileCore {
                     index,
                 }),
             )
+        })
+        .await
+    }
+    pub async fn reader_font_catalog(self: Arc<Self>) -> Result<ReaderFontCatalog> {
+        work(move || {
+            let fonts =
+                rebook_app_core::fonts::store::load(&self.root.join("fonts"), Default::default());
+            let custom = load_custom_fonts(&self.root);
+            let is_downloaded = |family: &str| {
+                let indices = rebook_app_core::fonts::catalog::indices_for_family(family);
+                !indices.is_empty() && indices.iter().all(|&i| fonts.faces[i].is_some())
+            };
+
+            let mut cjk_system = vec![
+                FontOption {
+                    family: "sans-serif".into(),
+                    label: "系统字体".into(),
+                    downloaded: true,
+                },
+                FontOption {
+                    family: "LXGW WenKai GB Screen".into(),
+                    label: rebook_app_core::fonts::catalog::display_name("LXGW WenKai GB Screen")
+                        .into(),
+                    downloaded: is_downloaded("LXGW WenKai GB Screen"),
+                },
+            ];
+            for f in custom.iter().filter(|f| f.is_cjk) {
+                cjk_system.push(FontOption {
+                    family: f.family.clone(),
+                    label: f.display_name.clone(),
+                    downloaded: true,
+                });
+            }
+            let catalog_group = |id: &str, zh: &str, en: &str| FontGroup {
+                id: id.into(),
+                title_zh: zh.into(),
+                title_en: en.into(),
+                items: rebook_app_core::fonts::catalog::cjk_families_in_group(id)
+                    .into_iter()
+                    .map(|(family, label)| FontOption {
+                        family: family.into(),
+                        label: label.into(),
+                        downloaded: is_downloaded(family),
+                    })
+                    .collect(),
+            };
+            let cjk_groups = vec![
+                FontGroup {
+                    id: "system".into(),
+                    title_zh: "内置".into(),
+                    title_en: "Built-in".into(),
+                    items: cjk_system,
+                },
+                catalog_group("canger", "仓耳", "Tsanger"),
+                catalog_group("fangzheng", "方正", "Founder"),
+                catalog_group("other", "其他", "Other"),
+            ];
+
+            let mut latin_builtin = vec![
+                FontOption {
+                    family: "serif".into(),
+                    label: "系统字体".into(),
+                    downloaded: true,
+                },
+                FontOption {
+                    family: "Literata".into(),
+                    label: "Literata".into(),
+                    downloaded: is_downloaded("Literata"),
+                },
+            ];
+            for f in custom.iter().filter(|f| !f.is_cjk) {
+                latin_builtin.push(FontOption {
+                    family: f.family.clone(),
+                    label: f.display_name.clone(),
+                    downloaded: true,
+                });
+            }
+            let latin_groups = vec![
+                FontGroup {
+                    id: "builtin".into(),
+                    title_zh: "内置".into(),
+                    title_en: "Built-in".into(),
+                    items: latin_builtin,
+                },
+                catalog_group("latin-extra", "其他", "Other"),
+            ];
+
+            let mut engine =
+                rebook_layout::LayoutEngine::with_fonts(fonts.reader_fonts().iter().cloned());
+            let found = engine.available_reader_font_families();
+            let default_mono = rebook_layout::default_monospace_font();
+            let mut monospace = vec![FontOption {
+                family: default_mono.into(),
+                label: default_mono.into(),
+                downloaded: true,
+            }];
+            for family in found.monospace {
+                if !family.starts_with('.')
+                    && !monospace
+                        .iter()
+                        .any(|item| item.family.eq_ignore_ascii_case(&family))
+                {
+                    monospace.push(FontOption {
+                        label: family.clone(),
+                        family,
+                        downloaded: true,
+                    });
+                }
+            }
+            for f in custom.iter().filter(|f| !f.is_cjk) {
+                if !monospace
+                    .iter()
+                    .any(|item| item.family.eq_ignore_ascii_case(&f.family))
+                {
+                    monospace.push(FontOption {
+                        family: f.family.clone(),
+                        label: f.display_name.clone(),
+                        downloaded: true,
+                    });
+                }
+            }
+
+            Ok(ReaderFontCatalog {
+                cjk_groups,
+                latin_groups,
+                monospace,
+            })
+        })
+        .await
+    }
+    pub async fn download_font_family(self: Arc<Self>, family: String) -> Result<()> {
+        let indices = rebook_app_core::fonts::catalog::indices_for_family(&family);
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let client = rebook_app_core::fonts::download::client().map_err(error)?;
+        let fonts_root = self.root.join("fonts");
+        let catalog = rebook_app_core::fonts::catalog::catalog();
+        for index in indices {
+            let asset = catalog.fonts[index].clone();
+            if rebook_app_core::fonts::store::load_cached(&fonts_root, &asset).is_some() {
+                continue;
+            }
+            rebook_app_core::fonts::download::fetch(&client, fonts_root.clone(), asset, |_| {})
+                .await
+                .map_err(error)?;
+        }
+        Ok(())
+    }
+    pub async fn import_custom_font(self: Arc<Self>, path: String) -> Result<ImportedFont> {
+        work(move || {
+            let src = std::path::PathBuf::from(&path);
+            let bytes = std::fs::read(&src).map_err(error)?;
+            let Some((family, display_name, is_cjk)) = rebook_layout::inspect_font_bytes(&bytes)
+            else {
+                return Err(error("不支持或无效的字体文件"));
+            };
+            let dir = self.root.join("fonts").join("custom");
+            std::fs::create_dir_all(&dir).map_err(error)?;
+            let file_name = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("custom-font.ttf");
+            std::fs::write(dir.join(file_name), &bytes).map_err(error)?;
+            Ok(ImportedFont {
+                family,
+                label: display_name,
+                is_cjk,
+            })
         })
         .await
     }

@@ -1812,7 +1812,9 @@ impl LayoutEngine {
                 classification = infer_reader_font_classification(family_name);
             }
             if classification.monospace {
-                families.monospace.push(family_name.clone());
+                if !family_name.starts_with('.') {
+                    families.monospace.push(family_name.clone());
+                }
             } else if classification.serif {
                 families.serif.push(family_name.clone());
             } else if classification.sans_serif {

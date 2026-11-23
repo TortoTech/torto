@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct MobileSettings: View {
     let core: MobileCore
@@ -14,7 +15,7 @@ struct MobileSettings: View {
     @State private var aiSaveError: String?
     private var palette: MobilePalette { MobilePalette(scheme) }
 
-    enum Route { case theme, language, typography, providers, provider, translation, assistant, layout, about }
+    enum Route { case theme, language, providers, provider, translation, assistant, layout, about }
 
     var body: some View {
         let route = routes.last
@@ -33,7 +34,7 @@ struct MobileSettings: View {
                     MobileGroup {
                         MobileRow(title: title(.theme), value: themeLabel, icon: "moon") { routes.append(.theme) }
                         MobileRow(title: title(.language), value: languageLabel(language), icon: "translate") { routes.append(.language) }
-                        MobileRow(title: title(.typography), icon: "type") { routes.append(.typography) }
+                        MobileRow(title: title(.layout), icon: "type") { routes.append(.layout) }
                     }
                     MobileGroup {
                         MobileRow(title: title(.providers), icon: "ai") { routes.append(.providers) }
@@ -53,8 +54,6 @@ struct MobileSettings: View {
                 InterfaceOptions(value: $language, fallback: (Locale.preferredLanguages.first ?? "en").hasPrefix("zh") ? "zh-CN" : "en",
                                  description: mobileText("开启后，将跟随系统设置界面语言", "When enabled, the interface language follows your system settings"),
                                  choices: [MobileChoice("zh-CN", "中文"), MobileChoice("en", "English")])
-            case .typography:
-                TypesettingSettings(core: core, library: library) { routes.append(.layout) }
             case .providers:
                 ProviderList(core: core) { value in
                     provider = value
@@ -110,7 +109,6 @@ struct MobileSettings: View {
         case nil: mobileText("设置", "Settings")
         case .theme: mobileText("界面主题", "Interface theme")
         case .language: mobileText("界面语言", "Interface language")
-        case .typography: mobileText("排版", "Typesetting")
         case .providers: mobileText("AI 提供商", "AI providers")
         case .provider: provider?.id.isEmpty == true ? mobileText("添加 AI 提供商", "Add AI provider") : mobileText("编辑 AI 提供商", "Edit AI provider")
         case .translation: mobileText("翻译", "Translation")
@@ -270,54 +268,194 @@ enum MobileFontField: String, CaseIterable, Identifiable {
     }
 }
 
-struct FontSettings<General: View>: View {
+struct ReaderFontStylePanel: View {
     let core: MobileCore
     @ObservedObject var library: LibraryModel
+    let isCjkBook: Bool
     var apply: ((ReadingOptions) -> Void)? = nil
-    @ViewBuilder var general: () -> General
+    @Environment(\.colorScheme) private var scheme
     @State private var options: ReadingOptions?
-    @State private var fonts: FontFamilies?
-    @State private var choice: ChoiceRequest?
-    @State private var error: String?
+    @State private var catalog: ReaderFontCatalog?
+    @State private var activeTab: MobileFontField = .cjk
+    @State private var activeGroupId: String = ""
+    @State private var downloadingFamily: String?
+    @State private var importing = false
     @State private var saving = false
+    @State private var error: String?
+    private var palette: MobilePalette { MobilePalette(scheme) }
 
-    var body: some View {
-        Group {
-            SectionCaption(title: mobileText("中日韩书籍", "CJK books"))
-            MobileGroup { row(.cjk); row(.cjkLatin) }
-            SectionCaption(title: mobileText("其他语言书籍", "Other-language books"))
-            MobileGroup { row(.latin); row(.latinCjk) }
-            SectionCaption(title: mobileText("通用", "General"))
-            MobileGroup { row(.code); general() }
-            if let error { Text(error).font(.footnote).foregroundStyle(.red) }
-        }
-        .task(id: library.fontsReady) {
-            do {
-                options = try await core.readingOptions()
-                fonts = try await core.fontFamilies()
-            } catch { if !Task.isCancelled { self.error = message(error) } }
-        }
-        .fullScreenCover(item: $choice) { request in request.page { choice = nil } }
+    private var tabs: [MobileFontField] {
+        isCjkBook ? [.cjk, .cjkLatin, .code] : [.latin, .latinCjk, .code]
     }
 
-    private func row(_ field: MobileFontField) -> some View {
-        let value = options?[keyPath: field.path] ?? ""
-        let choices = fonts.map(field.choices) ?? []
-        return MobileRow(title: field.title, value: choices.first { $0.id == value }?.title ?? value) {
-            choice = ChoiceRequest(title: field.pageTitle, choices: choices, value: value, searchable: true) { selected in
-                guard var pending = options, pending[keyPath: field.path] != selected else { return }
-                pending[keyPath: field.path] = selected
-                saving = true
-                Task {
-                    defer { saving = false }
-                    do {
-                        try await core.saveReadingOptions(options: pending)
-                        options = pending
-                        apply?(pending)
-                    } catch { self.error = message(error) }
+    private func tabTitle(_ tab: MobileFontField) -> String {
+        switch tab {
+        case .cjk: mobileText("中文字体", "CJK")
+        case .latinCjk: mobileText("中日韩字体", "CJK")
+        case .latin, .cjkLatin: mobileText("拉丁字体", "Latin")
+        case .code: mobileText("代码字体", "Code")
+        }
+    }
+
+    private func currentFamily(_ opts: ReadingOptions) -> String {
+        switch activeTab {
+        case .cjk: opts.cjkFont
+        case .cjkLatin: opts.cjkLatinFont.isEmpty ? opts.latinFont : opts.cjkLatinFont
+        case .latin: opts.latinFont
+        case .latinCjk: opts.latinCjkFont.isEmpty ? opts.cjkFont : opts.latinCjkFont
+        case .code: opts.monospaceFont
+        }
+    }
+
+    private func groups(for cat: ReaderFontCatalog) -> [FontGroup] {
+        switch activeTab {
+        case .cjk, .latinCjk: cat.cjkGroups
+        case .latin, .cjkLatin: cat.latinGroups
+        case .code: []
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 0) {
+                ForEach(tabs, id: \.self) { tab in
+                    let selected = activeTab == tab
+                    Button {
+                        activeTab = tab
+                        syncGroup()
+                    } label: {
+                        Text(tabTitle(tab))
+                            .font(.system(size: 13))
+                            .lineLimit(1)
+                            .foregroundStyle(selected ? palette.ink : palette.muted)
+                            .frame(maxWidth: .infinity, minHeight: 30)
+                            .background(selected ? palette.surface : .clear, in: RoundedRectangle(cornerRadius: 13))
+                    }.buttonStyle(.plain)
                 }
             }
-        }.disabled(choices.isEmpty || options == nil || saving)
+            .padding(3)
+            .background(palette.surfaceMuted, in: RoundedRectangle(cornerRadius: 16))
+
+            if let cat = catalog, let opts = options {
+                let current = currentFamily(opts)
+                let gs = groups(for: cat)
+                if !gs.isEmpty {
+                    HStack(spacing: 0) {
+                        ForEach(gs, id: \.id) { group in
+                            let selected = activeGroupId == group.id
+                            let extra = (group.id == "system" || group.id == "builtin") ? 1 : 0
+                            let text = "\(mobileText(group.titleZh, group.titleEn))(\(group.items.count + extra))"
+                            Button { activeGroupId = group.id } label: {
+                                Text(text)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                    .foregroundStyle(selected ? palette.ink : palette.muted)
+                                    .frame(maxWidth: .infinity, minHeight: 26)
+                                    .background(selected ? palette.surface : .clear, in: RoundedRectangle(cornerRadius: 11))
+                            }.buttonStyle(.plain)
+                        }
+                    }
+                    .padding(3)
+                    .background(palette.surfaceMuted, in: RoundedRectangle(cornerRadius: 14))
+                }
+
+                let showImport = activeTab == .code || activeGroupId == "system" || activeGroupId == "builtin"
+                let items = activeTab == .code ? cat.monospace : (gs.first { $0.id == activeGroupId }?.items ?? [])
+                let busy = saving || downloadingFamily != nil
+
+                ScrollView {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                        ForEach(items, id: \.family) { item in
+                            let selected = item.family.caseInsensitiveCompare(current) == .orderedSame
+                            let downloading = downloadingFamily == item.family
+                            let label = downloading ? mobileText("下载中", "Downloading") : (item.label == "系统字体" ? mobileText("系统字体", "System font") : item.label)
+                            Button { select(item) } label: {
+                                Text(label)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                    .foregroundStyle((selected || downloading) ? palette.accent : palette.ink)
+                                    .padding(.horizontal, 6)
+                                    .frame(maxWidth: .infinity, minHeight: 40)
+                                    .background(downloading ? palette.accent.opacity(0.12) : palette.surface, in: RoundedRectangle(cornerRadius: 8))
+                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke((selected || downloading) ? palette.accent : palette.border, lineWidth: selected ? 1.5 : 1))
+                            }.buttonStyle(.plain).disabled(busy)
+                        }
+                        if showImport {
+                            Button { importing = true } label: {
+                                Text(mobileText("导入字体", "Import font"))
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                    .foregroundStyle(palette.ink)
+                                    .padding(.horizontal, 6)
+                                    .frame(maxWidth: .infinity, minHeight: 40)
+                                    .background(palette.surface, in: RoundedRectangle(cornerRadius: 8))
+                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.border, lineWidth: 1))
+                            }.buttonStyle(.plain).disabled(busy)
+                        }
+                    }
+                }.frame(maxHeight: 240)
+            } else {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 160)
+            }
+
+            if let error { Text(error).font(.footnote).foregroundStyle(.red) }
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
+        .task(id: library.fontsReady) {
+            activeTab = tabs.first ?? .cjk
+            do {
+                options = try await core.readingOptions()
+                catalog = try await core.readerFontCatalog()
+                syncGroup()
+            } catch { if !Task.isCancelled { self.error = message(error) } }
+        }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.font]) { result in
+            guard case .success(let url) = result else { return }
+            Task {
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    _ = try await core.importCustomFont(path: url.path)
+                    catalog = try await core.readerFontCatalog()
+                } catch { self.error = message(error) }
+            }
+        }
+    }
+
+    private func syncGroup() {
+        guard let cat = catalog, let opts = options else { return }
+        let gs = groups(for: cat)
+        let cur = currentFamily(opts)
+        activeGroupId = gs.first { g in g.items.contains { $0.family.caseInsensitiveCompare(cur) == .orderedSame } }?.id ?? gs.first?.id ?? ""
+    }
+
+    private func select(_ item: FontOption) {
+        guard var pending = options, !saving, downloadingFamily == nil else { return }
+        let field = activeTab
+        Task {
+            error = nil
+            if !item.downloaded {
+                downloadingFamily = item.family
+                do {
+                    try await core.downloadFontFamily(family: item.family)
+                    catalog = try await core.readerFontCatalog()
+                } catch {
+                    downloadingFamily = nil
+                    self.error = message(error)
+                    return
+                }
+                downloadingFamily = nil
+            }
+            pending[keyPath: field.path] = item.family
+            saving = true
+            defer { saving = false }
+            do {
+                try await core.saveReadingOptions(options: pending)
+                options = pending
+                apply?(pending)
+            } catch { self.error = message(error) }
+        }
     }
 }
 
@@ -329,34 +467,6 @@ struct FontDownloadRow: View {
                         mobileText("下载默认字体", "Download reading fonts")) {
                 Task { await library.downloadFonts(retry: true) }
             }.disabled(library.fontsDownloading)
-        }
-    }
-}
-
-private struct TypesettingSettings: View {
-    let core: MobileCore
-    @ObservedObject var library: LibraryModel
-    let openLayout: () -> Void
-    @AppStorage("reader.fontSize") private var font = 20
-    @AppStorage("reader.focus") private var focus = false
-    @AppStorage("reader.unified") private var unified = false
-    @State private var size = Double(min(40, max(16, (UserDefaults.standard.object(forKey: "reader.fontSize") as? Int ?? 20) / 2 * 2)))
-
-    var body: some View {
-        SettingsScroll {
-            FontSettings(core: core, library: library) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(mobileText("字号", "Font size")).font(.system(size: 16))
-                    ReadingCapsuleSlider(value: $size, range: 16...40, step: 2,
-                                         label: mobileText("字号", "Font size"), fontSize: true) { font = Int($0) }
-                }.padding(.horizontal, 16).padding(.vertical, 10)
-                MobileToggle(title: mobileText("专注模式", "Focus mode"), value: $focus)
-                if !focus { MobileToggle(title: mobileText("统一版式", "Unified layout"), value: $unified) }
-            }
-            MobileGroup {
-                MobileRow(title: mobileText("AI 排版", "AI layout"), icon: "ai", action: openLayout)
-                FontDownloadRow(library: library)
-            }
         }
     }
 }

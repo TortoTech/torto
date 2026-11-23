@@ -446,12 +446,16 @@ struct ReaderScreen: View {
             }, fonts: { self.panel = .fonts }, layout: { self.panel = .layout }, mode: { self.panel = .mode })
                 .simultaneousGesture(dragPanel())
         case .fonts:
+            let isCjk = model.bookLanguages.isEmpty || model.bookLanguages.contains { lang in
+                let l = lang.lowercased()
+                return l.hasPrefix("zh") || l.hasPrefix("ja") || l.hasPrefix("ko")
+            }
             VStack(spacing: 0) {
                 panelHeader(mobileText("字体样式", "Font styles")) { self.panel = .typography }
-                SettingsScroll {
-                    FontSettings(core: core, library: library, apply: model.applyFonts) { EmptyView() }
-                    if !library.fontsReady { MobileGroup { FontDownloadRow(library: library) } }
-                }.frame(maxHeight: height * 0.58)
+                ReaderFontStylePanel(core: core, library: library, isCjkBook: isCjk, apply: model.applyFonts)
+                if !library.fontsReady {
+                    MobileGroup { FontDownloadRow(library: library) }.padding(.horizontal, 16).padding(.bottom, 12)
+                }
             }
         case .layout:
             VStack(spacing: 0) {

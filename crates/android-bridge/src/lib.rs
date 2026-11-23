@@ -361,9 +361,7 @@ impl MobileCore {
             style.typography.sans_serif_font = "sans-serif".into();
             settings::apply_typography(&mut style, &options);
             apply_mobile_page_style(&mut style);
-            let fonts =
-                rebook_app_core::fonts::store::load(&self.root.join("fonts"), Default::default());
-            rebook_app_core::fonts::install(Arc::new(fonts.clone()));
+            let reader_fonts = settings::load_all_reader_fonts(&self.root);
             let settings =
                 rebook_app_core::plugins::PluginSettings::load_default().map_err(error)?;
             let original=canonical.clone();
@@ -371,7 +369,7 @@ impl MobileCore {
                 canonical,
                 &id,
                 &settings,
-                fonts.reader_fonts(),
+                reader_fonts.clone(),
             );
             pipeline
                 .translation
@@ -384,7 +382,7 @@ impl MobileCore {
                 source.clone(),
                 viewport,
                 style,
-                fonts.reader_fonts(),
+                reader_fonts,
             )
             .map_err(error)?;
             session.set_cache_policy(rebook_reader::ReaderCachePolicy {

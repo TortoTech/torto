@@ -68,7 +68,7 @@ import org.tortotech.torto.core.*
     LazyColumn(contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
         item { SettingsGroup {
             InterfaceSettingsRows(state,open)
-            SettingsRow("type",tr("排版","Typesetting")){open("typography")}
+            SettingsRow("type",tr("AI 排版","AI layout")){open("layout")}
         } }
         item { SettingsGroup {
             SettingsRow("ai",tr("AI 提供商","AI providers")){open("ai")}

@@ -544,6 +544,12 @@ impl DesktopApp {
                     crate::fonts::CustomImportTarget::Latin => {
                         crate::settings::ReaderSettingsChange::LatinFont(first_family)
                     }
+                    crate::fonts::CustomImportTarget::LatinCjk => {
+                        crate::settings::ReaderSettingsChange::LatinCjkFont(Some(first_family))
+                    }
+                    crate::fonts::CustomImportTarget::Monospace => {
+                        crate::settings::ReaderSettingsChange::MonospaceFont(first_family)
+                    }
                 };
                 if let Some(reader) = self.reader.as_mut() {
                     self.reopen_text_settings_open = reader.is_text_settings_open();

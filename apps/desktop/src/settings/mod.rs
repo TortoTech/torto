@@ -56,6 +56,8 @@ pub(crate) enum ReaderSettingsChange {
     CjkFont(String),
     LatinFont(String),
     CjkLatinFont(Option<String>),
+    LatinCjkFont(Option<String>),
+    MonospaceFont(String),
 }
 
 pub(crate) struct SettingsFeature {
@@ -414,6 +416,8 @@ impl SettingsFeature {
                 | ReaderSettingsChange::CjkFont(_)
                 | ReaderSettingsChange::LatinFont(_)
                 | ReaderSettingsChange::CjkLatinFont(_)
+                | ReaderSettingsChange::LatinCjkFont(_)
+                | ReaderSettingsChange::MonospaceFont(_)
         );
         match change {
             ReaderSettingsChange::Spread(spread) => preferences.spread = spread,
@@ -443,6 +447,15 @@ impl SettingsFeature {
                             family,
                         }
                     });
+                preferences.typography.normalize();
+            }
+            ReaderSettingsChange::LatinCjkFont(family) => {
+                preferences.typography.latin_cjk_font =
+                    family.filter(|f| !f.trim().is_empty());
+                preferences.typography.normalize();
+            }
+            ReaderSettingsChange::MonospaceFont(family) => {
+                preferences.typography.monospace_font = family;
                 preferences.typography.normalize();
             }
         }
