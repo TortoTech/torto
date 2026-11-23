@@ -1,7 +1,6 @@
 import groovy.json.JsonOutput
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 val repositoryRoot = rootDir.resolve("../..").canonicalFile
@@ -56,7 +55,8 @@ tasks.named("preBuild").configure {dependsOn(notices)}
 val signingFile = providers.environmentVariable("TORTO_ANDROID_KEYSTORE").orNull
 android {
     namespace = "org.tortotech.torto"
-    compileSdk = 36
+    compileSdk = 37
+    buildToolsVersion = "36.0.0"
     ndkVersion = "28.2.13676358"
     defaultConfig {
         applicationId = "org.tortotech.torto"
@@ -96,12 +96,12 @@ android {
 
     buildFeatures { compose = true; resValues = true }
     androidResources { localeFilters += setOf("zh", "en") }
-    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/notices/assets"))
-    sourceSets["main"].res.srcDir(layout.buildDirectory.dir("generated/brand"))
+    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/notices/assets").get().asFile)
+    sourceSets["main"].res.srcDir(layout.buildDirectory.dir("generated/brand").get().asFile)
     listOf("debug", "release").forEach { variant ->
         val native = nativeVariant(variant)
-        sourceSets[variant].java.srcDir(layout.buildDirectory.dir("generated/rust/$native/kotlin"))
-        sourceSets[variant].jniLibs.srcDir(layout.buildDirectory.dir("generated/rust/$native/jniLibs"))
+        sourceSets[variant].kotlin.directories += layout.buildDirectory.dir("generated/rust/$native/kotlin").get().asFile.absolutePath
+        sourceSets[variant].jniLibs.srcDir(layout.buildDirectory.dir("generated/rust/$native/jniLibs").get().asFile)
     }
     packaging { jniLibs { useLegacyPackaging = compressNativeLibraries } }
 }
