@@ -56,6 +56,7 @@ pub(crate) enum Icon {
     Pin,
     PinOff,
     Plus,
+    RefreshCw,
     ScanText,
     Search,
     Send,
@@ -72,7 +73,7 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 56] = [
+    const ALL: [Self; 57] = [
         Self::Chart,
         Self::Table,
         Self::AlertCircle,
@@ -123,6 +124,7 @@ impl Icon {
         Self::Send,
         Self::Server,
         Self::Settings,
+        Self::RefreshCw,
         Self::SquarePen,
         Self::Sun,
         Self::Target,
@@ -179,6 +181,7 @@ impl Icon {
             Self::Pin => asset!("pin"),
             Self::PinOff => asset!("pin-off"),
             Self::Plus => asset!("plus"),
+            Self::RefreshCw => asset!("refresh-cw"),
             Self::ScanText => asset!("scan-text"),
             Self::Search => asset!("search"),
             Self::Send => asset!("send"),

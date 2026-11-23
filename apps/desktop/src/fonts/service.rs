@@ -94,6 +94,11 @@ impl FontService {
     pub(crate) fn settled(&self) -> bool {
         self.initialized && !self.running && !self.requested
     }
+    pub(crate) fn preload_ready(&self) -> bool {
+        catalog::preload_indices()
+            .into_iter()
+            .all(|index| self.statuses.get(index) == Some(&Status::Ready))
+    }
     pub(crate) fn retry(&mut self) {
         if !self.running
             || self

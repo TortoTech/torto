@@ -15,13 +15,14 @@ import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.flow.first
 
 /** Focus once per opening, after this window can actually accept IME input. */
-@Composable internal fun rememberInputFocus(enabled:Boolean=true):FocusRequester {
+@Composable internal fun rememberInputFocus(enabled:Boolean=true,delayMs:Long=320L):FocusRequester {
     val requester=remember {FocusRequester()}
     val window=LocalWindowInfo.current
     val keyboard=LocalSoftwareKeyboardController.current
     LaunchedEffect(enabled){
         if(enabled){
             snapshotFlow {window.isWindowFocused}.first {it}
+            if(delayMs>0L)kotlinx.coroutines.delay(delayMs)
             withFrameNanos {}
             requester.requestFocus()
             keyboard?.show()
@@ -43,7 +44,7 @@ import kotlinx.coroutines.flow.first
         DisposableEffect(window){window?.let {
             it.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
             it.setDimAmount(0f)
-            it.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+            it.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
             it.setWindowAnimations(R.style.Animation_Torto_ImagePreview)
         };onDispose {}}
         val bars=remember(window,view){window?.let {WindowCompat.getInsetsController(it,view)}}

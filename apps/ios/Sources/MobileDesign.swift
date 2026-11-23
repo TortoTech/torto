@@ -132,6 +132,7 @@ struct MobileGroup<Content: View>: View {
 struct MobileRow: View {
     let title: String
     var value: String? = nil
+    var description: String? = nil
     var icon: String? = nil
     var check: Bool? = nil
     var action: () -> Void
@@ -142,8 +143,13 @@ struct MobileRow: View {
             HStack(spacing: 0) {
                 if let icon { MobileIcon(icon, size: 24).padding(.trailing, 12) }
                 SettingsRowLabels {
-                    Text(title).font(.system(size: 16, weight: check == true ? .medium : .regular))
-                        .foregroundStyle(check == true ? palette.accent : palette.ink)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title).font(.system(size: 16, weight: check == true ? .medium : .regular))
+                            .foregroundStyle(check == true ? palette.accent : palette.ink)
+                        if let description {
+                            Text(description).font(.system(size: 12)).foregroundStyle(palette.secondary)
+                        }
+                    }
                     if let value, !value.isEmpty {
                         Text(value).font(.system(size: 14)).foregroundStyle(palette.secondary)
                             .lineLimit(2).multilineTextAlignment(.trailing)
@@ -194,9 +200,9 @@ struct MobileToggle: View {
     var body: some View {
         let palette = MobilePalette(scheme)
         Toggle(isOn: $value) {
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 16)).foregroundStyle(palette.ink)
-                if let description { Text(description).font(.system(size: 14)).foregroundStyle(palette.secondary) }
+                if let description { Text(description).font(.system(size: 12)).foregroundStyle(palette.secondary) }
             }
         }
         .toggleStyle(MobileSwitchStyle())

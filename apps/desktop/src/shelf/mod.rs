@@ -1151,6 +1151,7 @@ impl ShelfFeature {
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(actions_rect));
+                        ui.spacing_mut().item_spacing.x = 0.0;
                         if interaction_blocked {
                             // The modal backdrop dims this entire action row.
                             // Keep disabled actions inert without fading them twice.

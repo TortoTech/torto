@@ -19,28 +19,47 @@ private class HomeTransitionSnapshot { var state:ScreenState?=null;var colors:Co
  * The reader mounts underneath immediately so opening and exit run concurrently. */
 @Composable internal fun ReaderEntryHost(state:ScreenState,content:@Composable (ScreenState)->Unit){
     val home=remember {HomeTransitionSnapshot()}
+    val reader=remember {HomeTransitionSnapshot()}
     val colors=MaterialTheme.colorScheme
     if(state.active==null)SideEffect {home.state=state;home.colors=colors}
+    else SideEffect {reader.state=state;reader.colors=colors}
     val transition=updateTransition(state.active!=null,label="open reader")
     LaunchedEffect(transition.currentState,transition.targetState){
         if(transition.currentState&&transition.targetState){home.state=null;home.colors=null}
+        if(!transition.currentState&&!transition.targetState){reader.state=null;reader.colors=null}
     }
     transition.AnimatedContent(
         modifier=Modifier.fillMaxSize(),
         transitionSpec={
-            (EnterTransition.None togetherWith if(targetState)fadeOut(tween(60))else ExitTransition.None)
-                .apply {targetContentZIndex=if(targetState)-1f else 0f}.using(null)
+            if(targetState) ContentTransform(
+                targetContentEnter=slideInHorizontally(tween(280)){it},
+                initialContentExit=slideOutHorizontally(tween(280)){-it/3},
+                targetContentZIndex=1f,
+            ).using(null)
+            else ContentTransform(
+                targetContentEnter=slideInHorizontally(tween(280)){-it/3},
+                initialContentExit=slideOutHorizontally(tween(280)){it},
+                targetContentZIndex=0f,
+            ).using(null)
         },
     ){reading->
-        // Returning has no exit animation. Never render a second shelf inside
-        // the retiring reader slot while AnimatedContent disposes that slot.
-        if(reading&&state.active==null)return@AnimatedContent
-        val exiting=!reading&&state.active!=null
-        val displayed=if(exiting)home.state ?: state.copy(active=null,frame=null)else state
+        val exitingHome=!reading&&state.active!=null
+        val exitingReader=reading&&state.active==null
+        val displayed=when{
+            exitingHome->home.state ?: state.copy(active=null,frame=null)
+            exitingReader->reader.state ?: return@AnimatedContent
+            else->state
+        }
+        val exiting=exitingHome||exitingReader
         val blocker=if(exiting)Modifier.clearAndSetSemantics {}.pointerInput(Unit){
             awaitPointerEventScope {while(true)awaitPointerEvent(PointerEventPass.Initial).changes.forEach {it.consume()}}
         }else Modifier
-        MaterialTheme(colorScheme=if(exiting)home.colors ?: colors else colors){
+        val scheme=when{
+            exitingHome->home.colors ?: colors
+            exitingReader->reader.colors ?: colors
+            else->colors
+        }
+        MaterialTheme(colorScheme=scheme){
             Box(Modifier.fillMaxSize().then(blocker)){content(displayed)}
         }
     }

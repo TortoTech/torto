@@ -1,6 +1,29 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+
+fn provider_models_cache_path(root: &Path) -> PathBuf {
+    root.join("provider-models-cache.json")
+}
+
+pub fn load_provider_models_cache(root: &Path) -> HashMap<String, Vec<String>> {
+    std::fs::read(provider_models_cache_path(root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_provider_models_cache(
+    root: &Path,
+    provider_id: &str,
+    models: &[String],
+) -> std::io::Result<()> {
+    let mut cache = load_provider_models_cache(root);
+    cache.insert(provider_id.to_owned(), models.to_vec());
+    crate::persistence::write_json_atomic(&provider_models_cache_path(root), &cache)
+}
 
 #[derive(Clone)]
 pub struct ProviderModelsRequest {

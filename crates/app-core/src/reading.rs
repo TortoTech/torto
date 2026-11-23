@@ -7,6 +7,37 @@ use crate::plugins::{
 use rebook_publication::{BookSource, RenditionLayout};
 use std::sync::Arc;
 
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct BookReadingPrefs {
+    #[serde(default)]
+    translation_enabled: bool,
+}
+
+fn book_prefs_path(root: &std::path::Path, book_id: &str) -> std::path::PathBuf {
+    root.join("book-prefs")
+        .join(format!("{}.json", crate::persistence::safe_book_id(book_id)))
+}
+
+pub fn load_book_translation_enabled(root: &std::path::Path, book_id: &str) -> bool {
+    std::fs::read(book_prefs_path(root, book_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BookReadingPrefs>(&bytes).ok())
+        .is_some_and(|prefs| prefs.translation_enabled)
+}
+
+pub fn save_book_translation_enabled(
+    root: &std::path::Path,
+    book_id: &str,
+    enabled: bool,
+) -> std::io::Result<()> {
+    crate::persistence::write_json_atomic(
+        &book_prefs_path(root, book_id),
+        &BookReadingPrefs {
+            translation_enabled: enabled,
+        },
+    )
+}
+
 /// Focus presentation never changes the saved classic layout preference.
 pub fn effective_typesetting(
     focus: bool,

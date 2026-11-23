@@ -71,6 +71,15 @@ class ReaderView(context: Context) : View(context) {
     private var frame: ReaderFrame? = null
     private var selected: SelectedText? = null
     private val selectionPath = Path()
+    private val highlightPath = Path()
+    private fun drawMergedRects(canvas: Canvas, rects: List<org.tortotech.torto.core.Rect>, paint: Paint, padX: Float = 0f, padY: Float = 0f, shiftY: Float = 0f) {
+        if (rects.isEmpty()) return
+        highlightPath.rewind()
+        rects.forEach { r ->
+            highlightPath.addRect((r.x - padX) * density, (r.y + shiftY - padY) * density, (r.x + r.width + padX) * density, (r.y + shiftY + r.height + padY) * density, Path.Direction.CW)
+        }
+        canvas.drawPath(highlightPath, paint)
+    }
     private val density get() = resources.displayMetrics.density
     private var anchorX = 0f; private var anchorY = 0f
     private var selecting = false
@@ -480,9 +489,9 @@ class ReaderView(context: Context) : View(context) {
                     canvas.drawBitmap(f.bitmap,null,RectF(0f,top,f.bitmap.width.toFloat(),top+f.bitmap.height),paint)
                     canvas.translate(0f,-shift)
                 }else canvas.drawBitmap(f.bitmap,null,Rect(0,0,width,height),paint)
-                f.info.marks.forEach {canvas.drawRect(it.x*density,it.y*density,(it.x+it.width)*density,(it.y+it.height)*density,savedHighlight)}
+                drawMergedRects(canvas, f.info.marks, savedHighlight)
                 if(f.info.focusBounds.isNotEmpty()){
-                    if(f.info.focusHighlight)f.info.focusBounds.forEach {r->canvas.drawRect((r.x-4)*density,(r.y-2)*density,(r.x+r.width+4)*density,(r.y+r.height+2)*density,highlight)}
+                    if(f.info.focusHighlight)drawMergedRects(canvas, f.info.focusBounds, highlight, padX = 4f, padY = 2f)
                     else {val fade=canvas.save();f.info.focusBounds.forEach {r->canvas.clipOutRect((r.x-8)*density,(r.y-2)*density,(r.x+r.width+8)*density,(r.y+r.height+2)*density)}
                         focusShade.color=f.info.focusFadeColor.toInt();canvas.drawRect(0f,shift,width.toFloat(),height+shift,focusShade);canvas.restoreToCount(fade)}
                 }
@@ -501,10 +510,10 @@ class ReaderView(context: Context) : View(context) {
         if(current.info.isScroll){canvas.drawColor((current.info.focusFadeColor.toInt() and 0xFFFFFF) or 0xFF000000.toInt());previousFrame?.let {drawRaster(canvas,it)};drawRaster(canvas,current)}
         else canvas.drawBitmap(current.bitmap,null,Rect(0,0,width,height),paint)
         canvas.save();canvas.translate(0f,-pendingOffset)
-        current.info.marks.forEach {canvas.drawRect(it.x*density,it.y*density,(it.x+it.width)*density,(it.y+it.height)*density,savedHighlight)}
+        drawMergedRects(canvas, current.info.marks, savedHighlight)
         val focusShift=focusPreview?.let {(it.first-current.info.scrollDistance).toFloat()} ?: 0f
         (focusPreview?.second ?: current.info.focusBounds).takeIf {it.isNotEmpty()}?.let {bounds->
-            if(current.info.focusHighlight){bounds.forEach {r->canvas.drawRect((r.x-4)*density,(r.y+focusShift-2)*density,(r.x+r.width+4)*density,(r.y+focusShift+r.height+2)*density,highlight)}}
+            if(current.info.focusHighlight){drawMergedRects(canvas, bounds, highlight, padX = 4f, padY = 2f, shiftY = focusShift)}
             else{focusShade.color=current.info.focusFadeColor.toInt();canvas.save()
                 bounds.forEach {r->canvas.clipOutRect(((r.x-8)*density).coerceAtLeast(0f),(r.y+focusShift-2)*density,((r.x+r.width+8)*density).coerceAtMost(width.toFloat()),(r.y+focusShift+r.height+2)*density)}
                 canvas.drawRect(0f,pendingOffset,width.toFloat(),height+pendingOffset,focusShade);canvas.restore()}

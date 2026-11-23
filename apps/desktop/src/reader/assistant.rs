@@ -2449,6 +2449,13 @@ impl DesktopReader {
         self.translation.clear_error();
         if self.translation.enabled {
             self.translation.enabled = false;
+            if let Some(paths) = rebook_app_core::environment::paths() {
+                let _ = rebook_app_core::reading::save_book_translation_enabled(
+                    paths.data_dir(),
+                    &self.book_id,
+                    false,
+                );
+            }
             self.cancel_translation_request("translation_disabled");
             self.translation.toc_task.cancel();
             let was_rendering = self.translation.render_enabled;
@@ -2485,6 +2492,13 @@ impl DesktopReader {
             return;
         }
         self.translation.enabled = true;
+        if let Some(paths) = rebook_app_core::environment::paths() {
+            let _ = rebook_app_core::reading::save_book_translation_enabled(
+                paths.data_dir(),
+                &self.book_id,
+                true,
+            );
+        }
         if self.set_translation_rendering(true) {
             self.refresh_translation_view();
         }

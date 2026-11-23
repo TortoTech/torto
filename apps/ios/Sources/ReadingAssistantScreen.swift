@@ -117,7 +117,7 @@ struct ReadingAssistantScreen: View {
                     }.buttonStyle(MobileInkButtonStyle())
                         .disabled(model.chatStream == nil && (model.working || model.chatDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
                         .accessibilityLabel(model.chatStream != nil ? mobileText("停止", "Stop") : mobileText("发送", "Send"))
-                }.padding(.vertical, 8).padding(.leading, 14).padding(.trailing, 8).frame(minHeight: 52)
+                }.padding(.vertical, 6).padding(.leading, 14).padding(.trailing, 8).frame(minHeight: 52)
                     .background(palette.surface, in: .rect(cornerRadius: 20))
             }.frame(maxWidth: 680).padding(.horizontal, 16).padding(.bottom, 12)
                 .frame(maxWidth: .infinity).background(palette.background.ignoresSafeArea(edges: .bottom))

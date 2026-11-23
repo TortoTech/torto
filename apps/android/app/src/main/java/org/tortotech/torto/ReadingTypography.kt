@@ -153,7 +153,8 @@ private fun ReadingOptions.withFont(setting:ReadingFontSetting,value:String)=whe
                             ReadingFontSetting.Code->tr("代码字体","Code")
                         }
                         Surface(
-                            modifier=Modifier.weight(1f).height(30.dp).clickable {activeTab=tab},
+                            onClick={activeTab=tab},
+                            modifier=Modifier.weight(1f).height(30.dp),
                             shape=RoundedCornerShape(13.dp),
                             color=if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,
                         ){
@@ -196,7 +197,8 @@ private fun ReadingOptions.withFont(setting:ReadingFontSetting,value:String)=whe
                                 val extra=if(group.id=="system"||group.id=="builtin") 1 else 0
                                 val text="${tr(group.titleZh,group.titleEn)}(${group.items.size+extra})"
                                 Surface(
-                                    modifier=Modifier.weight(1f).height(26.dp).clickable {activeGroupId=group.id},
+                                    onClick={activeGroupId=group.id},
+                                    modifier=Modifier.weight(1f).height(26.dp),
                                     shape=RoundedCornerShape(11.dp),
                                     color=if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,
                                 ){
@@ -216,14 +218,19 @@ private fun ReadingOptions.withFont(setting:ReadingFontSetting,value:String)=whe
                     rawItems.forEach {add(it.family to it)}
                     if(showImport) add("__import__" to null)
                 }
+                val isDefaultPreload={family:String->family=="LXGW WenKai GB Screen"||family=="Literata"||family=="Maple Mono"}
+                val anyDownloading=state.downloadingFontFamily!=null||(state.fontsDownloading&&rawItems.any {!it.downloaded&&isDefaultPreload(it.family)})
                 val busy=state.busy||state.downloadingFontFamily!=null
-                Column(Modifier.fillMaxWidth().heightIn(max=240.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(8.dp)){
+                val gridHeight=if(groups.isEmpty()) 276.dp else 232.dp
+                Column(Modifier.fillMaxWidth().height(gridHeight).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(8.dp)){
                     cards.chunked(3).forEach {row->
                         Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){
                             row.forEach {(key,option)->
                                 if(option==null){
                                     Surface(
-                                        modifier=Modifier.weight(1f).height(40.dp).clickable(enabled=!busy,onClick=onImportFont),
+                                        onClick=onImportFont,
+                                        enabled=!busy,
+                                        modifier=Modifier.weight(1f).height(40.dp),
                                         shape=RoundedCornerShape(8.dp),
                                         color=MaterialTheme.colorScheme.surface,
                                         border=BorderStroke(1.dp,MaterialTheme.colorScheme.outlineVariant),
@@ -234,20 +241,28 @@ private fun ReadingOptions.withFont(setting:ReadingFontSetting,value:String)=whe
                                         }
                                     }
                                 } else {
-                                    val selected=option.family.equals(currentFamily,true)
-                                    val downloading=state.downloadingFontFamily==option.family
+                                    val selected=!anyDownloading&&option.family.equals(currentFamily,true)
+                                    val downloading=state.downloadingFontFamily==option.family||(state.fontsDownloading&&!option.downloaded&&isDefaultPreload(option.family))
                                     val label=if(downloading) tr("下载中","Downloading") else if(option.label=="系统字体") tr("系统字体","System font") else option.label
                                     Surface(
-                                        modifier=Modifier.weight(1f).height(40.dp).clickable(enabled=!busy){
+                                        onClick={
                                             model.selectFont(option.family,option.downloaded){opts->opts.withFont(activeTab,option.family)}
                                         },
+                                        enabled=!busy,
+                                        modifier=Modifier.weight(1f).height(40.dp),
                                         shape=RoundedCornerShape(8.dp),
-                                        color=if(downloading)MaterialTheme.colorScheme.primary.copy(alpha=0.12f)else MaterialTheme.colorScheme.surface,
-                                        border=BorderStroke(if(selected)1.5.dp else 1.dp,if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
+                                        color=MaterialTheme.colorScheme.surface,
+                                        border=BorderStroke(if(selected||downloading)1.5.dp else 1.dp,if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
                                     ){
-                                        Box(Modifier.padding(horizontal=6.dp),contentAlignment=Alignment.Center){
-                                            Text(label,fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
-                                                color=if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                                        Box(Modifier.fillMaxSize()){
+                                            if(downloading){
+                                                val frac=(state.downloadingFontProgress/100f).coerceIn(0.06f,1f)
+                                                Box(Modifier.fillMaxHeight().fillMaxWidth(frac).background(MaterialTheme.colorScheme.primary.copy(alpha=0.18f)))
+                                            }
+                                            Box(Modifier.fillMaxSize().padding(horizontal=6.dp),contentAlignment=Alignment.Center){
+                                                Text(label,fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                                    color=if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                                            }
                                         }
                                     }
                                 }
@@ -257,7 +272,6 @@ private fun ReadingOptions.withFont(setting:ReadingFontSetting,value:String)=whe
                     }
                 }
             }
-            TypographyFontDownloads(state,model)
         }
     }
 }

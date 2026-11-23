@@ -4347,7 +4347,7 @@ impl DesktopReader {
             });
         }
         let search = SearchUiState::default();
-        Self {
+        let mut view = Self {
             reader,
             images: images::ImageLoader::default(),
             opening_prefetch_pending: true,
@@ -4485,7 +4485,14 @@ impl DesktopReader {
             reopen_notice: None,
             reopen_error: None,
             exit_requested: false,
+        };
+        if rebook_app_core::environment::paths().is_some_and(|paths| {
+            rebook_app_core::reading::load_book_translation_enabled(paths.data_dir(), &view.book_id)
+        }) && view.plugin_settings.translation_endpoint().is_ok()
+        {
+            view.toggle_translation();
         }
+        view
     }
 }
 

@@ -351,13 +351,15 @@ impl MobileCore {
                 &book.path, Some(&book.id), self.root.join("cache/source-ir"),
             ).map_err(error)?;
             let canonical = mobile_source::for_reading(publication.source());
-            let options = settings::load_reading(&self.root);
+            let mut options = settings::load_reading(&self.root);
+            options.translated =
+                rebook_app_core::reading::load_book_translation_enabled(&self.root, &id);
             let mut style = ReaderStyle::default();
             style.spread = SpreadMode::Single;
             style.focus_footnote_icons = true;
             style.minimum_content_width = 0.0;
             style.typography.font_size = 20.0;
-            style.typography.monospace_font = "monospace".into();
+            style.typography.monospace_font = rebook_layout::default_monospace_font().into();
             style.typography.sans_serif_font = "sans-serif".into();
             settings::apply_typography(&mut style, &options);
             apply_mobile_page_style(&mut style);

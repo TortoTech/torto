@@ -197,7 +197,9 @@ impl SettingsFeature {
             layout_probe_selection: None,
             pending_layout_probe: None,
             provider_models_task: TaskSlot::default(),
-            provider_models_cache: HashMap::new(),
+            provider_models_cache: rebook_app_core::environment::paths()
+                .map(|p| rebook_app_core::provider_models::load_provider_models_cache(p.data_dir()))
+                .unwrap_or_default(),
             provider_models_errors: HashMap::new(),
             provider_models_loading: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -338,6 +340,13 @@ impl SettingsFeature {
         match message.result {
             Ok(models) => {
                 self.provider_models_errors.remove(&request.provider_id);
+                if let Some(paths) = rebook_app_core::environment::paths() {
+                    let _ = rebook_app_core::provider_models::save_provider_models_cache(
+                        paths.data_dir(),
+                        &request.provider_id,
+                        &models,
+                    );
+                }
                 self.provider_models_cache
                     .insert(request.provider_id, models);
             }

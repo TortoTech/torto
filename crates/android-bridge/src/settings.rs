@@ -25,7 +25,7 @@ impl Default for ReadingOptions {
             cjk_latin_font: "Literata".into(),
             latin_font: "Literata".into(),
             latin_cjk_font: String::new(),
-            monospace_font: "monospace".into(),
+            monospace_font: rebook_layout::default_monospace_font().into(),
             font_weight: 400,
             sentence_split: false,
             translated: false,
@@ -41,6 +41,15 @@ pub(crate) fn load_reading(root: &std::path::Path) -> ReadingOptions {
     // Translation belongs to the current reader session, as on desktop.
     options.translated = false;
     options.font_weight = 400;
+    if options.latin_font.eq_ignore_ascii_case("serif") {
+        options.latin_font = "sans-serif".into();
+    }
+    if options.cjk_latin_font.eq_ignore_ascii_case("serif") {
+        options.cjk_latin_font = "sans-serif".into();
+    }
+    if options.monospace_font.trim().is_empty() {
+        options.monospace_font = rebook_layout::default_monospace_font().into();
+    }
     options
 }
 pub(crate) fn apply_typography(style: &mut ReaderStyle, options: &ReadingOptions) {
@@ -83,6 +92,11 @@ pub struct ReaderFontCatalog {
     pub latin_groups: Vec<FontGroup>,
     pub monospace: Vec<FontOption>,
 }
+#[uniffi::export(with_foreign)]
+pub trait FontDownloadProgress: Send + Sync {
+    fn on_progress(&self, percent: u8);
+}
+
 #[derive(Clone, uniffi::Record)]
 pub struct ImportedFont {
     pub family: String,
@@ -383,6 +397,13 @@ impl MobileCore {
         })
         .await
     }
+    pub async fn cached_models(self: Arc<Self>, provider_id: String) -> Result<Vec<String>> {
+        work(move || {
+            let cache = rebook_app_core::provider_models::load_provider_models_cache(&self.root);
+            Ok(cache.get(&provider_id).cloned().unwrap_or_default())
+        })
+        .await
+    }
     pub async fn fetch_models(
         self: Arc<Self>,
         provider: Provider,
@@ -399,7 +420,8 @@ impl MobileCore {
                         .map(|p| p.api_key.clone())
                 })
                 .unwrap_or_default();
-            runtime()
+            let provider_id = provider.id.clone();
+            let models = runtime()
                 .block_on(rebook_app_core::provider_models::fetch_provider_models(
                     &rebook_app_core::provider_models::ProviderModelsRequest {
                         provider_id: provider.id,
@@ -408,7 +430,13 @@ impl MobileCore {
                         api_key: key,
                     },
                 ))
-                .map_err(error)
+                .map_err(error)?;
+            let _ = rebook_app_core::provider_models::save_provider_models_cache(
+                &self.root,
+                &provider_id,
+                &models,
+            );
+            Ok(models)
         })
         .await
     }
@@ -500,10 +528,18 @@ impl MobileCore {
 }
 #[uniffi::export]
 impl MobileReader {
-    /// Translation is a live reader choice, independent of saved typography.
+    pub fn translation_enabled(&self) -> bool {
+        self.with(|s| Ok(s.options.translated)).unwrap_or(false)
+    }
+    /// Translation is a per-book reader choice, independent of saved typography.
     pub async fn set_translation_enabled(self: Arc<Self>, enabled: bool) -> Result<()> {
         work(move || {
             let changed = self.with(|s| {
+                let _ = rebook_app_core::reading::save_book_translation_enabled(
+                    &s.root,
+                    &s.book_id,
+                    enabled,
+                );
                 if s.options.translated == enabled {
                     return Ok(false);
                 }
@@ -684,7 +720,7 @@ impl MobileCore {
 
             let mut latin_builtin = vec![
                 FontOption {
-                    family: "serif".into(),
+                    family: "sans-serif".into(),
                     label: "系统字体".into(),
                     downloaded: true,
                 },
@@ -711,28 +747,23 @@ impl MobileCore {
                 catalog_group("latin-extra", "其他", "Other"),
             ];
 
-            let mut engine =
-                rebook_layout::LayoutEngine::with_fonts(fonts.reader_fonts().iter().cloned());
-            let found = engine.available_reader_font_families();
-            let default_mono = rebook_layout::default_monospace_font();
-            let mut monospace = vec![FontOption {
-                family: default_mono.into(),
-                label: default_mono.into(),
-                downloaded: true,
-            }];
-            for family in found.monospace {
-                if !family.starts_with('.')
-                    && !monospace
-                        .iter()
-                        .any(|item| item.family.eq_ignore_ascii_case(&family))
-                {
-                    monospace.push(FontOption {
-                        label: family.clone(),
-                        family,
-                        downloaded: true,
-                    });
-                }
-            }
+            let mut monospace = vec![
+                FontOption {
+                    family: "monospace".into(),
+                    label: "系统字体".into(),
+                    downloaded: true,
+                },
+                FontOption {
+                    family: "Maple Mono".into(),
+                    label: "Maple Mono".into(),
+                    downloaded: is_downloaded("Maple Mono"),
+                },
+                FontOption {
+                    family: "Fira Code".into(),
+                    label: "Fira Code".into(),
+                    downloaded: is_downloaded("Fira Code"),
+                },
+            ];
             for f in custom.iter().filter(|f| !f.is_cjk) {
                 if !monospace
                     .iter()
@@ -754,24 +785,46 @@ impl MobileCore {
         })
         .await
     }
-    pub async fn download_font_family(self: Arc<Self>, family: String) -> Result<()> {
-        let indices = rebook_app_core::fonts::catalog::indices_for_family(&family);
-        if indices.is_empty() {
-            return Ok(());
-        }
-        let client = rebook_app_core::fonts::download::client().map_err(error)?;
-        let fonts_root = self.root.join("fonts");
-        let catalog = rebook_app_core::fonts::catalog::catalog();
-        for index in indices {
-            let asset = catalog.fonts[index].clone();
-            if rebook_app_core::fonts::store::load_cached(&fonts_root, &asset).is_some() {
-                continue;
-            }
-            rebook_app_core::fonts::download::fetch(&client, fonts_root.clone(), asset, |_| {})
-                .await
-                .map_err(error)?;
-        }
-        Ok(())
+    pub async fn download_font_family(
+        self: Arc<Self>,
+        family: String,
+        progress: Arc<dyn FontDownloadProgress>,
+    ) -> Result<()> {
+        runtime()
+            .spawn(async move {
+                let indices = rebook_app_core::fonts::catalog::indices_for_family(&family);
+                if indices.is_empty() {
+                    return Ok(());
+                }
+                let client = rebook_app_core::fonts::download::client().map_err(error)?;
+                let fonts_root = self.root.join("fonts");
+                let catalog = rebook_app_core::fonts::catalog::catalog();
+                let total = indices.len().max(1);
+                progress.on_progress(0);
+                for (step, index) in indices.into_iter().enumerate() {
+                    let asset = catalog.fonts[index].clone();
+                    if rebook_app_core::fonts::store::load_cached(&fonts_root, &asset).is_some() {
+                        progress.on_progress((((step + 1) * 100) / total).min(100) as u8);
+                        continue;
+                    }
+                    let cb = progress.clone();
+                    rebook_app_core::fonts::download::fetch(
+                        &client,
+                        fonts_root.clone(),
+                        asset,
+                        move |p| {
+                            let overall = ((step * 100 + p as usize) / total).min(100) as u8;
+                            cb.on_progress(overall);
+                        },
+                    )
+                    .await
+                    .map_err(error)?;
+                }
+                progress.on_progress(100);
+                Ok(())
+            })
+            .await
+            .map_err(error)?
     }
     pub async fn import_custom_font(self: Arc<Self>, path: String) -> Result<ImportedFont> {
         work(move || {

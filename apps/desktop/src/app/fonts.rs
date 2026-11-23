@@ -15,7 +15,8 @@ impl DesktopApp {
         if reader.has_status_notice() {
             return;
         }
-        let ready = self.fonts.settled() && self.settings.font_apply_available;
+        let ready =
+            self.fonts.settled() && self.fonts.preload_ready() && self.settings.font_apply_available;
         let missing = reader.missing_font_resources();
         if !ready && !missing {
             return;

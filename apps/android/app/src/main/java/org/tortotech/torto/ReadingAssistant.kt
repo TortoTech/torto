@@ -85,8 +85,7 @@ import org.tortotech.torto.core.ChatMessage
     val pane=tr("阅读助手","Reading assistant")
     val inputLabel=tr("针对本书提出你的问题","Ask a question about this book")
     val streaming=state.chatWorking&&state.messages.none {it.id==state.chatStreamId}
-    val ime=WindowInsets.ime.getBottom(density)>0
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).semantics {paneTitle=pane}.statusBarsPadding().navigationBarsPadding().imePadding()){
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).semantics {paneTitle=pane}.statusBarsPadding().windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))){
         Box(Modifier.fillMaxWidth().height(64.dp)){
             Column(Modifier.align(Alignment.Center).fillMaxWidth().padding(horizontal=56.dp),horizontalAlignment=Alignment.CenterHorizontally){
                 Text(pane,fontSize=16.sp,lineHeight=22.sp,color=MaterialTheme.colorScheme.onSurface)
@@ -119,7 +118,7 @@ import org.tortotech.torto.core.ChatMessage
             }
         }
         Column(Modifier.fillMaxWidth().padding(horizontal=16.dp).padding(bottom=12.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
-            if(!ime)Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)){
+            Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(6.dp)){
                 val prompts=listOf(
                     tr("书籍亮点","Highlights") to tr("请结合全书内容总结本书的主要亮点，并提供原文引源。","Summarize the main highlights of this book using the full book and cite the sources."),
                     tr("背景解读","Background") to tr("请解读本书相关的历史、文化与写作背景，结合书中内容并提供引源。","Explain this book's historical, cultural and writing background, grounded in its content with citations."),
@@ -132,7 +131,7 @@ import org.tortotech.torto.core.ChatMessage
             val send=state.chatWorking||state.chatDraft.isNotBlank()&&!state.busy&&state.changes.isEmpty()
             val sendLabel=if(state.chatWorking)tr("停止生成","Stop generating")else tr("发送","Send")
             Surface(Modifier.fillMaxWidth(),shape=RoundedCornerShape(20.dp),color=MaterialTheme.colorScheme.surfaceContainerLowest){
-                Row(Modifier.fillMaxWidth().heightIn(min=52.dp).padding(start=14.dp,end=8.dp,top=8.dp,bottom=8.dp),verticalAlignment=Alignment.CenterVertically){
+                Row(Modifier.fillMaxWidth().heightIn(min=52.dp).padding(start=14.dp,end=8.dp,top=6.dp,bottom=6.dp),verticalAlignment=Alignment.CenterVertically){
                     BasicTextField(state.chatDraft,model::editChatDraft,Modifier.weight(1f).focusRequester(inputFocus).semantics {contentDescription=inputLabel},maxLines=4,
                         textStyle=MaterialTheme.typography.bodyLarge.copy(fontSize=16.sp,color=MaterialTheme.colorScheme.onSurface),cursorBrush=SolidColor(brandControlColor()),
                         decorationBox={input->Box {if(state.chatDraft.isEmpty())Text(tr("针对本书提出你的问题","Ask a question about this book"),fontSize=16.sp,color=MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.65f));input()}})

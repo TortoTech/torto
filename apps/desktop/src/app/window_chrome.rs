@@ -11,6 +11,8 @@ const BUTTON_SPACING: f32 = 4.0;
 #[cfg(target_os = "windows")]
 const RIGHT_PADDING: f32 = 12.0;
 #[cfg(target_os = "windows")]
+const CONTROLS_LEFT_GAP: f32 = 8.0;
+#[cfg(target_os = "windows")]
 pub(crate) const CONTROLS_WIDTH: f32 = BUTTON_SIZE * 3.0 + BUTTON_SPACING * 2.0 + RIGHT_PADDING;
 
 #[derive(Clone, Copy, Default)]
@@ -97,7 +99,7 @@ pub(crate) fn reserve_width(ctx: &egui::Context) -> f32 {
     #[cfg(target_os = "macos")]
     { let _ = ctx; 0.0 }
     #[cfg(target_os = "windows")]
-    { if state(ctx).fullscreen { 0.0 } else { CONTROLS_WIDTH } }
+    { if state(ctx).fullscreen { 0.0 } else { CONTROLS_WIDTH + CONTROLS_LEFT_GAP } }
 }
 pub(crate) fn header(ctx: &egui::Context, rect: Rect) {
     let drag_enabled = !state(ctx).fullscreen;
@@ -250,18 +252,54 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
                     } else {
                         crate::ui::palette().text
                     };
-                    let glyph = match index {
-                        0 => crate::ui::Icon::Minus,
-                        1 if state.maximized => crate::ui::Icon::Minimize2,
-                        1 => crate::ui::Icon::Maximize2,
-                        _ => crate::ui::Icon::X,
-                    };
-                    crate::ui::paint_icon(
-                        ui,
-                        Rect::from_center_size(btn_rect.center(), Vec2::splat(18.0)),
-                        glyph,
-                        color,
-                    );
+                    match index {
+                        0 => {
+                            crate::ui::paint_icon(
+                                ui,
+                                Rect::from_center_size(btn_rect.center(), Vec2::splat(18.0)),
+                                crate::ui::Icon::Minus,
+                                color,
+                            );
+                        }
+                        1 if state.maximized => {
+                            let stroke = Stroke::new(1.0, color);
+                            let center = btn_rect.center();
+                            let back = Rect::from_center_size(
+                                center + Vec2::new(1.5, -1.5),
+                                Vec2::splat(8.0),
+                            );
+                            ui.painter()
+                                .line_segment([back.left_top(), back.right_top()], stroke);
+                            ui.painter()
+                                .line_segment([back.right_top(), back.right_bottom()], stroke);
+                            ui.painter().rect_stroke(
+                                Rect::from_center_size(
+                                    center + Vec2::new(-1.0, 1.0),
+                                    Vec2::splat(8.0),
+                                ),
+                                1.0,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        1 => {
+                            let stroke = Stroke::new(1.0, color);
+                            ui.painter().rect_stroke(
+                                Rect::from_center_size(btn_rect.center(), Vec2::splat(10.0)),
+                                1.0,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        _ => {
+                            crate::ui::paint_icon(
+                                ui,
+                                Rect::from_center_size(btn_rect.center(), Vec2::splat(18.0)),
+                                crate::ui::Icon::X,
+                                color,
+                            );
+                        }
+                    }
                     if response.clicked() {
                         match index {
                             0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
@@ -474,7 +512,7 @@ mod tests {
     #[test]
     fn fullscreen_releases_buttons_and_disables_caption_dragging() {
         let ctx = egui::Context::default();
-        assert_eq!(reserve_width(&ctx), CONTROLS_WIDTH);
+        assert_eq!(reserve_width(&ctx), CONTROLS_WIDTH + CONTROLS_LEFT_GAP);
         set_state(
             &ctx,
             WindowState {

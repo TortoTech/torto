@@ -29,25 +29,27 @@ import androidx.compose.ui.unit.sp
     val sendLabel=tr("发送批注","Send note")
     val placeholder=tr("写下这一刻的想法…","Write down your thoughts…")
     val reference=tr("引用：","Quote: ")+remember(quote){quote.lineSequence().joinToString(" "){it.trim()}}
-    FullScreenInputDialog(close,state.readingBrightness){dismiss->
-        val focus=rememberInputFocus(!state.busy)
-        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha=.35f)).semantics {paneTitle=title}.imePadding()){
-            Box(Modifier.fillMaxSize().clickable(interactionSource=remember {MutableInteractionSource()},indication=null,onClickLabel=tr("关闭批注","Close note"),onClick=dismiss))
-            Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(),color=MaterialTheme.colorScheme.background){
-                Column(Modifier.navigationBarsPadding().padding(horizontal=16.dp,vertical=14.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
-                    Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)){
-                        Surface(Modifier.weight(1f),shape=RoundedCornerShape(24.dp),color=MaterialTheme.colorScheme.surfaceContainerLowest){
-                            BasicTextField(text,{text=it},Modifier.fillMaxWidth().heightIn(min=42.dp,max=160.dp).padding(horizontal=14.dp,vertical=10.dp).focusRequester(focus).semantics {contentDescription=inputLabel},
-                                enabled=!state.busy,maxLines=5,textStyle=MaterialTheme.typography.bodyLarge.copy(fontSize=16.sp,lineHeight=24.sp,color=MaterialTheme.colorScheme.onSurface),cursorBrush=SolidColor(brandControlColor()),
-                                decorationBox={input->Box {if(text.isEmpty())Text(placeholder,fontSize=16.sp,color=MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.6f));input()}})
-                        }
-                        val enabled=text.isNotBlank()&&!state.busy
-                        Box(Modifier.size(40.dp).clip(CircleShape).background(brandControlColor().copy(alpha=if(enabled)1f else .3f)).semantics {contentDescription=sendLabel}.clickable(enabled=enabled,role=Role.Button){save(text.trim()){if(active)dismiss()}},contentAlignment=Alignment.Center){
-                            if(state.busy)CircularProgressIndicator(Modifier.size(18.dp),color=Color.White,strokeWidth=2.dp)else AppIcon("up",size=24.dp,tint=Color.White)
-                        }
+    val keyboard=androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val focusManager=androidx.compose.ui.platform.LocalFocusManager.current
+    val dismiss={focusManager.clearFocus();keyboard?.hide();close()}
+    androidx.activity.compose.BackHandler(onBack=dismiss)
+    val focus=rememberInputFocus(!state.busy,delayMs=0L)
+    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha=.35f)).semantics {paneTitle=title}){
+        Box(Modifier.fillMaxSize().clickable(interactionSource=remember {MutableInteractionSource()},indication=null,onClickLabel=tr("关闭批注","Close note"),onClick=dismiss))
+        Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(),color=MaterialTheme.colorScheme.background){
+            Column(Modifier.windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime)).padding(horizontal=16.dp,vertical=14.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
+                Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(10.dp)){
+                    Surface(Modifier.weight(1f),shape=RoundedCornerShape(24.dp),color=MaterialTheme.colorScheme.surfaceContainerLowest){
+                        BasicTextField(text,{text=it},Modifier.fillMaxWidth().heightIn(min=42.dp,max=160.dp).padding(horizontal=14.dp,vertical=10.dp).focusRequester(focus).semantics {contentDescription=inputLabel},
+                            enabled=!state.busy,maxLines=5,textStyle=MaterialTheme.typography.bodyLarge.copy(fontSize=16.sp,lineHeight=24.sp,color=MaterialTheme.colorScheme.onSurface),cursorBrush=SolidColor(brandControlColor()),
+                            decorationBox={input->Box {if(text.isEmpty())Text(placeholder,fontSize=16.sp,color=MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.6f));input()}})
                     }
-                    Text(reference,Modifier.fillMaxWidth(),fontSize=13.sp,lineHeight=20.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=TextOverflow.Ellipsis)
+                    val enabled=text.isNotBlank()&&!state.busy
+                    Box(Modifier.size(40.dp).clip(CircleShape).background(brandControlColor().copy(alpha=if(enabled)1f else .3f)).semantics {contentDescription=sendLabel}.clickable(enabled=enabled,role=Role.Button){save(text.trim()){if(active)dismiss()}},contentAlignment=Alignment.Center){
+                        if(state.busy)CircularProgressIndicator(Modifier.size(18.dp),color=Color.White,strokeWidth=2.dp)else AppIcon("up",size=24.dp,tint=Color.White)
+                    }
                 }
+                Text(reference,Modifier.fillMaxWidth(),fontSize=13.sp,lineHeight=20.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,maxLines=1,overflow=TextOverflow.Ellipsis)
             }
         }
     }

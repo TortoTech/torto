@@ -15,7 +15,7 @@ internal fun localDateTime(ms:Long):String=if(ms<=0)"—" else DateTimeFormatter
 @Composable internal fun CloudSettingsPanel(state:ScreenState,model:ReaderModel){
     val saved=state.cloud ?: return
     var draft by remember(saved){mutableStateOf(saved.copy())};var password by remember{mutableStateOf("")}
-    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp).imePadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start=16.dp,end=16.dp,top=8.dp,bottom=16.dp).imePadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
         SettingsGroup {SettingToggle(tr("启用云同步","Enable cloud sync"),draft.enabled,!state.busy){draft=draft.copy(enabled=it)}}
         SettingsGroup {
         SettingChoice(tr("云盘提供商","Cloud provider"),draft.provider,state.cloudPresets.map {it.id to it.name},!state.busy){id->val preset=state.cloudPresets.first {it.id==id};draft=draft.copy(provider=id,url=preset.url)}

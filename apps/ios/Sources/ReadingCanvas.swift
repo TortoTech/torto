@@ -235,8 +235,12 @@ struct ReadingCanvas: UIViewRepresentable {
             ctx.translateBy(x: offset.x, y: offset.y)
             UIImage(cgImage: frame.raster.image).draw(in: CGRect(x: 0, y: CGFloat(info.rasterTop),
                                                                width: width, height: CGFloat(info.rasterHeight)))
-            ctx.setFillColor(Self.color(0x55d8b86a).cgColor)
-            for mark in info.marks { ctx.fill(rectangle(mark)) }
+            if !info.marks.isEmpty {
+                ctx.setFillColor(Self.color(0x55d8b86a).cgColor)
+                ctx.beginPath()
+                for mark in info.marks { ctx.addRect(rectangle(mark)) }
+                ctx.fillPath(using: .winding)
+            }
             if !info.focusBounds.isEmpty {
                 ctx.saveGState()
                 for area in info.focusBounds {

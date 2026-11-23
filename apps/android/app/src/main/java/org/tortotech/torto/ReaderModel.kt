@@ -46,7 +46,7 @@ data class ScreenState(
     val statsPeriod:StatisticsPeriod?=null,val statsKind:String="week",val statsOffset:Int=0,val statsLoading:Boolean=false,val bookStatistics:BookStatistics?=null,val statsBookId:String?=null,
     val appVersion:String="",val checkingUpdate:Boolean=false,val appUpdate:AppUpdate?=null,val updateChecked:Boolean=false,val downloadingUpdate:Boolean=false,val updateProgress:UInt=0u,val updateError:String?=null,val downloadedUpdate:String?=null,val diagnosticFile:String?=null,
     val monoTypeface:android.graphics.Typeface=android.graphics.Typeface.MONOSPACE,
-    val reading:ReadingOptions?=null,val fontFamilies:FontFamilies?=null,val fontCatalog:ReaderFontCatalog?=null,val downloadingFontFamily:String?=null,val activeBookIsCjk:Boolean=true,val aiOptions:AiOptions?=null,
+    val reading:ReadingOptions?=null,val fontFamilies:FontFamilies?=null,val fontCatalog:ReaderFontCatalog?=null,val downloadingFontFamily:String?=null,val downloadingFontProgress:Int=0,val activeBookIsCjk:Boolean=true,val aiOptions:AiOptions?=null,
     val fontsDownloading:Boolean=false,val fontsReady:Boolean=false,val fontsError:String?=null,val fontApplyAvailable:Boolean=false,
     val fontNoticeUntil:Long=0,
     val providers:List<Provider> = emptyList(),val providerKinds:List<ProviderKind> = emptyList(),
@@ -134,12 +134,20 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             mutable.update {it.copy(fontsDownloading=fonts.running,fontsReady=fonts.ready,fontsError=fonts.error)}
             if(fonts.revision>observedFonts) {
                 observedFonts=fonts.revision
-                if(fonts.downloaded>0u)try {
+                if(fonts.downloaded>0u&&fonts.ready)try {
                     val active=reader
                     val families=core.fontFamilies()
-                    mutable.update {it.copy(fontFamilies=families,
-                        fontApplyAvailable=active!=null&&reader===active&&readerBook==it.active?.id,
-                        notice="新字体已下载完成",fontNoticeUntil=android.os.SystemClock.uptimeMillis()+5000)}
+                    val catalog=runCatching {core.readerFontCatalog()}.getOrNull()
+                    mutable.update {
+                        val inReader=active!=null&&reader===active&&readerBook==it.active?.id
+                        it.copy(
+                            fontFamilies=families,
+                            fontCatalog=catalog ?: it.fontCatalog,
+                            fontApplyAvailable=inReader,
+                            notice=if(inReader)"默认字体下载完成" else it.notice,
+                            fontNoticeUntil=if(inReader)android.os.SystemClock.uptimeMillis()+5000 else it.fontNoticeUntil,
+                        )
+                    }
                 }catch(e:CancellationException){throw e}catch(_:Exception){DiagnosticLog.record(getApplication(),"fonts.refresh_failed")}
             }
         }}
@@ -241,17 +249,21 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
-            mutable.update {it.copy(downloadingFontFamily=family)}
+            mutable.update {it.copy(downloadingFontFamily=family,downloadingFontProgress=0)}
             try {
-                core.downloadFontFamily(family)
+                core.downloadFontFamily(family,object:FontDownloadProgress{
+                    override fun onProgress(percent:UByte){
+                        mutable.update {it.copy(downloadingFontProgress=percent.toInt())}
+                    }
+                })
                 val catalog=core.readerFontCatalog()
-                mutable.update {it.copy(fontCatalog=catalog,downloadingFontFamily=null)}
+                mutable.update {it.copy(fontCatalog=catalog,downloadingFontFamily=null,downloadingFontProgress=0)}
                 state.value.reading?.let {saveReadingOptions(apply(it))}
             }catch(e:CancellationException){
-                mutable.update {it.copy(downloadingFontFamily=null)}
+                mutable.update {it.copy(downloadingFontFamily=null,downloadingFontProgress=0)}
                 throw e
             }catch(e:Exception){
-                mutable.update {it.copy(downloadingFontFamily=null,notice=e.message ?: if(it.language=="en")"Font download failed" else "字体下载失败")}
+                mutable.update {it.copy(downloadingFontFamily=null,downloadingFontProgress=0,notice=e.message ?: if(it.language=="en")"Font download failed" else "字体下载失败")}
             }
         }
     }
@@ -293,10 +305,19 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     suspend fun probeLayoutModel(provider: String, model: String): String =
         core.probeLayoutModel(provider, model)
 
+    fun loadCachedModels(providerId:String,cacheKey:String){
+        if(providerId.isBlank()||state.value.modelChoices.containsKey(cacheKey))return
+        viewModelScope.launch {
+            val cached=runCatching {core.cachedModels(providerId)}.getOrDefault(emptyList())
+            if(cached.isNotEmpty()){
+                mutable.update {it.copy(modelChoices=it.modelChoices+(cacheKey to cached))}
+            }
+        }
+    }
     fun fetchModels(provider:Provider,key:String,clearKey:Boolean=false)=runOperation {
         val cacheKey=provider.kind+":"+provider.baseUrl
         mutable.update {it.copy(modelFetchError=null)}
-        try{val models=core.fetchModels(provider,if(clearKey)"" else key.takeIf {it.isNotBlank()});mutable.update {it.copy(modelChoices=mapOf(cacheKey to models))}}
+        try{val models=core.fetchModels(provider,if(clearKey)"" else key.takeIf {it.isNotBlank()});mutable.update {it.copy(modelChoices=it.modelChoices+(cacheKey to models))}}
         catch(e:Exception){mutable.update {it.copy(modelFetchError=e.message)}}
     }
     private suspend fun persistAiOptions(options:AiOptions,token:Long){
@@ -392,7 +413,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         if(!state.value.fontApplyAvailable||state.value.active==null)return
         val target=reader ?: return
         val token=generation
-        clearNotice("新字体已下载完成")
+        clearNotice("默认字体下载完成")
         cancelAi()
         runOperation(quietUpdate=true) {
             if(token!=generation||reader!==target)return@runOperation
@@ -551,13 +572,14 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                             if(token!=generation){opened.shutdown();opened.close();if(reader===opened){reader=null;readerBook=null};return@withContext}
                             val downloadedDuringOpen=ReadingFonts.state.value.let {it.revision!=fontRevision&&it.downloaded>0u}
                             mutable.update {it.copy(focusAvailable=focusAvailable,focus=focus,fontApplyAvailable=downloadedDuringOpen)}
+                            val bookTranslated = opened.translationEnabled()
                             val toc = opened.toc()
                             val languages=opened.bookLanguages()
                             val words=withContext(Dispatchers.Default){bookSupportsWordSelection(languages)}
                             val selection=selectionFor(focus,words)
-                            opened.selectionMode(selection)
+                            opened.selectionMode(if(bookTranslated)"paragraph"else selection)
                             if(token!=generation)return@withContext
-                            mutable.update { it.copy(toc = toc,bookLanguages=languages,wordSelectionAvailable=words,selectionMode=selection) }
+                            mutable.update { it.copy(toc = toc,bookLanguages=languages,wordSelectionAvailable=words,selectionMode=selection,translated=bookTranslated,reading=it.reading?.copy(translated=bookTranslated)) }
                             publish(opened.configure(state.value.fontSize,state.value.unified,state.value.dark), token,next)
                             prepareReferences(opened,token)
                             viewModelScope.launch {checkCloudResume()}
@@ -929,7 +951,10 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         cancelChat();cancelAi();aiVersion=0uL;manualLayout=false;scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
         resizeJob?.cancel(); viewport = null
-        mutable.update { it.copy(active = null, focus=preferredFocus, focusAvailable=false, cloudResume=null, bookLanguages=emptyList(),messages=emptyList(),chatSources=emptyMap(),chatLoadingSources=emptySet(),chatSourceErrors=emptySet(), frame = null, openingBook=false, readerContentLoading=false, fontApplyAvailable=false, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=true,processing=false, selected = null, toc = emptyList(),chatWorking=false,chatQuestion="",chatContent="",chatReasoning="",chatActivity="",chatStreamId="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
+        mutable.update {
+            val clearFontNotice=it.notice=="默认字体下载完成"
+            it.copy(active = null, focus=preferredFocus, focusAvailable=false, cloudResume=null, bookLanguages=emptyList(),messages=emptyList(),chatSources=emptyMap(),chatLoadingSources=emptySet(),chatSourceErrors=emptySet(), frame = null, openingBook=false, readerContentLoading=false, fontApplyAvailable=false, notice=if(clearFontNotice)null else it.notice, fontNoticeUntil=if(clearFontNotice)0 else it.fontNoticeUntil, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=true,processing=false, selected = null, toc = emptyList(),chatWorking=false,chatQuestion="",chatContent="",chatReasoning="",chatActivity="",chatStreamId="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList())
+        }
         runOperation { reader?.shutdown(); reader?.close(); reader = null; readerBook = null; val books=core.books(); mutable.update { it.copy(books=books) } }
     }
     fun interfaceSettings(theme: String, language: String) = runOperation {

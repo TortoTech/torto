@@ -1061,22 +1061,20 @@ fn semantic_layout_rows(
             ));
         });
         ui.end_row();
-        if !settings.image_model.is_empty() {
-            settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
-            settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
-                reasoning_effort_selector(
-                    ui,
-                    "image-recognition-reasoning-effort",
-                    &mut settings.image_reasoning_effort,
-                    image_options.iter().find(|option| {
-                        option.provider_id == settings.image_provider
-                            && option.model == settings.image_model
-                    }),
-                    language,
-                );
-            });
-            ui.end_row();
-        }
+        settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
+        settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+            reasoning_effort_selector(
+                ui,
+                "image-recognition-reasoning-effort",
+                &mut settings.image_reasoning_effort,
+                image_options.iter().find(|option| {
+                    option.provider_id == settings.image_provider
+                        && option.model == settings.image_model
+                }),
+                language,
+            );
+        });
+        ui.end_row();
     }
 }
 
@@ -1211,12 +1209,7 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             state.invalidate_provider_models(&provider_id);
         }
         let provider = state.draft_plugin_settings.providers[index].clone();
-        let needs_initial_fetch = !state.provider_models_cache.contains_key(&provider.id)
-            && !state.provider_models_errors.contains_key(&provider.id)
-            && !state.provider_models_task.is_pending()
-            && !provider_changed
-            && !provider.base_url.trim().is_empty();
-        if refresh_requested || needs_initial_fetch {
+        if refresh_requested && !provider.base_url.trim().is_empty() {
             state.request_provider_models(ProviderModelsRequest {
                 provider_id: provider.id,
                 kind: provider.kind,
@@ -1271,6 +1264,12 @@ fn provider_models_selector(
             .map(|model| model.id.trim().to_owned())
             .filter(|model| !model.is_empty()),
     );
+    let mut options: Vec<String> = options.into_iter().collect();
+    options.sort_by(|a, b| {
+        let sa = selected_models.iter().any(|c| c.id == *a);
+        let sb = selected_models.iter().any(|c| c.id == *b);
+        sb.cmp(&sa).then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+    });
     egui::ComboBox::from_id_salt(("ai-provider-models", provider_id))
         .width(SETTINGS_MODEL_SELECT_WIDTH)
         .truncate()
@@ -1311,7 +1310,9 @@ fn provider_models_selector(
                 }
             }
         });
-    let refresh_requested = secondary_button(ui, language.text("刷新", "Refresh")).clicked();
+    let refresh_requested = icon_button(ui, Icon::RefreshCw)
+        .on_hover_text(language.text("刷新模型列表", "Refresh model list"))
+        .clicked();
     if loading {
         ui.add(crate::ui::LoadingSpinner::new());
     } else if let Some(error) = error {
@@ -1679,7 +1680,7 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, language.text("专家翻译", "Expert translation"));
+                settings_row_label(ui, language.text("提取术语表", "Extract glossary"));
                 settings_row_control_sized(ui, 44.0, |ui| {
                     toggle_switch(ui, &mut settings.expert_translation).on_hover_text(language.text(
                         "自动积累本书的专业术语译法，用于后续翻译，保持术语一致。已有译文不会自动重译。",

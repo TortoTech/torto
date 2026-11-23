@@ -38,13 +38,13 @@ import org.json.JSONObject
     val disabled=state.loading||state.working||state.sending||state.locked
     val title=tr("反馈问题","Report an issue")
     val descriptionLabel=tr("反馈内容","Feedback description")
-    FullScreenInputDialog(model::close,brightness){dismiss->
-        val inputFocus=rememberInputFocus(!state.loading&&!state.locked&&state.status!="submitted")
-        Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).semantics {paneTitle=title}.statusBarsPadding().navigationBarsPadding().imePadding()){
-            Box(Modifier.fillMaxWidth().height(64.dp)){
-                Text(title,Modifier.align(Alignment.Center),fontSize=16.sp,textAlign=TextAlign.Center)
-                ActionIcon("expand",tr("关闭反馈","Close feedback"),modifier=Modifier.align(Alignment.CenterStart).padding(start=4.dp),onClick=dismiss)
-            }
+    androidx.activity.compose.BackHandler(onBack=model::close)
+    val inputFocus=rememberInputFocus(!state.loading&&!state.locked&&state.status!="submitted")
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).semantics {paneTitle=title}.statusBarsPadding().windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))){
+        Box(Modifier.fillMaxWidth().height(64.dp)){
+            Text(title,Modifier.align(Alignment.Center),fontSize=16.sp,textAlign=TextAlign.Center)
+            ActionIcon("back",tr("返回","Back"),modifier=Modifier.align(Alignment.CenterStart).padding(start=4.dp),onClick=model::close)
+        }
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal=16.dp),verticalArrangement=Arrangement.spacedBy(16.dp)){
                 if(state.loading)LinearProgressIndicator(Modifier.fillMaxWidth())
                 if(state.status=="submitted"){
@@ -84,14 +84,13 @@ import org.json.JSONObject
                 if(state.status=="pending")Text(tr("暂时无法确认提交结果，内容已保留，请稍后重试","The result is not yet confirmed. Your report is preserved; retry later"),fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 state.error?.let {Text(feedbackError(it),fontSize=13.sp,color=MaterialTheme.colorScheme.error)}
                 if(waiting)Text(tr("请稍后重试","Please retry later"),fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
-                Button(onClick=if(state.status=="submitted")dismiss else model::submit,
+                Button(onClick=if(state.status=="submitted")model::close else model::submit,
                     enabled=state.status=="submitted"||!state.loading&&!state.working&&!state.sending&&!waiting&&state.valid,modifier=Modifier.fillMaxWidth()){
                     if(state.sending){CircularProgressIndicator(Modifier.size(18.dp),strokeWidth=2.dp,color=MaterialTheme.colorScheme.onPrimary);Spacer(Modifier.width(8.dp))}
                     Text(if(state.status=="submitted")tr("完成","Done")else if(state.sending)tr("提交中","Submitting")else if(state.locked)tr("重试","Retry")else tr("提交","Submit"))
                 }
             }
         }
-    }
     state.preview?.let {FullScreenImagePreview(it,model::closePreview)}
 }
 

@@ -275,7 +275,7 @@ struct ReaderScreen: View {
             if panel == nil {
                 if model.selection == nil && showFontNotice {
                     HStack {
-                        Text(mobileText("新字体已下载完成", "Reading fonts downloaded")).font(.footnote)
+                        Text(mobileText("默认字体下载完成", "Default fonts downloaded")).font(.footnote)
                         Button(mobileText("应用", "Apply")) { showFontNotice = false; model.applyFonts() }.disabled(model.working)
                     }.padding(12).background(palette.surface, in: .capsule).padding(.bottom, 8)
                 } else if model.selection == nil && model.showingChrome && model.previewedNote == nil && model.frame != nil {
@@ -292,12 +292,12 @@ struct ReaderScreen: View {
                     .background((panel.isLarge ? palette.background : panel == .compose ? palette.background : palette.surface)
                         .ignoresSafeArea(edges: .bottom))
                     .offset(y: panelDrag)
-                    .transition(.offset(y: 24).combined(with: .opacity))
+                    .transition(panel.isLarge ? .move(edge: .bottom) : .opacity)
             }
             if let note = model.previewedNote, panel == nil { noteFooter(note).padding(.horizontal, 16).padding(.bottom, 12) }
             else if (model.showingChrome || panel != nil) && panel != .compose { footer }
         }
-        .animation(.easeOut(duration: 0.15), value: panel)
+        .animation(.easeOut(duration: panel?.isLarge == true ? 0.3 : 0.15), value: panel)
         .animation(.easeOut(duration: 0.15), value: model.showingChrome)
     }
 
@@ -453,9 +453,6 @@ struct ReaderScreen: View {
             VStack(spacing: 0) {
                 panelHeader(mobileText("字体样式", "Font styles")) { self.panel = .typography }
                 ReaderFontStylePanel(core: core, library: library, isCjkBook: isCjk, apply: model.applyFonts)
-                if !library.fontsReady {
-                    MobileGroup { FontDownloadRow(library: library) }.padding(.horizontal, 16).padding(.bottom, 12)
-                }
             }
         case .layout:
             VStack(spacing: 0) {

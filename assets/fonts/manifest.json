@@ -508,6 +508,42 @@
       "mirror_url": "https://gitee.com/TortoTech/lab/releases/download/reader-fonts-v2/roboto.ttf",
       "size": 488584,
       "sha256": "d7598e12c5dbef095ff8272cfc55da0250bd07fbdecbac8a530b9b277872a134"
+    },
+    {
+      "id": "maple-mono",
+      "file": "maple-mono.ttf",
+      "family": "Maple Mono",
+      "display_name": "Maple Mono",
+      "group": "code",
+      "preload": true,
+      "italic": false,
+      "github_asset_id": 782778917,
+      "size": 426076,
+      "sha256": "55c21f6733c7fa93403c7acccb9d15d87c98fec20723b875e4fdd6db1619388c"
+    },
+    {
+      "id": "maple-mono-italic",
+      "file": "maple-mono-italic.ttf",
+      "family": "Maple Mono",
+      "display_name": "Maple Mono",
+      "group": "code",
+      "preload": true,
+      "italic": true,
+      "github_asset_id": 782778916,
+      "size": 475168,
+      "sha256": "a95b2e4254be1057fb3838cec43c04cb2a5a2852a3e7beea122951571af07d8f"
+    },
+    {
+      "id": "fira-code",
+      "file": "fira-code.ttf",
+      "family": "Fira Code",
+      "display_name": "Fira Code",
+      "group": "code",
+      "preload": false,
+      "italic": false,
+      "github_asset_id": 782778942,
+      "size": 286320,
+      "sha256": "04149681350f161aca538858b88d17443c586cacca83c165939a13423fe91a26"
     }
   ]
 }

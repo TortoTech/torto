@@ -65,7 +65,7 @@ import org.tortotech.torto.core.*
     }
 }
 @Composable fun SettingsScreen(state:ScreenState,open:(String)->Unit) {
-    LazyColumn(contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
+    LazyColumn(contentPadding=PaddingValues(start=16.dp,end=16.dp,top=8.dp,bottom=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
         item { SettingsGroup {
             InterfaceSettingsRows(state,open)
             SettingsRow("type",tr("AI 排版","AI layout")){open("layout")}

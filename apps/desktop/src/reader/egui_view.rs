@@ -5625,19 +5625,19 @@ fn grouped_cjk_font_picker(
                     let any_downloading = crate::fonts::any_downloading(ui.ctx());
                     for (idx, (family, label)) in items.iter().enumerate() {
                         let is_custom = family == "__custom__";
-                        let selected = !is_custom && family == current_family;
                         let status = if is_custom {
                             None
                         } else {
                             crate::fonts::family_status(ui.ctx(), family)
                         };
                         let is_downloading = matches!(status, Some(crate::fonts::Status::Downloading(_)));
+                        let selected = !is_custom && !any_downloading && family == current_family;
                         let card_text = if is_downloading {
                             language.text("下载中", "Downloading")
                         } else {
                             label.as_str()
                         };
-                        let stroke = if selected {
+                        let stroke = if selected || is_downloading {
                             egui::Stroke::new(1.5, palette().accent)
                         } else {
                             egui::Stroke::new(1.0, palette().border)
@@ -5805,7 +5805,6 @@ fn grouped_latin_font_picker(
                     let any_downloading = crate::fonts::any_downloading(ui.ctx());
                     for (idx, (family, label)) in items.iter().enumerate() {
                         let is_custom = family == "__custom__";
-                        let selected = !is_custom && family == current_family;
                         let status = if is_custom {
                             None
                         } else {
@@ -5813,12 +5812,13 @@ fn grouped_latin_font_picker(
                         };
                         let is_downloading =
                             matches!(status, Some(crate::fonts::Status::Downloading(_)));
+                        let selected = !is_custom && !any_downloading && family == current_family;
                         let card_text = if is_downloading {
                             language.text("下载中", "Downloading")
                         } else {
                             label.as_str()
                         };
-                        let stroke = if selected {
+                        let stroke = if selected || is_downloading {
                             egui::Stroke::new(1.5, palette().accent)
                         } else {
                             egui::Stroke::new(1.0, palette().border)
@@ -5897,26 +5897,18 @@ fn grouped_monospace_font_picker(
     language: crate::preferences::AppLanguage,
     current_family: &str,
 ) -> Option<FontPickerAction> {
-    let default_mono = rebook_layout::default_monospace_font();
-    let mut items: Vec<(String, String)> = vec![(
-        default_mono.to_owned(),
-        default_mono.to_owned(),
-    )];
-    for family in system_monospace_font_families() {
-        items.push((family.clone(), family.clone()));
-    }
+    let mut items: Vec<(String, String)> = vec![
+        (
+            "monospace".to_owned(),
+            language.text("系统字体", "System font").to_owned(),
+        ),
+        ("Maple Mono".to_owned(), "Maple Mono".to_owned()),
+        ("Fira Code".to_owned(), "Fira Code".to_owned()),
+    ];
     for (family, label) in crate::fonts::custom_latin_families(ui.ctx()) {
         if !items.iter().any(|(f, _)| f.eq_ignore_ascii_case(&family)) {
             items.push((family, label));
         }
-    }
-    if !current_family.is_empty()
-        && !current_family.starts_with('.')
-        && !items
-            .iter()
-            .any(|(f, _)| f.eq_ignore_ascii_case(current_family))
-    {
-        items.push((current_family.to_owned(), current_family.to_owned()));
     }
     items.push((
         "__custom__".to_owned(),
@@ -5937,16 +5929,31 @@ fn grouped_monospace_font_picker(
                     let any_downloading = crate::fonts::any_downloading(ui.ctx());
                     for (idx, (family, label)) in items.iter().enumerate() {
                         let is_custom = family == "__custom__";
-                        let selected = !is_custom && family.eq_ignore_ascii_case(current_family);
-                        let stroke = if selected {
+                        let status = if is_custom {
+                            None
+                        } else {
+                            crate::fonts::family_status(ui.ctx(), family)
+                        };
+                        let is_downloading =
+                            matches!(status, Some(crate::fonts::Status::Downloading(_)));
+                        let selected = !is_custom
+                            && !any_downloading
+                            && family.eq_ignore_ascii_case(current_family);
+                        let highlight = selected || is_downloading;
+                        let stroke = if highlight {
                             egui::Stroke::new(1.5, palette().accent)
                         } else {
                             egui::Stroke::new(1.0, palette().border)
                         };
+                        let text = if is_downloading {
+                            language.text("下载中", "Downloading")
+                        } else {
+                            label.as_str()
+                        };
                         let btn = egui::Button::new(
-                            RichText::new(label.as_str())
+                            RichText::new(text)
                                 .size(crate::ui::scaled_font_size(12.5))
-                                .color(if selected {
+                                .color(if highlight {
                                     palette().accent
                                 } else {
                                     palette().text

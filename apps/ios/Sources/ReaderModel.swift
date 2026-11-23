@@ -199,11 +199,11 @@ final class ReaderModel: ObservableObject {
                     let available = try await opened.focusModeAvailable()
                     let language = try await opened.bookLanguages()
                     let autoLayout = (try? await core.aiOptions().layoutEnabled) ?? false
-                    try await opened.setTranslationEnabled(enabled: false)
+                    let bookTranslated = opened.translationEnabled()
                     let configured = try await opened.configure(fontSize: font, unified: unified, dark: dark)
                     let page = focus && available ? try await opened.focusMode(enabled: true) : configured
                     let mode = Self.preferredSelection(focus && available, words: Self.supportsWords(language))
-                    try await opened.selectionMode(mode: mode)
+                    try await opened.selectionMode(mode: bookTranslated ? "paragraph" : mode)
                     let rendered = try ReadingFrame(page, viewport: viewport, retaining: nil)
                     guard !closing else {
                         try await opened.shutdown()
@@ -214,6 +214,7 @@ final class ReaderModel: ObservableObject {
                     bookLanguages = language
                     selectionMode = mode
                     aiEnabled = autoLayout
+                    translated = bookTranslated
                     appearancePending = dark != paperDark
                     frame = rendered
                     prepareReferences(opened)

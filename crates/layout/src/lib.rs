@@ -762,13 +762,7 @@ impl Default for ReaderTypography {
 /// Platform default shared by reader code and interface code displays.
 #[must_use]
 pub const fn default_monospace_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Menlo"
-    } else if cfg!(target_os = "windows") {
-        "Consolas"
-    } else {
-        "DejaVu Sans Mono"
-    }
+    "Maple Mono"
 }
 
 /// Maximum number of book pages shown in one viewport.
@@ -906,7 +900,14 @@ fn font_stack<'a>(families: impl IntoIterator<Item = &'a str>, generic: &str) ->
 }
 
 fn quote_font_family(family: &str) -> String {
-    format!("\"{}\"", family.replace('\\', "\\\\").replace('"', "\\\""))
+    if matches!(
+        family.to_ascii_lowercase().as_str(),
+        "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" | "system-ui"
+    ) {
+        family.to_ascii_lowercase()
+    } else {
+        format!("\"{}\"", family.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -48,8 +48,8 @@ struct MobileSettings: View {
                 }
             case .theme:
                 InterfaceOptions(value: $theme, fallback: scheme == .dark ? "dark" : "light",
-                                 description: mobileText("开启后，将跟随系统切换界面主题", "When enabled, interface theme follows your system settings"),
-                                 choices: [MobileChoice("light", mobileText("浅色主题", "Light theme")), MobileChoice("dark", mobileText("深色主题", "Dark theme"))])
+                                 description: mobileText("开启后，将跟随系统打开或关闭深色模式", "When enabled, dark mode follows your system settings"),
+                                 choices: [MobileChoice("light", mobileText("浅色模式", "Light mode")), MobileChoice("dark", mobileText("深色模式", "Dark mode"))])
             case .language:
                 InterfaceOptions(value: $language, fallback: (Locale.preferredLanguages.first ?? "en").hasPrefix("zh") ? "zh-CN" : "en",
                                  description: mobileText("开启后，将跟随系统设置界面语言", "When enabled, the interface language follows your system settings"),
@@ -90,8 +90,8 @@ struct MobileSettings: View {
 
     private var themeLabel: String {
         switch theme {
-        case "dark": mobileText("深色主题", "Dark theme")
-        case "light": mobileText("浅色主题", "Light theme")
+        case "dark": mobileText("深色模式", "Dark mode")
+        case "light": mobileText("浅色模式", "Light mode")
         default: mobileText("跟随系统", "Follow system")
         }
     }
@@ -107,7 +107,7 @@ struct MobileSettings: View {
     private func title(_ route: Route?) -> String {
         switch route {
         case nil: mobileText("设置", "Settings")
-        case .theme: mobileText("界面主题", "Interface theme")
+        case .theme: mobileText("深色模式", "Dark mode")
         case .language: mobileText("界面语言", "Interface language")
         case .providers: mobileText("AI 提供商", "AI providers")
         case .provider: provider?.id.isEmpty == true ? mobileText("添加 AI 提供商", "Add AI provider") : mobileText("编辑 AI 提供商", "Edit AI provider")
@@ -279,6 +279,7 @@ struct ReaderFontStylePanel: View {
     @State private var activeTab: MobileFontField = .cjk
     @State private var activeGroupId: String = ""
     @State private var downloadingFamily: String?
+    @State private var downloadingProgress: Int = 0
     @State private var importing = false
     @State private var saving = false
     @State private var error: String?
@@ -361,23 +362,36 @@ struct ReaderFontStylePanel: View {
 
                 let showImport = activeTab == .code || activeGroupId == "system" || activeGroupId == "builtin"
                 let items = activeTab == .code ? cat.monospace : (gs.first { $0.id == activeGroupId }?.items ?? [])
+                let isDefaultPreload: (String) -> Bool = { $0 == "LXGW WenKai GB Screen" || $0 == "Literata" || $0 == "Maple Mono" }
+                let anyDownloading = downloadingFamily != nil || (library.fontsDownloading && items.contains { !$0.downloaded && isDefaultPreload($0.family) })
                 let busy = saving || downloadingFamily != nil
 
                 ScrollView {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
                         ForEach(items, id: \.family) { item in
-                            let selected = item.family.caseInsensitiveCompare(current) == .orderedSame
-                            let downloading = downloadingFamily == item.family
+                            let selected = !anyDownloading && item.family.caseInsensitiveCompare(current) == .orderedSame
+                            let downloading = downloadingFamily == item.family || (library.fontsDownloading && !item.downloaded && isDefaultPreload(item.family))
                             let label = downloading ? mobileText("下载中", "Downloading") : (item.label == "系统字体" ? mobileText("系统字体", "System font") : item.label)
                             Button { select(item) } label: {
-                                Text(label)
-                                    .font(.system(size: 12))
-                                    .lineLimit(1)
-                                    .foregroundStyle((selected || downloading) ? palette.accent : palette.ink)
-                                    .padding(.horizontal, 6)
-                                    .frame(maxWidth: .infinity, minHeight: 40)
-                                    .background(downloading ? palette.accent.opacity(0.12) : palette.surface, in: RoundedRectangle(cornerRadius: 8))
-                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke((selected || downloading) ? palette.accent : palette.border, lineWidth: selected ? 1.5 : 1))
+                                ZStack(alignment: .leading) {
+                                    palette.surface
+                                    if downloading {
+                                        GeometryReader { geo in
+                                            let frac = max(0.06, min(1.0, Double(downloadingProgress) / 100.0))
+                                            palette.accent.opacity(0.18)
+                                                .frame(width: geo.size.width * frac)
+                                        }
+                                    }
+                                    Text(label)
+                                        .font(.system(size: 12))
+                                        .lineLimit(1)
+                                        .foregroundStyle((selected || downloading) ? palette.accent : palette.ink)
+                                        .padding(.horizontal, 6)
+                                        .frame(maxWidth: .infinity, minHeight: 40)
+                                }
+                                .frame(height: 40)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke((selected || downloading) ? palette.accent : palette.border, lineWidth: (selected || downloading) ? 1.5 : 1))
                             }.buttonStyle(.plain).disabled(busy)
                         }
                         if showImport {
@@ -393,7 +407,7 @@ struct ReaderFontStylePanel: View {
                             }.buttonStyle(.plain).disabled(busy)
                         }
                     }
-                }.frame(maxHeight: 240)
+                }.frame(height: gs.isEmpty ? 276 : 232)
             } else {
                 ProgressView().frame(maxWidth: .infinity, minHeight: 160)
             }
@@ -437,15 +451,26 @@ struct ReaderFontStylePanel: View {
             error = nil
             if !item.downloaded {
                 downloadingFamily = item.family
+                downloadingProgress = 0
+                final class ProgressBox: FontDownloadProgress, @unchecked Sendable {
+                    let update: @Sendable (UInt8) -> Void
+                    init(_ update: @escaping @Sendable (UInt8) -> Void) { self.update = update }
+                    func onProgress(percent: UInt8) { update(percent) }
+                }
+                let box = ProgressBox { p in
+                    Task { @MainActor in downloadingProgress = Int(p) }
+                }
                 do {
-                    try await core.downloadFontFamily(family: item.family)
+                    try await core.downloadFontFamily(family: item.family, progress: box)
                     catalog = try await core.readerFontCatalog()
                 } catch {
                     downloadingFamily = nil
+                    downloadingProgress = 0
                     self.error = message(error)
                     return
                 }
                 downloadingFamily = nil
+                downloadingProgress = 0
             }
             pending[keyPath: field.path] = item.family
             saving = true

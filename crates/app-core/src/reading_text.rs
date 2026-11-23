@@ -253,7 +253,18 @@ pub fn normalize_resolved_footnote_text(text: &str, marker: &str) -> Option<Stri
 }
 
 fn note_marker_value(marker: &str) -> &str {
-    marker.trim().trim_matches(['[', ']', '(', ')', '（', '）', '【', '】', '.', '．']).trim()
+    marker
+        .trim()
+        .trim_matches(['[', ']', '(', ')', '（', '）', '【', '】', '.', '．', '←', '↑', '↩'])
+        .trim()
+}
+
+fn looks_like_note_marker(text: &str) -> bool {
+    let v = note_marker_value(text);
+    !v.is_empty()
+        && ((v.len() <= 4 && v.bytes().all(|b| b.is_ascii_digit()))
+            || (v.chars().count() == 1
+                && v.chars().all(|c| !c.is_alphanumeric() || ('①'..='⑳').contains(&c))))
 }
 
 fn after_note_marker(text: &str) -> &str {
@@ -273,10 +284,13 @@ fn strip_note_marker<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
         .find(|(open, _)| text.starts_with(*open))
     {
         let (label, rest) = text.strip_prefix(open)?.split_once(close)?;
-        return (label.trim() == value).then(|| after_note_marker(rest));
+        return (note_marker_value(label) == value).then(|| after_note_marker(rest));
     }
     let rest = text.strip_prefix(value)?;
-    (rest.is_empty() || after_note_marker(rest).len() < rest.len())
+    let symbol_marker = value
+        .chars()
+        .all(|c| !c.is_ascii_alphanumeric());
+    (rest.is_empty() || symbol_marker || after_note_marker(rest).len() < rest.len())
         .then(|| after_note_marker(rest))
 }
 
@@ -449,6 +463,11 @@ pub fn note_inline_markdown(inlines: &[Inline]) -> String {
     let mut out = String::new();
     for inline in inlines {
         match inline {
+            Inline::Text(r)
+                if matches!(
+                    r.style.inline_role,
+                    InlineRole::Footnote | InlineRole::PageMarker
+                ) => {}
             Inline::Text(r) => {
                 let mut value = escape(&r.text);
                 if r.style.bold {
@@ -514,13 +533,32 @@ pub fn focus_footnote_markdown_in_section(
             // legacy backlink; other links in the note body remain selectable.
             let first = content.iter_mut().position(|inline| match inline {
                 Inline::Text(run) => {
-                    if run.text.trim().is_empty() {
+                    let trimmed = run.text.trim();
+                    if trimmed.is_empty() {
                         return false;
                     }
+                    if !removed_marker && matches!(trimmed, "[" | "(" | "（" | "【") {
+                        return false;
+                    }
+                    if matches!(
+                        run.style.inline_role,
+                        InlineRole::Footnote | InlineRole::PageMarker
+                    ) {
+                        if run.style.inline_role == InlineRole::Footnote {
+                            removed_marker = true;
+                        }
+                        return false;
+                    }
+                    let internal_link = run
+                        .link
+                        .as_ref()
+                        .is_some_and(|url| url.website_url().is_none());
                     if run.style.link_role == LinkRole::FootnoteBacklink
-                        || (!removed_marker && run.link.is_some()
-                            && !note_marker_value(marker).is_empty()
-                            && note_marker_value(&run.text) == note_marker_value(marker))
+                        || (!removed_marker
+                            && internal_link
+                            && ((!note_marker_value(marker).is_empty()
+                                && note_marker_value(&run.text) == note_marker_value(marker))
+                                || looks_like_note_marker(&run.text)))
                     {
                         removed_marker = true;
                         return false;
