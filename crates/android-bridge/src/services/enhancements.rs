@@ -81,7 +81,9 @@ pub(crate) fn queue(
     base: Recognition,
     settings: &PluginSettings,
 ) -> bool {
-    if !semantic::needs_enhancement(&section, range.clone(), &base) {
+    if settings.semantic_layout_image_endpoint().is_none()
+        || !semantic::needs_enhancement(&section, range.clone(), &base)
+    {
         return true;
     }
     let book = plugins::pdf_native::cache_identity(&s.book_id, s.pipeline.rewrite.as_ref());

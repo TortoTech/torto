@@ -46,7 +46,7 @@ pub use raster_cache::{
     raster_cache_stats, retire_publication_rasters,
 };
 pub use semantic_lists::semantic_list_groups;
-pub use semantic_paragraphs::semantic_paragraph_groups;
+pub use semantic_paragraphs::{FocusGroupScope, focus_group_scopes, semantic_paragraph_groups};
 
 /// Avoid copying blocks without footnotes, especially image-heavy chapters.
 pub fn numbered_semantic_footnotes(block: &Block) -> Cow<'_, Block> {
@@ -550,7 +550,9 @@ impl ReaderTypography {
         }
         normalize_family(&mut self.monospace_font, &defaults.monospace_font);
         self.minimum_font_size = finite_clamp(self.minimum_font_size, 1.0, 120.0, 12.0);
-        self.font_size = finite_clamp(self.font_size, self.minimum_font_size, 120.0, 20.0);
+        let clamped_font_size = finite_clamp(self.font_size, self.minimum_font_size, 120.0, 20.0);
+        let even_font_size = (clamped_font_size / 2.0).round() * 2.0;
+        self.font_size = even_font_size.clamp(self.minimum_font_size, 120.0);
         self.font_weight = self.font_weight.clamp(200, 900);
     }
 
@@ -567,7 +569,7 @@ impl ReaderTypography {
                     || (self.default_font, self.default_western_family()),
                     |choice| (choice.category, choice.family.as_str()),
                 );
-                self.reading_stack(category, family, &self.default_cjk_font)
+                self.cjk_primary_reading_stack(category, &self.default_cjk_font, family)
             }
             WritingSystem::Latin | WritingSystem::Other | WritingSystem::Unknown => self
                 .reading_stack(
@@ -577,6 +579,69 @@ impl ReaderTypography {
                         .as_deref()
                         .unwrap_or(&self.default_cjk_font),
                 ),
+        }
+    }
+
+    #[must_use]
+    pub fn cjk_western_override_stack(&self) -> String {
+        let (category, family) = self.cjk_default_font.as_ref().map_or_else(
+            || (self.default_font, self.default_western_family()),
+            |choice| (choice.category, choice.family.as_str()),
+        );
+        self.reading_stack(category, family, &self.default_cjk_font)
+    }
+
+    fn cjk_primary_reading_stack(
+        &self,
+        category: ReaderDefaultFont,
+        cjk_family: &str,
+        western_family: &str,
+    ) -> String {
+        match category {
+            ReaderDefaultFont::Serif => font_stack(
+                [
+                    cjk_family,
+                    western_family,
+                    "LXGW WenKai GB Screen",
+                    "Noto Serif SC",
+                    "Source Han Serif SC",
+                    "Songti SC",
+                    "PingFang SC",
+                    "Microsoft YaHei",
+                    "Noto Sans CJK SC",
+                    "Georgia",
+                    "Times New Roman",
+                ],
+                "serif",
+            ),
+            ReaderDefaultFont::SansSerif => font_stack(
+                [
+                    cjk_family,
+                    western_family,
+                    "LXGW WenKai GB Screen",
+                    "Noto Sans SC",
+                    "Source Han Sans SC",
+                    "PingFang SC",
+                    "Microsoft YaHei",
+                    "Roboto",
+                    "Arial",
+                ],
+                "sans-serif",
+            ),
+            ReaderDefaultFont::Other => font_stack(
+                [
+                    cjk_family,
+                    western_family,
+                    "LXGW WenKai GB Screen",
+                    "Noto Sans SC",
+                    "Source Han Sans SC",
+                    "PingFang SC",
+                    "Microsoft YaHei",
+                    "Roboto",
+                    "Arial",
+                ],
+                "sans-serif",
+            ),
         }
     }
 
@@ -782,6 +847,51 @@ fn optical_size_variations(font_size: f32) -> [FontVariation; 1] {
     )]
 }
 
+fn is_western_override_char(ch: char) -> bool {
+    match ch {
+        '!'..='~'
+        | '\u{00A2}'..='\u{00A5}'
+        | '\u{00AC}'
+        | '\u{00B1}'
+        | '\u{00BC}'..='\u{00BE}'
+        | '\u{00C0}'..='\u{00D6}'
+        | '\u{00D7}'
+        | '\u{00D8}'..='\u{00F6}'
+        | '\u{00F7}'
+        | '\u{00F8}'..='\u{00FF}'
+        | '\u{0100}'..='\u{024F}'
+        | '\u{1E00}'..='\u{1EFF}'
+        | '\u{20A0}'..='\u{20CF}'
+        | '\u{2150}'..='\u{215E}'
+        | '\u{2200}'..='\u{22FF}' => true,
+        _ => false,
+    }
+}
+
+fn western_font_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut last_western_end: usize = 0;
+
+    for (idx, ch) in text.char_indices() {
+        let end = idx + ch.len_utf8();
+        if is_western_override_char(ch) {
+            if run_start.is_none() {
+                run_start = Some(idx);
+            }
+            last_western_end = end;
+        } else if matches!(ch, ' ' | '\u{00A0}') && run_start.is_some() {
+            // Merge internal spaces when followed by another Western character.
+        } else if let Some(start) = run_start.take() {
+            ranges.push(start..last_western_end);
+        }
+    }
+    if let Some(start) = run_start {
+        ranges.push(start..last_western_end);
+    }
+    ranges
+}
+
 fn font_stack<'a>(families: impl IntoIterator<Item = &'a str>, generic: &str) -> String {
     let mut seen = HashSet::new();
     let mut stack = families
@@ -875,6 +985,49 @@ fn is_symbolic_reader_font(family: &str, panose: Option<&[u8]>, family_class: Op
         || normalized.contains("symbol")
         || normalized.contains("webdings")
         || normalized.contains("wingdings")
+}
+
+pub fn inspect_font_bytes(bytes: &[u8]) -> Option<(String, String, bool)> {
+    use read_fonts::TableProvider;
+    use read_fonts::types::NameId;
+    let font = FontRef::from_index(bytes, 0).ok()?;
+    let name_table = font.name().ok()?;
+    let mut en_family: Option<String> = None;
+    let mut zh_family: Option<String> = None;
+    for target_id in [NameId::TYPOGRAPHIC_FAMILY_NAME, NameId::FAMILY_NAME] {
+        for record in name_table.name_record() {
+            if record.name_id() != target_id {
+                continue;
+            }
+            let Ok(text) = record.string(name_table.string_data()) else {
+                continue;
+            };
+            let s: String = text.chars().collect();
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lang = record.language_id();
+            let is_zh = matches!(lang, 0x0804 | 0x0404 | 0x0C04 | 0x1004 | 0x1404)
+                || trimmed.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
+            if is_zh && zh_family.is_none() {
+                zh_family = Some(trimmed.to_owned());
+            } else if en_family.is_none() {
+                en_family = Some(trimmed.to_owned());
+            }
+        }
+        if en_family.is_some() {
+            break;
+        }
+    }
+    let family = en_family.or_else(|| zh_family.clone())?;
+    let display = zh_family.unwrap_or_else(|| family.clone());
+    let supports_chinese = font.cmap().ok().is_some_and(|cmap| {
+        "中文字体阅读书籍测试国家学习时间"
+            .chars()
+            .all(|ch| cmap.map_codepoint(ch).is_some())
+    });
+    Some((family, display, supports_chinese))
 }
 
 fn supports_common_chinese(charmap: &parley::fontique::Charmap<'_>) -> bool {
@@ -1248,6 +1401,7 @@ pub struct ReaderFontFamilies {
     pub other: Vec<String>,
     pub monospace: Vec<String>,
     pub chinese: Vec<String>,
+    pub latin: Vec<String>,
 }
 
 impl ReaderFontFamilies {
@@ -1431,6 +1585,28 @@ pub fn svg_font_database() -> Arc<resvg::usvg::fontdb::Database> {
     }).clone()
 }
 
+fn font_blob_family_overrides() -> &'static std::sync::RwLock<HashMap<u64, String>> {
+    static OVERRIDES: std::sync::OnceLock<std::sync::RwLock<HashMap<u64, String>>> =
+        std::sync::OnceLock::new();
+    OVERRIDES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Associates a font blob id with an explicit OpenType family name override so
+/// distinct font files that share an internal family name (e.g. Tsanger 04/05)
+/// can be registered and selected independently.
+pub fn register_font_blob_family_override(blob_id: u64, family_name: impl Into<String>) {
+    if let Ok(mut map) = font_blob_family_overrides().write() {
+        map.insert(blob_id, family_name.into());
+    }
+}
+
+fn font_blob_family_override(blob_id: u64) -> Option<String> {
+    font_blob_family_overrides()
+        .read()
+        .ok()
+        .and_then(|map| map.get(&blob_id).cloned())
+}
+
 impl LayoutEngine {
     pub fn new() -> Self {
         let _timing = timing::stage(timing::TimingStage::Fonts);
@@ -1464,7 +1640,17 @@ impl LayoutEngine {
         let _timing = timing::stage(timing::TimingStage::Fonts);
         let mut engine = Self::new();
         for font in fonts {
-            engine.font_context.collection.register_fonts(font, None);
+            let override_family = font_blob_family_override(font.id());
+            let info_override = override_family.as_deref().map(|name| {
+                parley::fontique::FontInfoOverride {
+                    family_name: Some(name),
+                    ..Default::default()
+                }
+            });
+            engine
+                .font_context
+                .collection
+                .register_fonts(font, info_override);
         }
         engine
     }
@@ -1526,10 +1712,51 @@ impl LayoutEngine {
     }
 
     pub fn available_reader_font_families(&mut self) -> ReaderFontFamilies {
+        self.available_reader_font_families_with_locale(false)
+    }
+
+    pub fn available_reader_font_families_with_locale(
+        &mut self,
+        prefer_cjk_names: bool,
+    ) -> ReaderFontFamilies {
         let _timing = timing::stage(timing::TimingStage::Fonts);
         let discovered = self.available_font_families();
-        let mut families = ReaderFontFamilies::default();
+        let has_cjk = |name: &str| {
+            let has_kana = name.chars().any(|c| ('\u{3040}'..='\u{30FF}').contains(&c));
+            !has_kana
+                && name.chars().any(|c| {
+                    ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
+                })
+        };
+        let mut deduped: Vec<String> = Vec::with_capacity(discovered.len());
+        let mut seen_sources: HashMap<_, usize> = HashMap::new();
         for family_name in &discovered {
+            let Some(font_info) = self
+                .font_context
+                .collection
+                .family_by_name(family_name)
+                .and_then(|family| family.default_font().cloned())
+            else {
+                continue;
+            };
+            let key = (font_info.source().id(), font_info.index());
+            if let Some(&existing_idx) = seen_sources.get(&key) {
+                let existing = deduped[existing_idx].as_str();
+                let replace = if prefer_cjk_names {
+                    has_cjk(family_name) && !has_cjk(existing)
+                } else {
+                    !has_cjk(family_name) && has_cjk(existing)
+                };
+                if replace {
+                    deduped[existing_idx] = family_name.clone();
+                }
+            } else {
+                seen_sources.insert(key, deduped.len());
+                deduped.push(family_name.clone());
+            }
+        }
+        let mut families = ReaderFontFamilies::default();
+        for family_name in &deduped {
             let font_info = self
                 .font_context
                 .collection
@@ -1559,15 +1786,25 @@ impl LayoutEngine {
             if has_embedded_bitmap_glyphs(&font) {
                 continue;
             }
+            let os2 = font.os2().ok();
+            let is_japanese_only = os2
+                .as_ref()
+                .and_then(|os2| os2.ul_code_page_range_1())
+                .is_some_and(|range| {
+                    let jis = (range & (1 << 17)) != 0;
+                    let chinese = (range & ((1 << 18) | (1 << 20))) != 0;
+                    jis && !chinese
+                });
+            let is_excluded_chinese_fallback = family_name.starts_with('.')
+                || family_name.eq_ignore_ascii_case("Arial Unicode MS");
             families.all.push(family_name.clone());
-            if supports_chinese {
+            if supports_chinese && !is_japanese_only && !is_excluded_chinese_fallback {
                 families.chinese.push(family_name.clone());
             }
             let fixed_pitch = font
                 .post()
                 .ok()
                 .is_some_and(|post| post.is_fixed_pitch() != 0);
-            let os2 = font.os2().ok();
             let panose = os2.as_ref().map(|os2| os2.panose_10());
             let family_class = os2.as_ref().map(|os2| os2.s_family_class());
             let mut classification = classify_reader_font(panose, family_class, fixed_pitch);
@@ -1585,6 +1822,49 @@ impl LayoutEngine {
                 && !is_symbolic_reader_font(family_name, panose, family_class)
             {
                 families.other.push(family_name.clone());
+            }
+            let is_non_latin_noto = (family_name.starts_with("Noto Sans ")
+                || family_name.starts_with("Noto Serif ")
+                || family_name.starts_with("Noto Naskh ")
+                || family_name.starts_with("Noto Nastaliq ")
+                || family_name.starts_with("Noto Kufi "))
+                && !matches!(
+                    family_name.as_str(),
+                    "Noto Sans Display" | "Noto Serif Display"
+                );
+            let is_decorative_or_script = panose
+                .is_some_and(|p| matches!(p.first(), Some(3..=5)))
+                || family_class
+                    .map(|v| v.to_be_bytes()[0])
+                    .is_some_and(|c| matches!(c, 10 | 12));
+            let is_non_latin_script_font = os2.as_ref().is_some_and(|os2| {
+                let cp_non_latin = os2.ul_code_page_range_1().is_some_and(|cp| {
+                    let has_latin1 = (cp & 1) != 0;
+                    let has_other = (cp & ((1 << 5) | (1 << 6) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21))) != 0;
+                    has_other && !has_latin1
+                });
+                // Armenian(10), Devanagari..Khmer/Tibetan(15..=28)
+                let ur1 = os2.ul_unicode_range_1();
+                let ur_non_latin = (ur1 & ((1 << 10) | 0x1FFF_8000)) != 0;
+                cp_non_latin || ur_non_latin
+            });
+            let supports_latin_ext = charmap
+                .as_ref()
+                .is_some_and(|cm| "ÉéÜü".chars().all(|c| cm.map(c).is_some()));
+            if !family_name.starts_with('.')
+                && supports_latin
+                && supports_latin_ext
+                && !supports_chinese
+                && !is_japanese_only
+                && !is_non_latin_script_font
+                && !is_decorative_or_script
+                && (classification.serif || classification.sans_serif)
+                && !classification.monospace
+                && !is_symbolic_reader_font(family_name, panose, family_class)
+                && !is_non_latin_noto
+                && !family_name.eq_ignore_ascii_case("Arial Unicode MS")
+            {
+                families.latin.push(family_name.clone());
             }
         }
         families
@@ -3983,6 +4263,19 @@ impl LayoutEngine {
         )));
         let default_brush = TextBrush::new(foreground, false, TextBaseline::Normal, 0, None);
         builder.push_default(StyleProperty::Brush(default_brush));
+
+        if font_stack == typography.default_stack_for(WritingSystem::Cjk) {
+            let western_ranges = western_font_ranges(text);
+            if !western_ranges.is_empty() {
+                let western_stack = typography.cjk_western_override_stack();
+                for range in western_ranges {
+                    builder.push(
+                        StyleProperty::FontFamily(FontFamily::from(western_stack.as_str())),
+                        range,
+                    );
+                }
+            }
+        }
 
         for span in spans {
             if let Some(ruby) = &span.ruby {
@@ -9817,6 +10110,11 @@ mod tests {
         assert!(
             typography
                 .default_stack_for(WritingSystem::Cjk)
+                .starts_with("\"CJK Primary\", \"CJK Western\"")
+        );
+        assert!(
+            typography
+                .cjk_western_override_stack()
                 .starts_with("\"CJK Western\", \"CJK Primary\"")
         );
         assert!(
@@ -9828,6 +10126,17 @@ mod tests {
             typography.default_stack_for(WritingSystem::Unknown),
             typography.default_stack_for(WritingSystem::Latin)
         );
+    }
+
+    #[test]
+    fn western_font_ranges_isolate_latin_digits_currency_and_math_from_cjk() {
+        assert!(western_font_ranges("今天天气真好，“我们去散步吧”——好！").is_empty());
+        let text = "第 2026 年，New York 的价格是 €12.50 ± 5%。";
+        let slices: Vec<&str> = western_font_ranges(text)
+            .into_iter()
+            .map(|r| &text[r])
+            .collect();
+        assert_eq!(slices, vec!["2026", "New York", "€12.50 ± 5%"]);
     }
 
     #[test]

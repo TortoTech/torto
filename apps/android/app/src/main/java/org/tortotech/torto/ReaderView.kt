@@ -42,8 +42,19 @@ class ReaderView(context: Context) : View(context) {
     var onSelect: ((Float, Float, Float, Float) -> Unit)? = null
     var onScroll: ((Float) -> Unit)? = null
     var onSentenceGesture: ((Boolean,String) -> Unit)? = null
+    var onFocusHighlightGesture: ((Boolean) -> Unit)? = null
+    var onFocusNoteGesture: ((Boolean) -> Unit)? = null
+    var onFocusChatGesture: (() -> Unit)? = null
     private var pinchConsuming=false
     private var pinchEligible=false
+    private var focusMultiEligible=false
+    private var multiMaxPointers=0
+    private var multiStartX=0f
+    private var multiStartY=0f
+    private var multiEndX=0f
+    private var multiEndY=0f
+    private var multiStartTime=0L
+    private var multiMoved=false
     private var pinchSource:String?=null
     private var pinchStart=0f
     private var pinchSpan=0f
@@ -512,12 +523,23 @@ class ReaderView(context: Context) : View(context) {
     }
     override fun onTouchEvent(event:MotionEvent):Boolean {
         if(event.actionMasked==MotionEvent.ACTION_POINTER_DOWN||pinchConsuming){
+            fun centroid(e:MotionEvent):Pair<Float,Float> {
+                val n=e.pointerCount.coerceAtLeast(1)
+                var sx=0f;var sy=0f
+                for(i in 0 until n){sx+=e.getX(i);sy+=e.getY(i)}
+                return (sx/n) to (sy/n)
+            }
             if(!pinchConsuming){
                 val control=frame?.info?.controls?.find {it.kind=="sentences"}
-                val eligible=event.pointerCount==2&&isEnabled&&!navigationPending&&!draggingHandle&&!selecting&&frame?.info?.isScroll==true&&control!=null
+                val focusOk=isEnabled&&!navigationPending&&!draggingHandle&&!selecting&&frame?.info?.isScroll==true
+                val eligible=event.pointerCount==2&&focusOk&&control!=null
                 val source=control?.source
                 pinchStart=if(event.pointerCount==2)hypot(event.getX(0)-event.getX(1),event.getY(0)-event.getY(1))else 0f
                 pinchSpan=pinchStart
+                val (cx,cy)=centroid(event)
+                multiMaxPointers=event.pointerCount
+                multiStartX=cx;multiStartY=cy;multiEndX=cx;multiEndY=cy
+                multiStartTime=event.eventTime;multiMoved=false
                 val cancel=MotionEvent.obtain(event);cancel.action=MotionEvent.ACTION_CANCEL;gestures.onTouchEvent(cancel);cancel.recycle()
                 if(draggingHandle)onHandleEnd?.invoke()
                 removeCallbacks(edgeScroll);finishContentTransition();cancelAnimation()
@@ -526,18 +548,44 @@ class ReaderView(context: Context) : View(context) {
                 queuedFocusRelease=false;queuedFocusTurn=null;queuedUnitTurn=null
                 setPosition(frame?.info?.scrollDistance ?: 0.0)
                 velocity?.recycle();velocity=null
-                pinchConsuming=true;pinchEligible=eligible;pinchSource=source
-                if(pinchEligible)onReadingGesture?.invoke()
+                pinchConsuming=true;pinchEligible=eligible;focusMultiEligible=focusOk;pinchSource=source
+                if(focusMultiEligible)onReadingGesture?.invoke()
                 parent?.requestDisallowInterceptTouchEvent(true);reportMotion()
+            }
+            if(event.pointerCount>multiMaxPointers){
+                multiMaxPointers=event.pointerCount
+                val (cx,cy)=centroid(event)
+                multiStartX=cx;multiStartY=cy;multiEndX=cx;multiEndY=cy
             }
             if(event.pointerCount>2)pinchEligible=false
             if(event.pointerCount==2)pinchSpan=hypot(event.getX(0)-event.getX(1),event.getY(0)-event.getY(1))
+            if(event.pointerCount==multiMaxPointers&&event.actionMasked==MotionEvent.ACTION_MOVE){
+                val (cx,cy)=centroid(event)
+                multiEndX=cx;multiEndY=cy
+                if(hypot(cx-multiStartX,cy-multiStartY)>=touchSlop)multiMoved=true
+            }
             if(event.actionMasked==MotionEvent.ACTION_UP||event.actionMasked==MotionEvent.ACTION_CANCEL){
                 val ratio=if(pinchStart>0f)pinchSpan/pinchStart else 1f
-                val commit=event.actionMasked==MotionEvent.ACTION_UP&&pinchEligible&&pinchStart>=touchSlop*4&&abs(pinchSpan-pinchStart)>=touchSlop*2
-                pinchConsuming=false;pinchEligible=false
-                if(commit&&(ratio>=1.18f||ratio<=.82f))pinchSource?.let {onSentenceGesture?.invoke(ratio>1f,it)}
-                pinchSource=null;parent?.requestDisallowInterceptTouchEvent(false);reportMotion();invalidate()
+                val pinchCommit=event.actionMasked==MotionEvent.ACTION_UP&&pinchEligible&&pinchStart>=touchSlop*4&&abs(pinchSpan-pinchStart)>=touchSlop*2&&(ratio>=1.18f||ratio<=.82f)
+                val dx=multiEndX-multiStartX
+                val dy=multiEndY-multiStartY
+                val dist=hypot(dx,dy)
+                val isUp=event.actionMasked==MotionEvent.ACTION_UP&&focusMultiEligible
+                val maxP=multiMaxPointers
+                val tapOk=isUp&&maxP==2&&!multiMoved&&(event.eventTime-multiStartTime)<=350L
+                val src=pinchSource
+                pinchConsuming=false;pinchEligible=false;focusMultiEligible=false;pinchSource=null
+                if(pinchCommit){
+                    src?.let {onSentenceGesture?.invoke(ratio>1f,it)}
+                } else if(tapOk){
+                    onFocusChatGesture?.invoke()
+                } else if(isUp&&maxP==2&&dist>=touchSlop*3){
+                    if(abs(dx)>abs(dy)*1.2f)onFocusHighlightGesture?.invoke(dx>0f)
+                    else if(abs(dy)>abs(dx)*1.2f)src?.let {onSentenceGesture?.invoke(dy>0f,it)}
+                } else if(isUp&&maxP==3&&abs(dx)>=touchSlop*3&&abs(dx)>abs(dy)*1.2f){
+                    onFocusNoteGesture?.invoke(dx>0f)
+                }
+                parent?.requestDisallowInterceptTouchEvent(false);reportMotion();invalidate()
             }
             return true
         }

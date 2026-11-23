@@ -14,6 +14,7 @@ struct ReaderScreen: View {
     @AppStorage("reader.fontSize") private var fontSize = 20
     @AppStorage("reader.focus") private var preferFocus = false
     @AppStorage("reader.unified") private var unified = false
+    @AppStorage("interface.theme") private var interfaceTheme = "system"
     @AppStorage("reader.theme") private var theme = "system"
     @AppStorage("reader.brightness") private var savedBrightness = -1.0
     @State private var brightness = 0.5
@@ -53,7 +54,11 @@ struct ReaderScreen: View {
         _model = StateObject(wrappedValue: ReaderModel(core: core, book: book))
     }
 
-    private var dark: Bool { theme == "dark" || (theme == "system" && colorScheme == .dark) }
+    private var dark: Bool {
+        if theme == "dark" { return true }
+        if theme == "light" { return false }
+        return interfaceTheme == "dark" || (interfaceTheme == "system" && colorScheme == .dark)
+    }
     private var immersive: Bool { model.frame?.info.isScroll ?? preferFocus }
     private var hideStatusBar: Bool {
         (model.preview?.isImage == true && model.preview?.isFormula != true) || immersive && !model.showingChrome && panel == nil && model.previewedNote == nil && !model.finished && !assistant && !feedback
@@ -74,7 +79,11 @@ struct ReaderScreen: View {
                             ReadingCanvas(frame: frame, selection: model.selection,
                                           enabled: !model.working && !model.finished && panel == nil && model.preview?.document == nil && !leaving,
                                           turn: model.turn, activate: model.activate, select: model.select,
-                                          splitSentences: model.setSentenceSplit, moving: { moving = $0 },
+                                          splitSentences: model.setSentenceSplit,
+                                          focusHighlight: model.focusHighlightGesture,
+                                          focusNote: { add in model.focusNoteGesture(add) { panel = .compose } },
+                                          focusChat: { assistant = true },
+                                          moving: { moving = $0 },
                                           turnMotion: model.turnMotion, turnPending: model.turnPending, neighbours: model.neighbours,
                                           beginHandle: model.beginHandle, moveHandle: model.moveHandle)
                             .opacity(firstFrameVisible ? 1 : 0)

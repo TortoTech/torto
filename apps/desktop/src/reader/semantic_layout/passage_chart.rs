@@ -22,7 +22,7 @@ impl Drop for PendingPassageChart {
 impl DesktopReader {
     pub(in crate::reader) fn queue_passage_chart(&mut self, index: usize, source: SourceRange) {
         if self.semantic_layout.passage_chart.is_some()
-            || self.plugin_settings.semantic_layout_endpoint().is_err()
+            || self.plugin_settings.semantic_layout_image_endpoint().is_none()
         {
             return;
         }

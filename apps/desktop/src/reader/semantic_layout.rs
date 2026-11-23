@@ -70,6 +70,8 @@ pub(super) struct SemanticLayoutState {
     semantic_config: Option<(
         crate::plugins::semantic_layout::SemanticLayoutSettings,
         Option<crate::plugins::AiProvider>,
+        Option<crate::plugins::AiProvider>,
+        crate::plugins::semantic_layout::LayoutModelProtocol,
         String,
     )>,
     translation_config: Option<(
@@ -337,6 +339,11 @@ impl DesktopReader {
         let semantic = (
             self.plugin_settings.semantic_layout.clone(),
             provider(&self.plugin_settings.semantic_layout.provider).cloned(),
+            provider(&self.plugin_settings.semantic_layout.image_provider).cloned(),
+            self.plugin_settings.semantic_layout_endpoint().map_or(
+                crate::plugins::semantic_layout::LayoutModelProtocol::Unconfirmed,
+                |(provider, model)| crate::plugins::semantic_layout::layout_model_protocol(provider, model),
+            ),
             self.plugin_settings.resolved_target_language(
                 crate::preferences::AppLanguage::system_translation_target(),
             ),

@@ -47,8 +47,8 @@ struct MobileSettings: View {
                 }
             case .theme:
                 InterfaceOptions(value: $theme, fallback: scheme == .dark ? "dark" : "light",
-                                 description: mobileText("开启后，将跟随系统打开或关闭深色模式", "When enabled, dark mode follows your system settings"),
-                                 choices: [MobileChoice("light", mobileText("浅色", "Light")), MobileChoice("dark", mobileText("深色", "Dark"))])
+                                 description: mobileText("开启后，将跟随系统切换界面主题", "When enabled, interface theme follows your system settings"),
+                                 choices: [MobileChoice("light", mobileText("浅色主题", "Light theme")), MobileChoice("dark", mobileText("深色主题", "Dark theme"))])
             case .language:
                 InterfaceOptions(value: $language, fallback: (Locale.preferredLanguages.first ?? "en").hasPrefix("zh") ? "zh-CN" : "en",
                                  description: mobileText("开启后，将跟随系统设置界面语言", "When enabled, the interface language follows your system settings"),
@@ -91,8 +91,8 @@ struct MobileSettings: View {
 
     private var themeLabel: String {
         switch theme {
-        case "dark": mobileText("已开启", "On")
-        case "light": mobileText("未开启", "Off")
+        case "dark": mobileText("深色主题", "Dark theme")
+        case "light": mobileText("浅色主题", "Light theme")
         default: mobileText("跟随系统", "Follow system")
         }
     }
@@ -108,7 +108,7 @@ struct MobileSettings: View {
     private func title(_ route: Route?) -> String {
         switch route {
         case nil: mobileText("设置", "Settings")
-        case .theme: mobileText("深色模式", "Dark mode")
+        case .theme: mobileText("界面主题", "Interface theme")
         case .language: mobileText("界面语言", "Interface language")
         case .typography: mobileText("排版", "Typesetting")
         case .providers: mobileText("AI 提供商", "AI providers")
@@ -253,6 +253,9 @@ enum MobileFontField: String, CaseIterable, Identifiable {
         default: title
         }
     }
+    private func displayName(_ family: String) -> String {
+        family == "LXGW WenKai GB Screen" ? "霞鹜文楷" : family
+    }
     func choices(_ fonts: FontFamilies) -> [MobileChoice] {
         let values: [String]
         let automatic: String?
@@ -263,7 +266,7 @@ enum MobileFontField: String, CaseIterable, Identifiable {
         case .latinCjk: values = fonts.cjk; automatic = mobileText("跟随中日韩主要字体", "Use CJK primary font")
         case .code: values = fonts.monospace; automatic = nil
         }
-        return (automatic.map { [MobileChoice("", $0)] } ?? []) + values.map { MobileChoice($0, $0) }
+        return (automatic.map { [MobileChoice("", $0)] } ?? []) + values.map { MobileChoice($0, displayName($0)) }
     }
 }
 

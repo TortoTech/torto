@@ -20,6 +20,7 @@ pub(crate) enum UserEvent {
     CloudResumeAccepted {account:String,offer:Option<rebook_app_core::sync::ResumeOffer>},
     CloudResume {account:String,offer:Option<rebook_app_core::sync::ResumeOffer>},
     Fonts(crate::fonts::Message),
+    CustomFontsImported(crate::fonts::CustomImportMessage),
     Feedback(crate::feedback::Message),
     RepaintAfter(std::time::Duration),
     EguiRepaint {

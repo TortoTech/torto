@@ -1,4 +1,5 @@
 //! Shared list boundaries for focus navigation and semantic footnote numbering.
+use super::semantic_paragraphs::{FocusGroupScope, focus_introduction};
 use rebook_publication::{Block, Inline, TextBlockKind};
 use std::ops::Range;
 
@@ -73,6 +74,23 @@ pub fn semantic_list_groups(blocks: &[&Block]) -> Vec<Range<usize>> {
         index = end;
     }
     result
+}
+
+pub(super) fn focus_scope(blocks: &[&Block], mut range: Range<usize>) -> FocusGroupScope {
+    let original_start = range.start;
+    if matches!(blocks[original_start], Block::Text(t)
+        if matches!(t.kind, TextBlockKind::ListItem { .. }))
+        && let Some(intro) = focus_introduction(blocks, original_start, true)
+    {
+        range.start = intro;
+    }
+    // A separately numbered introduction can share the card, while split
+    // steps keep the note labels that appear in their own text.
+    let share_notes_when_split = range.start == original_start;
+    FocusGroupScope {
+        range,
+        share_notes_when_split,
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,13 @@ use egui::{Sense, Stroke, Vec2};
 
 pub(crate) const HEIGHT: f32 = 44.0;
 #[cfg(target_os = "windows")]
-const BUTTON_WIDTH: f32 = 46.0;
+const BUTTON_SIZE: f32 = 32.0;
+#[cfg(target_os = "windows")]
+const BUTTON_SPACING: f32 = 4.0;
+#[cfg(target_os = "windows")]
+const RIGHT_PADDING: f32 = 12.0;
+#[cfg(target_os = "windows")]
+const CONTROLS_WIDTH: f32 = BUTTON_SIZE * 3.0 + BUTTON_SPACING * 2.0 + RIGHT_PADDING;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct WindowState {
@@ -91,7 +97,7 @@ pub(crate) fn reserve_width(ctx: &egui::Context) -> f32 {
     #[cfg(target_os = "macos")]
     { let _ = ctx; 0.0 }
     #[cfg(target_os = "windows")]
-    { if state(ctx).fullscreen { 0.0 } else { BUTTON_WIDTH * 3.0 } }
+    { if state(ctx).fullscreen { 0.0 } else { CONTROLS_WIDTH } }
 }
 pub(crate) fn header(ctx: &egui::Context, rect: Rect) {
     let drag_enabled = !state(ctx).fullscreen;
@@ -192,49 +198,50 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
             Vec2::new(ctx.content_rect().width(), HEIGHT),
         )
     });
-    let origin = Pos2::new(rect.right() - BUTTON_WIDTH * 3.0, rect.top());
+    let origin = Pos2::new(rect.right() - CONTROLS_WIDTH, rect.top());
     let layer = controls_layer();
     egui::Area::new(layer.id)
         .fade_in(false)
         .order(layer.order)
         .fixed_pos(origin)
         .constrain(false)
-        .default_size(Vec2::new(BUTTON_WIDTH * 3.0, rect.height()))
+        .default_size(Vec2::new(CONTROLS_WIDTH, rect.height()))
         .show(ctx, |ui| {
             ui.painter().rect_filled(
-                Rect::from_min_size(origin, Vec2::new(BUTTON_WIDTH * 3.0, rect.height())),
+                Rect::from_min_size(origin, Vec2::new(CONTROLS_WIDTH, rect.height())),
                 0.0,
                 geometry(ctx)
                     .background
                     .unwrap_or(crate::ui::palette().background),
             );
-            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let vertical_pad = ((rect.height() - BUTTON_SIZE) * 0.5).max(0.0);
+            ui.add_space(vertical_pad);
+            ui.spacing_mut().item_spacing = Vec2::new(BUTTON_SPACING, 0.0);
             ui.horizontal(|ui| {
                 for index in 0..3 {
-                    let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(BUTTON_WIDTH, rect.height()),
+                    let (btn_rect, response) = ui.allocate_exact_size(
+                        Vec2::splat(BUTTON_SIZE),
                         Sense::click(),
                     );
-                    exclude(ctx, rect);
+                    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    exclude(ctx, btn_rect);
                     ctx.data_mut(|data| {
                         data.get_temp_mut_or_default::<Geometry>(geometry_id())
-                            .buttons[index] = Some(rect);
+                            .buttons[index] = Some(btn_rect);
                     });
                     let hovered = response.hovered() || (state.hovered_button == Some(index));
                     let pressed = response.is_pointer_button_down_on()
                         || (state.pressed_button == Some(index));
                     if hovered || pressed {
                         ui.painter().rect_filled(
-                            rect,
-                            0.0,
+                            btn_rect,
+                            6.0,
                             if index == 2 {
                                 Color32::from_rgb(196, 43, 28)
+                            } else if pressed {
+                                ui.visuals().widgets.active.weak_bg_fill
                             } else {
-                                crate::ui::palette().text.gamma_multiply(if pressed {
-                                    0.18
-                                } else {
-                                    0.09
-                                })
+                                ui.visuals().widgets.hovered.weak_bg_fill
                             },
                         );
                     }
@@ -243,53 +250,18 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
                     } else {
                         crate::ui::palette().text
                     };
-                    let stroke = Stroke::new(1.0, color);
-                    let center = rect.center();
-                    match index {
-                        0 => {
-                            ui.painter().line_segment(
-                                [center - Vec2::new(5.0, 0.0), center + Vec2::new(5.0, 0.0)],
-                                stroke,
-                            );
-                        }
-                        1 if state.maximized => {
-                            let back = Rect::from_center_size(
-                                center + Vec2::new(1.5, -1.5),
-                                Vec2::splat(8.0),
-                            );
-                            ui.painter()
-                                .line_segment([back.left_top(), back.right_top()], stroke);
-                            ui.painter()
-                                .line_segment([back.right_top(), back.right_bottom()], stroke);
-                            ui.painter().rect_stroke(
-                                Rect::from_center_size(
-                                    center + Vec2::new(-1.0, 1.0),
-                                    Vec2::splat(8.0),
-                                ),
-                                0.0,
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        1 => {
-                            ui.painter().rect_stroke(
-                                Rect::from_center_size(center, Vec2::splat(10.0)),
-                                0.0,
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        _ => {
-                            ui.painter().line_segment(
-                                [center - Vec2::splat(5.0), center + Vec2::splat(5.0)],
-                                stroke,
-                            );
-                            ui.painter().line_segment(
-                                [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
-                                stroke,
-                            );
-                        }
-                    }
+                    let glyph = match index {
+                        0 => crate::ui::Icon::Minus,
+                        1 if state.maximized => crate::ui::Icon::Minimize2,
+                        1 => crate::ui::Icon::Maximize2,
+                        _ => crate::ui::Icon::X,
+                    };
+                    crate::ui::paint_icon(
+                        ui,
+                        Rect::from_center_size(btn_rect.center(), Vec2::splat(18.0)),
+                        glyph,
+                        color,
+                    );
                     if response.clicked() {
                         match index {
                             0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
@@ -306,7 +278,7 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
             let dim = geometry(ctx).overlay_dim;
             if dim > 0.0 {
                 ui.painter().rect_filled(
-                    Rect::from_min_size(origin, Vec2::new(BUTTON_WIDTH * 3.0, rect.height())),
+                    Rect::from_min_size(origin, Vec2::new(CONTROLS_WIDTH, rect.height())),
                     0.0,
                     Color32::BLACK.gamma_multiply(dim),
                 );
@@ -496,7 +468,7 @@ mod tests {
     #[test]
     fn fullscreen_releases_buttons_and_disables_caption_dragging() {
         let ctx = egui::Context::default();
-        assert_eq!(reserve_width(&ctx), 138.0);
+        assert_eq!(reserve_width(&ctx), CONTROLS_WIDTH);
         set_state(
             &ctx,
             WindowState {

@@ -79,14 +79,14 @@ class AiSettingsAutosaveTest {
                 val state by model!!.state.collectAsState()
                 TortoTheme(state){ChoicePageHost {Surface(Modifier.fillMaxSize()){if(show.value)AiRoleSettings(state,model!!,section.value)}}}
             }}
-            await("layout controls render"){label("Layout model")!=null}
+            await("layout controls render"){label("Layout classification model")!=null}
             screenshot("settings-layout-grouped.png")
             assertNull("Layout changes have no save button",label("Save"))
             assertNull(label("Manage providers and models"))
             click(node {it.isClickable&&it.isCheckable})
             clickLabel("Reasoning effort");clickLabel("Low")
-            clickLabel("Layout model")
-            await("model selection is a searchable page"){node {it.paneTitle?.toString()=="Layout model"}!=null&&node {it.isEditable}!=null}
+            clickLabel("Layout classification model")
+            await("model selection is a searchable page"){node {it.paneTitle?.toString()=="Layout classification model"}!=null&&node {it.isEditable}!=null}
             assertNull("The parent cannot be focused while choosing",label("AI layout"))
             assertEquals("Opening a child page does not commit its parent","model-a",core.aiOptions().layoutModel)
             assertTrue(node {it.isEditable}!!.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,Bundle().apply {putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,"model-b")}))
@@ -134,7 +134,7 @@ class AiSettingsAutosaveTest {
             assertNull(model!!.state.value.error)
         }finally {
             instrumentation.runOnMainSync {show.value=false}
-            await("role contents dispose"){label("Layout model")==null&&label("Translation model")==null&&label("Chat model")==null}
+            await("role contents dispose"){label("Layout classification model")==null&&label("Translation model")==null&&label("Chat model")==null}
             if(model!=null){
                 instrumentation.runOnMainSync {model!!.saveAiOptions(original);previous?.let {model!!.interfaceSettings(it.appTheme,it.language)}}
                 await("original settings restore"){!model!!.state.value.busy&&model!!.state.value.aiOptions==original&&(previous==null||model!!.state.value.appTheme==previous!!.appTheme&&model!!.state.value.language==previous!!.language)}

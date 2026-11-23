@@ -26,8 +26,8 @@ impl DesktopApp {
         let mut retry = false;
         let message = if ready {
             language.text(
-                "新字体已下载完成",
-                "New fonts downloaded",
+                "默认字体下载完成",
+                "Default fonts downloaded",
             )
         } else {
             language.text("此 PDF 缺少可用字体，部分文字可能显示不全。默认字体就绪后可应用修复", "This PDF needs a missing font. Apply the default fonts when ready to restore its text")

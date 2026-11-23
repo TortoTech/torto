@@ -97,21 +97,80 @@ import org.tortotech.torto.core.*
     val selectedModel=when{layout->draft.layoutModel;translation->draft.translationModel;else->draft.chatModel}
     val reasoning=when{layout->draft.layoutReasoning;translation->draft.translationReasoning;else->draft.chatReasoning}
     val selected=state.providers.firstOrNull {it.id==provider}
+    var layoutProtocol by remember(provider, selectedModel, selected?.baseUrl) { mutableStateOf("") }
+    val isDecision = layoutProtocol == "decision" || (selected != null &&
+        isLayoutDecisionModel(selected.baseUrl, selectedModel))
+    LaunchedEffect(layout, provider, selectedModel, selected?.baseUrl) {
+        if (layout && selectedModel.isNotBlank() && selected != null) {
+            layoutProtocol = try {
+                model.probeLayoutModel(provider, selectedModel)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                "unconfirmed"
+            }
+        }
+    }
+    LaunchedEffect(layout, layoutProtocol, provider, selectedModel) {
+        if (layout && layoutProtocol == "chat" && draft.imageModel.isEmpty()) {
+            changeOptions {
+                it.copy(imageProvider = provider, imageModel = selectedModel,
+                    imageReasoning = it.layoutReasoning)
+            }
+        }
+    }
     val levels=remember(selected?.kind,selectedModel){runCatching{aiReasoningLevels(selected?.kind ?: "custom",selectedModel)}.getOrDefault(listOf("default","none","low","medium","high"))}
     val levelNames=mapOf("default" to tr("模型默认","Model default"),"none" to tr("不思考","None"),"minimal" to tr("最小","Minimal"),"low" to tr("低","Low"),"medium" to tr("中","Medium"),"high" to tr("高","High"),"max" to tr("最高","Maximum"))
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp).imePadding().navigationBarsPadding(),verticalArrangement=Arrangement.spacedBy(12.dp)){
         if(layout)SettingsGroup {SettingToggle(tr("AI 排版","AI layout"),draft.layoutEnabled,!state.busy){enabled->changeOptions {it.copy(layoutEnabled=enabled)}}}
         SettingsGroup {
         SettingChoice(tr("提供商","Provider"),provider,state.providers.map {it.id to it.name},!state.busy){id->val first=state.providers.firstOrNull {it.id==id}?.models?.firstOrNull().orEmpty();changeOptions {value->when{layout->value.copy(layoutProvider=id,layoutModel=first);translation->value.copy(translationProvider=id,translationModel=first);else->value.copy(chatProvider=id,chatModel=first)}}}
-        SettingChoice(if(layout)tr("排版模型","Layout model")else if(translation)tr("翻译模型","Translation model")else tr("对话模型","Chat model"),selectedModel,selected?.models.orEmpty().map {it to it},!state.busy,searchable=true){id->changeOptions {value->when{layout->value.copy(layoutModel=id);translation->value.copy(translationModel=id);else->value.copy(chatModel=id)}}}
-        SettingChoice(tr("思考等级","Reasoning effort"),reasoning,levels.map {it to(levelNames[it] ?: it)},!state.busy){effort->changeOptions {value->when{layout->value.copy(layoutReasoning=effort);translation->value.copy(translationReasoning=effort);else->value.copy(chatReasoning=effort)}}}
-        if (layout && draft.layoutEnabled && selected?.citationDecisionsAvailable == true) {
-            SettingToggle(tr("文献引用预判（试验）","Citation screening (experimental)"),draft.layoutCitationDecisions,!state.busy){enabled->
-                changeOptions {it.copy(layoutCitationDecisions=enabled)}
+        SettingChoice(if(layout)tr("排版分类模型","Layout classification model")else if(translation)tr("翻译模型","Translation model")else tr("对话模型","Chat model"),selectedModel,selected?.models.orEmpty().map {it to it},!state.busy,searchable=true){id->changeOptions {value->when{layout->value.copy(layoutModel=id);translation->value.copy(translationModel=id);else->value.copy(chatModel=id)}}}
+        if (!layout || !isDecision) {
+            SettingChoice(tr("思考等级","Reasoning effort"),reasoning,levels.map {it to(levelNames[it] ?: it)},!state.busy){effort->changeOptions {value->when{layout->value.copy(layoutReasoning=effort);translation->value.copy(translationReasoning=effort);else->value.copy(chatReasoning=effort)}}}
+        }
+        }
+        if (layout && selectedModel.isNotBlank()) {
+            SettingsNote(when (if (isDecision) "decision" else layoutProtocol) {
+                "decision" -> tr("决策模型", "Decision model")
+                "chat" -> tr("常规 LLM", "LLM")
+                "unconfirmed" -> tr("模型类型未确认", "Model type unconfirmed")
+                else -> tr("正在确认模型类型", "Checking model type")
+            })
+        }
+        if (layout) {
+            val imageProvider = state.providers.firstOrNull { it.id == draft.imageProvider }
+            val imageModels = imageProvider?.let { candidate ->
+                candidate.models.filterNot { isLayoutDecisionModel(candidate.baseUrl, it) }
+            }.orEmpty()
+            val imageLevels = remember(imageProvider?.kind, draft.imageModel) {
+                runCatching { aiReasoningLevels(imageProvider?.kind ?: "custom", draft.imageModel) }
+                    .getOrDefault(listOf("default", "none", "low", "medium", "high"))
+            }
+            SettingsGroup {
+                SettingChoice(tr("排版生成提供商", "Layout generation provider"), draft.imageProvider,
+                    state.providers.map { it.id to it.name },
+                    !state.busy
+                ) { id ->
+                    val first = state.providers.firstOrNull { it.id == id }?.let { candidate ->
+                        candidate.models.firstOrNull { !isLayoutDecisionModel(candidate.baseUrl, it) }
+                    }.orEmpty()
+                    changeOptions { it.copy(imageProvider = id, imageModel = first) }
+                }
+                if (imageProvider != null) {
+                    SettingChoice(tr("排版生成模型", "Layout generation model"), draft.imageModel,
+                        imageModels.map { it to it }, !state.busy, searchable = true
+                    ) { id -> changeOptions { it.copy(imageModel = id) } }
+                    if (draft.imageModel.isNotEmpty()) {
+                        SettingChoice(tr("生成模型思考等级", "Generation reasoning effort"),
+                            draft.imageReasoning, imageLevels.map { it to (levelNames[it] ?: it) },
+                            !state.busy
+                        ) { effort -> changeOptions { it.copy(imageReasoning = effort) } }
+                    }
+                }
             }
         }
-        }
-        SettingsNote(if(layout)tr("使用能识图、速度快的模型（gemini/deepseek/qwen的flash系列）\n思考等级设置“不思考”","Use a fast model with vision\nReasoning effort: none")else if(translation)tr("使用文字能力强、速度快模型（gemini的flash系列）\n思考等级设置“低”或“不思考”","Use a fast model with strong language abilities\nReasoning effort: low or none")else tr("使用能识图的模型","Use a model with vision"))
+        SettingsNote(if(layout)tr("图片识别使用能识图的模型。","Use a vision model for image recognition.")else if(translation)tr("使用文字能力强、速度快模型（gemini的flash系列）\n思考等级设置“低”或“不思考”","Use a fast language model with low or no reasoning.")else tr("使用能识图的模型","Use a model with vision"))
         if(translation){
             SettingsGroup {
             val target=if(customTarget)"custom"else draft.targetLanguage
@@ -122,7 +181,6 @@ import org.tortotech.torto.core.*
             }
             if(customTarget)OutlinedTextField(customLanguage,{customLanguage=it.take(128);targetEdited=true},label={Text(tr("自定义语言","Custom language"))},singleLine=true,modifier=Modifier.fillMaxWidth().padding(horizontal=16.dp,vertical=8.dp))
             SettingToggle(tr("显示原文","Show original text"),draft.showOriginal,!state.busy){enabled->changeOptions {it.copy(showOriginal=enabled)}}
-            SettingToggle(tr("翻译目录","Translate contents"),draft.translateToc,!state.busy){enabled->changeOptions {it.copy(translateToc=enabled)}}
             SettingToggle(tr("专家翻译","Expert translation"),draft.expertTranslation,!state.busy){enabled->changeOptions {it.copy(expertTranslation=enabled)}}
             }
         }
@@ -136,7 +194,9 @@ internal fun mergeAiRoleDraft(latest:AiOptions,original:AiOptions,edited:AiOptio
         layoutProvider=if(edited.layoutProvider!=original.layoutProvider)edited.layoutProvider else latest.layoutProvider,
         layoutModel=if(edited.layoutModel!=original.layoutModel)edited.layoutModel else latest.layoutModel,
         layoutReasoning=if(edited.layoutReasoning!=original.layoutReasoning)edited.layoutReasoning else latest.layoutReasoning,
-        layoutCitationDecisions=if(edited.layoutCitationDecisions!=original.layoutCitationDecisions)edited.layoutCitationDecisions else latest.layoutCitationDecisions,
+        imageProvider=if(edited.imageProvider!=original.imageProvider)edited.imageProvider else latest.imageProvider,
+        imageModel=if(edited.imageModel!=original.imageModel)edited.imageModel else latest.imageModel,
+        imageReasoning=if(edited.imageReasoning!=original.imageReasoning)edited.imageReasoning else latest.imageReasoning,
     )
     "translation"->latest.copy(
         translationProvider=if(edited.translationProvider!=original.translationProvider)edited.translationProvider else latest.translationProvider,

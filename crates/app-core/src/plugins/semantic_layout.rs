@@ -55,7 +55,9 @@ pub struct SemanticLayoutSettings {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: ReasoningEffort,
-    pub citation_decisions: bool,
+    pub image_provider: String,
+    pub image_model: String,
+    pub image_reasoning_effort: ReasoningEffort,
 }
 
 impl Default for SemanticLayoutSettings {
@@ -65,13 +67,47 @@ impl Default for SemanticLayoutSettings {
             provider: String::new(),
             model: String::new(),
             reasoning_effort: ReasoningEffort::None,
-            citation_decisions: false,
+            image_provider: String::new(),
+            image_model: String::new(),
+            image_reasoning_effort: ReasoningEffort::None,
         }
     }
 }
 
-pub fn supports_citation_decisions(provider: &super::AiProvider) -> bool {
-    decisions::endpoint(provider).is_some()
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutModelProtocol {
+    Chat,
+    Decision,
+    Unconfirmed,
+}
+
+impl LayoutModelProtocol {
+    fn as_cache_value(&self) -> Option<&Self> {
+        (*self != Self::Unconfirmed).then_some(self)
+    }
+}
+
+pub fn layout_model_protocol(provider: &super::AiProvider, model: &str) -> LayoutModelProtocol {
+    decisions::model_protocol(provider, model)
+}
+
+pub async fn probe_layout_model(provider: &super::AiProvider, model: &str) -> LayoutModelProtocol {
+    decisions::probe_model(provider, model).await
+}
+
+pub(super) fn restore_layout_model_protocol(settings: &PluginSettings) {
+    let layout = &settings.semantic_layout;
+    for (id, model) in [
+        (&layout.provider, &layout.model),
+        (&layout.image_provider, &layout.image_model),
+    ] {
+        if !model.is_empty()
+            && let Some(provider) = settings.providers.iter().find(|p| p.id == *id)
+        {
+            decisions::restore_protocol(provider, model);
+        }
+    }
 }
 
 // Internal request roles, not user settings. Headings come only from the publication parser.
@@ -1179,13 +1215,13 @@ fn recognition_identity(book_id: &str, settings: &PluginSettings) -> Option<Valu
         true,
         true
     ]);
-    if config.citation_decisions
-        && let Some(endpoint) = decisions::endpoint(provider)
-    {
+    if let Some(endpoint) = decisions::selected_endpoint(provider, model) {
         identity.as_array_mut()?.push(endpoint.identity());
-    }
-    if let Some(endpoint) = decisions::figure_endpoint(provider) {
         identity.as_array_mut()?.push(endpoint.figure_identity());
+    }
+    if !config.image_model.is_empty() {
+        identity.as_array_mut()?.push(json!(settings.semantic_layout_image_endpoint()
+            .map(|(provider, model, effort)| json!([provider.id, provider.base_url, model, effort]))));
     }
     Some(identity)
 }
@@ -1535,7 +1571,7 @@ async fn recognize_inner(
     target: Option<std::ops::Range<usize>>,
     include_enhancements: bool,
 ) -> Result<Recognition, String> {
-    let (provider, model) = settings.semantic_layout_endpoint()?;
+    let image_endpoint = settings.semantic_layout_image_endpoint();
     let fingerprint = fingerprint(section);
     let mut identity = recognition_identity(book_id, settings);
     if !include_enhancements {
@@ -1553,6 +1589,7 @@ async fn recognize_inner(
     {
         if cached.image_text_revision < formulas::TEXT_REVISION
             && let Some(source) = book_source
+            && let Some((provider, model, effort)) = image_endpoint
         {
             let client = crate::http::builder()
                 .timeout(Duration::from_secs(90))
@@ -1562,7 +1599,7 @@ async fn recognize_inner(
                 &client,
                 provider,
                 model,
-                settings.semantic_layout.reasoning_effort,
+                effort,
                 source,
                 &target_section,
             )
@@ -1591,14 +1628,14 @@ async fn recognize_inner(
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|e| e.to_string())?;
-    let formulas_checked =
-        book_source.is_some() || formulas::candidates(&target_section).is_empty();
-    if let Some(source) = book_source {
+    let formulas_checked = image_endpoint.is_none()
+        || book_source.is_some() || formulas::candidates(&target_section).is_empty();
+    if let Some(source) = book_source && let Some((provider, model, effort)) = image_endpoint {
         let (recognized, failed) = formulas::recognize(
             &client,
             provider,
             model,
-            settings.semantic_layout.reasoning_effort,
+            effort,
             source,
             &target_section,
         )
@@ -1611,21 +1648,14 @@ async fn recognize_inner(
         compose(&mut working.blocks, annotation);
     }
     let section = &working;
-    let decision = if settings.semantic_layout.citation_decisions
-        && formulas::candidates(&target_section).is_empty()
-    {
-        decisions::endpoint(provider)
-    } else {
-        None
-    };
     let (groups, failed) = recognize_windows(
         &client, settings, section, book_id, &fingerprint, target.clone(), fixed_target,
-        None, decision.as_ref(), book_source,
+        None, book_source,
     ).await?;
     annotations.extend(groups);
     skipped_groups += failed;
     for nested in code_blocks::nested_sections(section, target.clone()) {
-        let (groups, failed) = recognize_windows(&client, settings, &nested.section, book_id, &fingerprint, 0..nested.section.blocks.len(), false, Some(&nested.context), None, None).await?;
+        let (groups, failed) = recognize_windows(&client, settings, &nested.section, book_id, &fingerprint, 0..nested.section.blocks.len(), false, Some(&nested.context), None).await?;
         annotations.extend(groups);
         skipped_groups += failed;
     }
@@ -1679,7 +1709,6 @@ async fn recognize_windows(
     target: std::ops::Range<usize>,
     fixed_target: bool,
     code_context: Option<&[String]>,
-    decision: Option<&decisions::Endpoint<'_>>,
     book_source: Option<&dyn BookSource>,
 ) -> Result<(Vec<Annotation>, usize), String> {
     let code_only = code_context.is_some();
@@ -1692,7 +1721,10 @@ async fn recognize_windows(
     let mut skipped_groups = 0;
     let mut used = HashSet::new();
     let mut start = target.start;
-    let figure_decision = if code_only { None } else { decisions::figure_endpoint(provider) };
+    let decision = decisions::selected_endpoint(provider, model);
+    if code_only && decision.is_some() {
+        return Ok((Vec::new(), 0));
+    }
     let mut vision_supported = true;
     while start < target.end {
         let end = if fixed_target {
@@ -1744,7 +1776,7 @@ async fn recognize_windows(
                     config.captions,
                     code_only,
                     book_source.is_some(),
-                    figure_decision.as_ref().map(decisions::Endpoint::figure_identity),
+                    decision.as_ref().map(decisions::Endpoint::figure_identity),
                     input
                 ]))
                 .map_err(|e| e.to_string())?,
@@ -1774,47 +1806,46 @@ async fn recognize_windows(
                     formulas: cache.formulas,
                     skipped_groups: 0,
                 }
-            } else if let Some(endpoint) = decision
-                && let Some(citations) = decisions::resolve(
-                    endpoint,
-                    book_id,
-                    fingerprint,
-                    section,
-                    start..end,
-                    lo..hi,
-                    &citation_candidates,
-                ).await
-            {
-                WindowResult {
-                    groups: Vec::new(),
-                    citations,
-                    formulas: Vec::new(),
-                    skipped_groups: 0,
-                }
             } else {
-                let evidence = if config.captions && (vision_supported || figure_decision.is_some()) {
-                    book_source.map_or_else(Vec::new, |source| {
-                        figure_captions::evidence(source, section, start..end, lo..hi)
-                    })
-                } else {
-                    Vec::new()
-                };
-                let decisions = if let Some(endpoint) = &figure_decision
-                    && !evidence.is_empty()
-                    && citation_candidates.is_empty()
-                {
-                    decisions::resolve_figures(endpoint, section, start..end, lo..hi, &evidence).await
-                } else {
-                    None
-                };
-                let groups = if let Some(groups) = decisions {
-                    WindowResult { groups, ..WindowResult::default() }
+                let groups = if let Some(endpoint) = &decision {
+                    if decisions::citation_only(section, start..end, lo..hi, &citation_candidates) {
+                        let citations = decisions::resolve(
+                            endpoint, book_id, fingerprint, section, &citation_candidates,
+                        ).await;
+                        WindowResult {
+                            skipped_groups: usize::from(citations.is_none()),
+                            citations: citations.unwrap_or_default(),
+                            ..WindowResult::default()
+                        }
+                    } else if config.captions && decisions::supports_images(endpoint) {
+                        let evidence = book_source.map_or_else(Vec::new, |source| {
+                            figure_captions::evidence(source, section, start..end, lo..hi)
+                        });
+                        let groups = if evidence.is_empty() {
+                            Some(Vec::new())
+                        } else {
+                            decisions::resolve_figures(endpoint, section, start..end, lo..hi, &evidence).await
+                        };
+                        WindowResult {
+                            skipped_groups: usize::from(groups.is_none()),
+                            groups: groups.unwrap_or_default(),
+                            ..WindowResult::default()
+                        }
+                    } else {
+                        WindowResult::default()
+                    }
                 } else {
                     let endpoint = (provider, model, settings.semantic_layout.reasoning_effort);
-                    let evidence = if vision_supported { evidence.as_slice() } else { &[] };
+                    let evidence = if config.captions && vision_supported {
+                        book_source.map_or_else(Vec::new, |source| {
+                            figure_captions::evidence(source, section, start..end, lo..hi)
+                        })
+                    } else {
+                        Vec::new()
+                    };
                     let result = request_groups(
                         client, endpoint, &input, section, config, start..end, lo..hi,
-                        code_only, evidence,
+                        code_only, &evidence,
                     ).await;
                     if !evidence.is_empty()
                         && result.as_ref().err().is_some_and(|error| request_images::unsupported(error))

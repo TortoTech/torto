@@ -210,6 +210,10 @@ fn sync_resolved_theme(ctx: &egui::Context) -> bool {
     DARK_THEME.swap(dark, Ordering::Relaxed) != dark
 }
 
+pub(crate) fn set_active_dark(dark: bool) {
+    DARK_THEME.store(dark, Ordering::Relaxed);
+}
+
 pub(crate) fn theme() -> egui::Theme {
     if DARK_THEME.load(Ordering::Relaxed) {
         egui::Theme::Dark
@@ -686,7 +690,7 @@ pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected:
             .galley(egui::pos2(rect.left() + 38.0, text_y), galley, foreground);
     }
     response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Full-width navigation/menu row with a left-aligned label and no icon slot.
@@ -720,7 +724,7 @@ pub(crate) fn navigation_text_button(ui: &mut Ui, label: &str, selected: bool) -
         );
     }
     response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Text action used in modal footers. Primary and secondary actions share the

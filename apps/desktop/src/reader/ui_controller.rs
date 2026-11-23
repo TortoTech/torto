@@ -71,7 +71,10 @@ impl DesktopReader {
             self.ui.focus_footnotes_visible = false;
             self.ui.focus_footnote_scroll_delta = 0.0;
         }
-        let was_menu_open = self.ui.overlay == ReaderOverlay::Menu;
+        let was_toolbar_pinned = matches!(
+            self.ui.overlay,
+            ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+        );
         self.ui.overlay = overlay;
         let menu_changed = self
             .ui
@@ -82,9 +85,9 @@ impl DesktopReader {
                 0.0
             });
         let now = Instant::now();
-        if overlay == ReaderOverlay::Menu {
+        if matches!(overlay, ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode) {
             self.ui.reveal_toolbar(now);
-        } else if was_menu_open && !self.ui.toolbar_hovered {
+        } else if was_toolbar_pinned && !self.ui.toolbar_hovered {
             self.ui.schedule_toolbar_hide(now);
         }
         if menu_changed {
@@ -107,7 +110,12 @@ impl DesktopReader {
             .is_some_and(|deadline| now >= deadline)
         {
             self.ui.toolbar_hide_at = None;
-            if !self.ui.toolbar_hovered && self.ui.overlay != ReaderOverlay::Menu {
+            if !self.ui.toolbar_hovered
+                && !matches!(
+                    self.ui.overlay,
+                    ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+                )
+            {
                 self.ui.toolbar_motion.animate_to(0.0);
                 // The elapsed wait belongs to the hide timer, not the new
                 // animation. Preserve its fade when waking from an idle frame.
@@ -311,6 +319,7 @@ mod tests {
             plugin_settings: reader.plugin_settings.clone(),
             language: preferences.language,
             theme: preferences.theme,
+            reader_theme: preferences.reader_theme,
             selection_granularity: preferences.selection_granularity,
             shortcuts: preferences.shortcuts,
             sync_settings: reader.sync_settings.clone(),

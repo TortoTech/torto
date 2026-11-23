@@ -182,7 +182,8 @@ impl SemanticLayoutSource {
         .await
         .map_err(|e| e.to_string())?
         .ok_or("This block has no eligible prose")?;
-        let (provider, model) = settings.semantic_layout_endpoint()?;
+        let (provider, model, effort) = settings.semantic_layout_image_endpoint()
+            .ok_or("请配置排版生成模型")?;
         let client = crate::http::builder()
             .timeout(Duration::from_secs(90))
             .build()
@@ -199,7 +200,7 @@ impl SemanticLayoutSource {
             &messages,
             None,
             Some(3072),
-            settings.semantic_layout.reasoning_effort,
+            effort,
             Some(&json!({"temperature":0})),
         ))
         .await?;

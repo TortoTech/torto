@@ -40,6 +40,7 @@ pub(crate) fn load_reading(root: &std::path::Path) -> ReadingOptions {
         .unwrap_or_default();
     // Translation belongs to the current reader session, as on desktop.
     options.translated = false;
+    options.font_weight = 400;
     options
 }
 pub(crate) fn apply_typography(style: &mut ReaderStyle, options: &ReadingOptions) {
@@ -54,7 +55,7 @@ pub(crate) fn apply_typography(style: &mut ReaderStyle, options: &ReadingOptions
     });
     t.latin_cjk_font = (!options.latin_cjk_font.is_empty()).then(|| options.latin_cjk_font.clone());
     t.monospace_font = options.monospace_font.clone();
-    t.font_weight = options.font_weight;
+    t.font_weight = 400;
     t.normalize();
 }
 #[derive(Clone, uniffi::Record)]
@@ -77,8 +78,6 @@ pub struct Provider {
     pub base_url: String,
     pub models: Vec<String>,
     pub key_saved: bool,
-    #[uniffi(default = false)]
-    pub citation_decisions_available: bool,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct AiOptions {
@@ -100,8 +99,9 @@ pub struct AiOptions {
     // ignored on save. These are no longer user settings.
     pub chat_steps: u16,
     pub chat_history: u16,
-    #[uniffi(default = false)]
-    pub layout_citation_decisions: bool,
+    pub image_provider: String,
+    pub image_model: String,
+    pub image_reasoning: String,
 }
 fn wire<T: Serialize>(v: &T) -> String {
     serde_json::to_value(v)
@@ -121,7 +121,9 @@ fn dto(s: &PluginSettings) -> AiOptions {
         layout_provider: s.semantic_layout.provider.clone(),
         layout_model: s.semantic_layout.model.clone(),
         layout_reasoning: wire(&s.semantic_layout.reasoning_effort),
-        layout_citation_decisions: s.semantic_layout.citation_decisions,
+        image_provider: s.semantic_layout.image_provider.clone(),
+        image_model: s.semantic_layout.image_model.clone(),
+        image_reasoning: wire(&s.semantic_layout.image_reasoning_effort),
         translation_provider: s.translation_provider.clone(),
         translation_model: s.translation_model.clone(),
         translation_reasoning: wire(&s.translation_reasoning_effort),
@@ -220,7 +222,6 @@ impl MobileCore {
                     base_url: p.base_url.clone(),
                     models: p.models.iter().map(|m| m.id.clone()).collect(),
                     key_saved: !p.api_key.is_empty(),
-                    citation_decisions_available: plugins::semantic_layout::supports_citation_decisions(p),
                 })
                 .collect())
         })
@@ -323,6 +324,27 @@ impl MobileCore {
         })
         .await
     }
+    pub async fn probe_layout_model(
+        self: Arc<Self>,
+        provider: String,
+        model: String,
+    ) -> Result<String> {
+        work(move || {
+            let settings = PluginSettings::load_default().map_err(error)?;
+            let provider = settings
+                .providers
+                .iter()
+                .find(|entry| {
+                    entry.id == provider && entry.models.iter().any(|entry| entry.id == model)
+                })
+                .ok_or_else(|| error("请从提供商中选择有效的模型"))?;
+            let protocol = runtime().block_on(plugins::semantic_layout::probe_layout_model(
+                provider, &model,
+            ));
+            Ok(wire(&protocol))
+        })
+        .await
+    }
     pub async fn ai_options(self: Arc<Self>) -> Result<AiOptions> {
         work(move || Ok(dto(&PluginSettings::load_default().map_err(error)?))).await
     }
@@ -334,6 +356,11 @@ impl MobileCore {
                     &options.layout_provider,
                     &options.layout_model,
                     options.layout_enabled,
+                ),
+                (
+                    &options.image_provider,
+                    &options.image_model,
+                    !options.image_model.is_empty(),
                 ),
                 (
                     &options.translation_provider,
@@ -359,7 +386,10 @@ impl MobileCore {
             s.semantic_layout.provider = options.layout_provider;
             s.semantic_layout.model = options.layout_model;
             s.semantic_layout.reasoning_effort = effort(&options.layout_reasoning)?;
-            s.semantic_layout.citation_decisions = options.layout_citation_decisions;
+            s.semantic_layout.image_provider = options.image_provider;
+            s.semantic_layout.image_model = options.image_model;
+            s.semantic_layout.image_reasoning_effort = effort(&options.image_reasoning)?;
+            s.fill_layout_image_model();
             s.translation_provider = options.translation_provider;
             s.translation_model = options.translation_model;
             s.translation_reasoning_effort = effort(&options.translation_reasoning)?;
@@ -475,6 +505,13 @@ impl MobileReader {
         })
         .await
     }
+}
+
+#[uniffi::export]
+pub fn is_layout_decision_model(base_url: String, model: String) -> bool {
+    let provider = AiProvider { base_url, ..AiProvider::default() };
+    plugins::semantic_layout::layout_model_protocol(&provider, &model)
+        == plugins::semantic_layout::LayoutModelProtocol::Decision
 }
 
 #[uniffi::export]

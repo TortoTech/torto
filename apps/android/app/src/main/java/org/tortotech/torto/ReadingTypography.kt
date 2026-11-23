@@ -28,11 +28,16 @@ internal enum class ReadingFontSetting { Cjk, CjkLatin, Latin, LatinCjk, Code }
 
 private data class FontChoice(val title:String,val pageTitle:String,val value:String,val options:List<Pair<String,String>>)
 
+private fun fontDisplayName(family:String)=when(family){
+    "LXGW WenKai GB Screen"->"霞鹜文楷"
+    else->family
+}
+
 @Composable private fun fontChoice(setting:ReadingFontSetting,state:ScreenState):FontChoice {
     val reading=state.reading
     val fonts=state.fontFamilies
-    val cjk=fonts?.cjk.orEmpty().map {it to it}
-    val latin=fonts?.latin.orEmpty().map {it to it}
+    val cjk=fonts?.cjk.orEmpty().map {it to fontDisplayName(it)}
+    val latin=fonts?.latin.orEmpty().map {it to fontDisplayName(it)}
     return when(setting){
         ReadingFontSetting.Cjk->FontChoice(tr("主要字体","Primary font"),tr("中日韩主要字体","CJK primary font"),reading?.cjkFont.orEmpty(),cjk)
         ReadingFontSetting.CjkLatin->FontChoice(tr("拉丁字体","Latin font"),tr("拉丁字体","Latin font"),reading?.cjkLatinFont.orEmpty(),listOf("" to tr("跟随其他语言字体","Use other-language font"))+latin)

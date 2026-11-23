@@ -21,6 +21,9 @@ use crate::shelf::{ShelfFeature, ShelfImportTaskMessage, SyncProgressMessage, Sy
 pub(crate) struct DesktopApp {
     fonts: crate::fonts::FontService,
     font_notice_dismissed: Option<u64>,
+    pending_font_apply: Option<(String, crate::settings::ReaderSettingsChange)>,
+    pending_custom_font_import: Option<crate::fonts::CustomImportTarget>,
+    reopen_text_settings_open: bool,
     shelf: ShelfFeature,
     reader: Option<DesktopReader>,
     settings: SettingsFeature,
@@ -80,6 +83,9 @@ impl DesktopApp {
         Self {
             fonts: crate::fonts::FontService::default(),
             font_notice_dismissed: None,
+            pending_font_apply: None,
+            pending_custom_font_import: None,
+            reopen_text_settings_open: false,
             shelf,
             reader: None,
             settings,
@@ -181,10 +187,33 @@ impl DesktopApp {
             }
             None
         } else if let Some(reader) = self.reader.as_mut() {
+            let reader_theme = match self.settings.applied().reader_theme {
+                Some(theme) => theme,
+                None => {
+                    let initial = crate::preferences::ReaderTheme::from_dark(
+                        crate::ui::theme() == egui::Theme::Dark,
+                    );
+                    self.settings.apply_reader_change(
+                        crate::settings::ReaderSettingsChange::Theme(initial),
+                    );
+                    initial
+                }
+            };
+            let interface_dark = crate::ui::theme() == egui::Theme::Dark;
+            let switched = reader_theme.is_dark() != interface_dark;
+            if switched {
+                crate::ui::set_active_dark(reader_theme.is_dark());
+                crate::ui::apply_visuals(ui.ctx(), &crate::ui::palette());
+            }
             let covers = self.shelf.reader_cover_cache();
             reader.prepare_sidebar_cover(ui.ctx(), covers);
             covers.trim_for_reader();
-            Some(reader.ui(ui, page_texture, interaction_blocked))
+            let plan = Some(reader.ui(ui, page_texture, interaction_blocked));
+            if switched {
+                crate::ui::set_active_dark(interface_dark);
+                crate::ui::apply_visuals(ui.ctx(), &crate::ui::palette());
+            }
+            plan
         } else {
             self.shelf.ui(ui, interaction_blocked);
             if self.shelf.opening_visible() {
@@ -232,13 +261,27 @@ impl DesktopApp {
                 window_chrome::block_drag(ui.ctx());
             }
         }
-        crate::fonts::publish_labels(ui.ctx(), &self.fonts.statuses, self.settings.applied().language);
+        crate::fonts::publish_labels(
+            ui.ctx(),
+            &self.fonts.statuses,
+            &self.fonts.custom_fonts,
+            self.settings.applied().language,
+        );
         self.settings.font_apply_available = self.reader.as_ref().is_some_and(|reader|
             !reader.uses_fonts(&self.fonts.reader_fonts)
                 && (!reader.missing_font_resources() || self.fonts.statuses[0] == crate::fonts::Status::Ready));
         settings_overlay(ui.ctx(), &mut self.settings);
-        if std::mem::take(&mut self.settings.font_retry_requested) || crate::fonts::take_request(ui.ctx()) {
+        if std::mem::take(&mut self.settings.font_retry_requested) {
             self.fonts.retry();
+        }
+        for family in crate::fonts::take_requests(ui.ctx()) {
+            self.fonts.request_family_download(&family);
+        }
+        if let Some(pending) = crate::fonts::take_apply_request(ui.ctx()) {
+            self.pending_font_apply = Some(pending);
+        }
+        if let Some(target) = crate::fonts::take_custom_import_request(ui.ctx()) {
+            self.pending_custom_font_import = Some(target);
         }
         if std::mem::take(&mut self.settings.font_apply_requested)
             && let Some(reader) = self.reader.as_mut() {
@@ -407,6 +450,9 @@ impl DesktopApp {
     ) {
         let started = std::time::Instant::now();
         self.fonts.spawn(runtime, proxy);
+        if let Some(target) = self.pending_custom_font_import.take() {
+            self.fonts.spawn_custom_import(target, runtime, proxy);
+        }
         if let Some(offer)=self.cloud_resume_accept.take()
             && let Some((store,_,baseline))=self.reader.as_ref().and_then(DesktopReader::cloud_resume_check) {
             let account=crate::sync::account_key(&self.settings.applied().sync_settings);let wake=proxy.clone();
@@ -458,8 +504,68 @@ impl DesktopApp {
             crate::fonts::install(self.fonts.fonts.clone());
             self.shelf.set_reader_fonts(self.fonts.reader_fonts.clone());
             crate::ui::font_resources_changed(ctx);
+            if let Some((family, _)) = self.pending_font_apply.as_ref()
+                && self.fonts.is_family_ready(family)
+                && let Some((_, change)) = self.pending_font_apply.take()
+            {
+                if let Some(reader) = self.reader.as_mut() {
+                    self.reopen_text_settings_open = reader.is_text_settings_open();
+                    reader.apply_downloaded_fonts();
+                }
+                if self.settings.apply_reader_change(change).is_ok()
+                    && let Some(reader) = self.reader.as_mut()
+                {
+                    reader.apply_global_settings(self.settings.applied());
+                }
+            }
         }
         self.settings.font_statuses = self.fonts.statuses.clone();
+    }
+
+    pub(crate) fn complete_custom_fonts_imported(
+        &mut self,
+        message: crate::fonts::CustomImportMessage,
+        ctx: &egui::Context,
+    ) {
+        let language = self.settings.applied().language;
+        match message.result {
+            Ok(imported) if !imported.is_empty() => {
+                let first_family = imported[0].family.clone();
+                self.fonts.add_custom_fonts(imported);
+                self.shelf.set_reader_fonts(self.fonts.reader_fonts.clone());
+                crate::ui::font_resources_changed(ctx);
+                let change = match message.target {
+                    crate::fonts::CustomImportTarget::Cjk => {
+                        crate::settings::ReaderSettingsChange::CjkFont(first_family)
+                    }
+                    crate::fonts::CustomImportTarget::CjkLatin => {
+                        crate::settings::ReaderSettingsChange::CjkLatinFont(Some(first_family))
+                    }
+                    crate::fonts::CustomImportTarget::Latin => {
+                        crate::settings::ReaderSettingsChange::LatinFont(first_family)
+                    }
+                };
+                if let Some(reader) = self.reader.as_mut() {
+                    self.reopen_text_settings_open = reader.is_text_settings_open();
+                    reader.apply_downloaded_fonts();
+                }
+                if self.settings.apply_reader_change(change).is_ok()
+                    && let Some(reader) = self.reader.as_mut()
+                {
+                    reader.apply_global_settings(self.settings.applied());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                if let Some(reader) = self.reader.as_mut() {
+                    reader.show_notice(
+                        language
+                            .text("导入字体失败，请检查字体文件", "Failed to import font file")
+                            .to_owned(),
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn complete_shelf_sync_check(
@@ -665,6 +771,9 @@ impl DesktopApp {
 
     fn promote_opened_reader(&mut self) {
         if let Some(mut next_reader) = self.shelf.take_opened_reader() {
+            if std::mem::take(&mut self.reopen_text_settings_open) {
+                next_reader.open_text_settings();
+            }
             self.font_notice_dismissed = None;
             if let Some(current) = &self.reader {
                 current.prepare_for_shutdown();
@@ -716,7 +825,17 @@ impl DesktopApp {
         ctx.request_repaint();
         self.shelf.apply_global_settings(&applied);
         if let Some(reader) = self.reader.as_mut() {
+            let interface_dark = crate::ui::theme() == egui::Theme::Dark;
+            let reader_dark = applied
+                .reader_theme
+                .map_or(interface_dark, crate::preferences::ReaderTheme::is_dark);
+            if reader_dark != interface_dark {
+                crate::ui::set_active_dark(reader_dark);
+            }
             reader.apply_global_settings(&applied);
+            if reader_dark != interface_dark {
+                crate::ui::set_active_dark(interface_dark);
+            }
         }
         self.applied_settings_revision = revision;
     }

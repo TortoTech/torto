@@ -2502,10 +2502,7 @@ impl DesktopReader {
     }
 
     pub(super) fn queue_toc_translation(&mut self) {
-        if !self.translation.enabled
-            || !self.plugin_settings.translate_toc
-            || self.translation.toc_task.is_pending()
-        {
+        if !self.translation.enabled || self.translation.toc_task.is_pending() {
             return;
         }
         let mut toc_ids = Vec::new();

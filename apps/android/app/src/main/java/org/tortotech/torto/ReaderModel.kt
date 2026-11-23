@@ -244,6 +244,9 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     }}
     fun saveProvider(provider:Provider,key:String,clearKey:Boolean,done:()->Unit={}) {cancelAi();runOperation {core.saveProvider(provider,key.takeIf {it.isNotBlank()},clearKey);reloadSettings();reader?.let {publish(it.reloadAiOptions())};mutable.update {it.copy(settingsRevision=it.settingsRevision+1)};done()}}
     fun deleteProvider(id:String){cancelAi();runOperation {core.deleteProvider(id);reloadSettings();reader?.let {publish(it.reloadAiOptions())};mutable.update {it.copy(settingsRevision=it.settingsRevision+1)}}}
+    suspend fun probeLayoutModel(provider: String, model: String): String =
+        core.probeLayoutModel(provider, model)
+
     fun fetchModels(provider:Provider,key:String,clearKey:Boolean=false)=runOperation {
         val cacheKey=provider.kind+":"+provider.baseUrl
         mutable.update {it.copy(modelFetchError=null)}
@@ -598,6 +601,54 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         if(!state.value.focus||state.value.busy||state.value.chatWorking)return
         val control=state.value.frame?.info?.controls?.find {it.kind=="sentences"&&it.source==source} ?: return
         if(control.active!=split)toggleReadingControl(control)
+    }
+    fun focusHighlightGesture(add:Boolean){
+        val current=state.value
+        if(!current.focus||current.busy||current.chatWorking)return
+        val bounds=current.frame?.info?.focusBounds?.takeIf {it.isNotEmpty()} ?: return
+        val first=bounds.first();val last=bounds.last()
+        val token=generation
+        runOperation(quietUpdate=true) {
+            if(token!=generation)return@runOperation
+            reader?.let { r ->
+                val sel=r.select(first.x+2f,first.y+first.height/2f,last.x+last.width-2f,last.y+last.height/2f)
+                if(sel!=null&&sel.highlighted!=add){
+                    val notes=r.toggleSelectionHighlight(!add)
+                    if(token==generation)mutable.update {it.copy(annotations=notes)}
+                }
+                r.clearSelection()
+                publish(r.page(),token)
+            }
+        }
+    }
+    fun focusNoteGesture(add:Boolean,openComposer:()->Unit){
+        val current=state.value
+        if(!current.focus||current.busy||current.chatWorking)return
+        val bounds=current.frame?.info?.focusBounds?.takeIf {it.isNotEmpty()} ?: return
+        val first=bounds.first();val last=bounds.last()
+        val token=generation
+        runOperation(quietUpdate=true) {
+            if(token!=generation)return@runOperation
+            reader?.let { r ->
+                val sel=r.select(first.x+2f,first.y+first.height/2f,last.x+last.width-2f,last.y+last.height/2f)
+                if(sel!=null){
+                    if(add){
+                        if(token==generation){
+                            mutable.update {it.copy(selected=sel,chromeVisible=false)}
+                            openComposer()
+                        }
+                    } else {
+                        val existing=state.value.annotations.find {it.text.trim()==sel.text.trim()&&!it.note.isNullOrBlank()}
+                        if(existing!=null){
+                            val notes=r.editAnnotation(existing.id,null)
+                            if(token==generation)mutable.update {it.copy(annotations=notes)}
+                        }
+                        r.clearSelection()
+                        publish(r.page(),token)
+                    }
+                }
+            }
+        }
     }
     suspend fun documentPage(interaction:ReaderInteraction,index:UInt,width:UInt,height:UInt,scale:Float,foreground:UInt,background:UInt,firstLineIndent:Float=0f):DocumentFrame? {
         val token=generation;val documentToken=documentGeneration

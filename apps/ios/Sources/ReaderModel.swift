@@ -682,6 +682,46 @@ final class ReaderModel: ObservableObject {
         toggleControl(control)
     }
 
+    func focusHighlightGesture(_ add: Bool) {
+        guard let reader, let bounds = frame?.info.focusBounds, let first = bounds.first, let last = bounds.last,
+              frame?.info.isScroll == true else { return }
+        run { [self] in
+            if let sel = try await reader.select(startX: first.x + 2, startY: first.y + first.height / 2,
+                                                 endX: last.x + last.width - 2, endY: last.y + last.height / 2),
+               sel.highlighted != add {
+                annotations = try await reader.toggleSelectionHighlight(remove: !add)
+            }
+            try await reader.clearSelection()
+            selection = nil
+            try show(try await reader.page())
+        }
+    }
+
+    func focusNoteGesture(_ add: Bool, openComposer: @escaping () -> Void) {
+        guard let reader, let bounds = frame?.info.focusBounds, let first = bounds.first, let last = bounds.last,
+              frame?.info.isScroll == true else { return }
+        run { [self] in
+            guard let sel = try await reader.select(startX: first.x + 2, startY: first.y + first.height / 2,
+                                                    endX: last.x + last.width - 2, endY: last.y + last.height / 2) else { return }
+            if add {
+                selection = sel
+                showingChrome = false
+                openComposer()
+            } else {
+                let trimmed = sel.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let existing = annotations.first(where: {
+                    $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed &&
+                    !($0.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }) {
+                    annotations = try await reader.editAnnotation(id: existing.id, note: nil)
+                }
+                try await reader.clearSelection()
+                selection = nil
+                try show(try await reader.page())
+            }
+        }
+    }
+
     func toggleControl(_ control: ReadingControl) {
         guard let reader else { return }
         run { [self] in try show(try await reader.toggleReadingControl(control: control)) }

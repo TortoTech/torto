@@ -770,8 +770,8 @@ pub(super) async fn recognize(
     if input.to_string().len() > 192 * 1024 {
         return (Vec::new(), false);
     }
-    let Ok((provider, model)) = settings.semantic_layout_endpoint() else {
-        return (Vec::new(), false);
+    let Some((provider, model, effort)) = settings.semantic_layout_image_endpoint() else {
+        return (Vec::new(), true);
     };
     let key = digest(
         &serde_json::to_vec(&json!([
@@ -781,7 +781,7 @@ pub(super) async fn recognize(
             provider.id,
             provider.base_url,
             model,
-            settings.semantic_layout.reasoning_effort,
+            effort,
             input
         ]))
         .unwrap(),
@@ -807,7 +807,7 @@ pub(super) async fn recognize(
             &messages,
             None,
             Some(8192),
-            settings.semantic_layout.reasoning_effort,
+            effort,
             Some(&options),
         ))
         .await;

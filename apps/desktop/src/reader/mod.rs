@@ -2075,7 +2075,12 @@ impl DesktopReader {
             self.prefetch();
         }
         if std::mem::take(&mut self.ui.opening_toolbar_pending) {
-            if !self.ui.toolbar_hovered && self.ui.overlay != ReaderOverlay::Menu {
+            if !self.ui.toolbar_hovered
+                && !matches!(
+                    self.ui.overlay,
+                    ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+                )
+            {
                 self.ui.schedule_toolbar_hide(Instant::now());
             }
             self.request_frame_repaint(ctx);
@@ -3370,6 +3375,14 @@ impl DesktopReader {
         self.error.is_some() || self.notice.is_some() || self.translation.error.is_some()
     }
 
+    pub(crate) fn is_text_settings_open(&self) -> bool {
+        self.ui.overlay == ReaderOverlay::TextSettings
+    }
+
+    pub(crate) fn open_text_settings(&mut self) {
+        self.ui.overlay = ReaderOverlay::TextSettings;
+    }
+
     pub(crate) fn apply_downloaded_fonts(&mut self) {
         // Reopening uses the existing worker, source locator and cancellation
         // protocol, including fresh PDF/font/raster caches. No UI-thread reflow.
@@ -3982,6 +3995,8 @@ impl SnapshotEffects {
 enum ReaderOverlay {
     None,
     Menu,
+    TextSettings,
+    SelectionMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4137,7 +4152,10 @@ impl ReaderUiState {
         self.toolbar_hovered = hovered;
         if hovered {
             self.reveal_toolbar(now);
-        } else if self.overlay != ReaderOverlay::Menu {
+        } else if !matches!(
+            self.overlay,
+            ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+        ) {
             self.schedule_toolbar_hide(now);
         }
         true

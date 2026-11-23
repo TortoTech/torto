@@ -15,8 +15,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable internal fun InterfaceSettingsRows(state:ScreenState,open:(String)->Unit){
-    SettingsItem(tr("深色模式","Dark mode"),icon="moon",value=when(state.appTheme){
-        "dark"->tr("已开启","On");"light"->tr("未开启","Off");else->tr("跟随系统","Follow system")
+    SettingsItem(tr("界面主题","Interface theme"),icon="moon",value=when(state.appTheme){
+        "dark"->tr("深色主题","Dark theme");"light"->tr("浅色主题","Light theme");else->tr("跟随系统","Follow system")
     }){open("dark-mode")}
     SettingsItem(tr("界面语言","Interface language"),icon="translate",value=when(state.language){
         "zh-CN"->"中文";"en"->"English";else->tr("跟随系统","Follow system")
@@ -26,8 +26,8 @@ import androidx.compose.ui.unit.sp
 @Composable fun DarkModeScreen(state:ScreenState,model:ReaderModel){
     val systemDark=isSystemInDarkTheme()
     InterfaceChoiceScreen(state.appTheme,
-        tr("开启后，将跟随系统打开或关闭深色模式","When enabled, dark mode follows your system settings"),
-        listOf("light" to tr("浅色","Light"),"dark" to tr("深色","Dark")),!state.busy,
+        tr("开启后，将跟随系统切换界面主题","When enabled, interface theme follows your system settings"),
+        listOf("light" to tr("浅色主题","Light theme"),"dark" to tr("深色主题","Dark theme")),!state.busy,
         onFollow={model.interfaceSettings(if(it)"system"else if(systemDark)"dark"else"light",state.language)},
         onSelect={model.interfaceSettings(it,state.language)})
 }

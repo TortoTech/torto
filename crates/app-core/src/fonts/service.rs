@@ -15,18 +15,30 @@ pub struct Report {
 }
 impl Report {
     pub fn ready(&self) -> bool {
-        self.fonts.faces.iter().all(Option::is_some)
+        super::catalog::preload_indices()
+            .into_iter()
+            .all(|index| self.fonts.faces.get(index).is_some_and(Option::is_some))
     }
 }
 
 pub async fn run(root: PathBuf, previous: FontSet, network: bool, send: impl Fn(Update)) -> Report {
+    run_indices(root, previous, network, super::catalog::preload_indices(), send).await
+}
+
+pub async fn run_indices(
+    root: PathBuf,
+    previous: FontSet,
+    network: bool,
+    indices: Vec<usize>,
+    send: impl Fn(Update),
+) -> Report {
     let load_root = root.clone();
     let fonts = match tokio::task::spawn_blocking(move || store::load(&load_root, previous)).await {
         Ok(fonts) => fonts,
         Err(error) => {
             let error = error.to_string();
-            for index in 0..3 {
-                send(Update::Finished(index, Err(error.clone())));
+            for index in &indices {
+                send(Update::Finished(*index, Err(error.clone())));
             }
             send(Update::Stopped);
             return Report {
@@ -39,7 +51,7 @@ pub async fn run(root: PathBuf, previous: FontSet, network: bool, send: impl Fn(
     send(Update::Loaded(Arc::new(fonts.clone())));
     let report = if network {
         let client = download::client();
-        download_missing(fonts, &send, |index| {
+        download_missing(fonts, &indices, &send, |index| {
             let root = root.clone();
             let client = client.clone();
             let send = &send;
@@ -63,23 +75,28 @@ pub async fn run(root: PathBuf, previous: FontSet, network: bool, send: impl Fn(
     report
 }
 
-async fn download_missing<F, Fut>(mut fonts: FontSet, send: &impl Fn(Update), fetch: F) -> Report
+async fn download_missing<F, Fut>(
+    mut fonts: FontSet,
+    indices: &[usize],
+    send: &impl Fn(Update),
+    fetch: F,
+) -> Report
 where
     F: Fn(usize) -> Fut,
     Fut: Future<Output = Result<Face, String>>,
 {
     let mut downloaded = 0;
     let mut error = None;
-    // Match desktop: small Latin faces first, larger CJK face last. A failed
-    // resource must not prevent the other missing resources from being tried.
-    for index in [1, 2, 0] {
-        if fonts.faces[index].is_some() {
+    for &index in indices {
+        if fonts.faces.get(index).is_some_and(Option::is_some) {
             continue;
         }
         let result = fetch(index).await;
         match &result {
             Ok(face) => {
-                fonts.faces[index] = Some(face.clone());
+                if let Some(slot) = fonts.faces.get_mut(index) {
+                    *slot = Some(face.clone());
+                }
                 downloaded += 1;
             }
             Err(message) => error = Some(message.clone()),
@@ -107,13 +124,13 @@ mod tests {
             index: 0,
         };
         let fonts = FontSet {
-            faces: std::array::from_fn(|_| Some(face.clone())),
+            faces: vec![Some(face.clone()); catalog().fonts.len()],
         };
         let events = Mutex::new(Vec::new());
         let report = runtime.block_on(run(root.clone(), fonts, false, |event| {
             events.lock().unwrap().push(match event {
                 Update::Loaded(fonts) => {
-                    assert!(fonts.faces.iter().all(Option::is_some));
+                    assert!(crate::fonts::catalog::preload_indices().into_iter().all(|i| fonts.faces[i].is_some()));
                     "loaded"
                 }
                 Update::Stopped => "stopped",
@@ -133,13 +150,14 @@ mod tests {
             data: peniko::Blob::new(Arc::new(vec![1])),
             index: 0,
         };
-        let fonts = FontSet {
-            faces: [None, Some(face.clone()), None],
-        };
+        let mut fonts = FontSet::default();
+        fonts.faces[1] = Some(face.clone());
         let attempts = Mutex::new(Vec::new());
         let events = Mutex::new(Vec::new());
+        let preload = crate::fonts::catalog::preload_indices();
         let report = runtime.block_on(download_missing(
             fonts,
+            &preload,
             &|update| {
                 if let Update::Finished(index, result) = update {
                     events.lock().unwrap().push((index, result.is_ok()));
@@ -167,6 +185,7 @@ mod tests {
         assert_eq!(report.error.as_deref(), Some("offline"));
         let retry = runtime.block_on(download_missing(
             report.fonts.as_ref().clone(),
+            &preload,
             &|_| {},
             |index| {
                 assert_eq!(index, 2);

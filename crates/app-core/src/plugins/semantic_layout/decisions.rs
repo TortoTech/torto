@@ -1,4 +1,4 @@
-//! Optional structured decisions through a System One model.
+//! Structured decisions through the selected System One model.
 
 use super::*;
 use citations::WindowCandidate;
@@ -30,26 +30,17 @@ fn provider_url(provider: &super::super::AiProvider) -> Option<reqwest::Url> {
     Some(url)
 }
 
-pub(super) fn endpoint(provider: &super::super::AiProvider) -> Option<Endpoint<'_>> {
+fn endpoint<'a>(provider: &'a super::super::AiProvider, model: &'a str) -> Option<Endpoint<'a>> {
     let mut url = provider_url(provider)?;
     let path = url.path().trim_end_matches('/');
     let path = path.strip_suffix("/chat/completions").unwrap_or(path);
-    let alias = provider
-        .models
-        .iter()
-        .any(|model| model.id == "aliyun/decision");
-    let direct = path.ends_with("/compatible-mode/v1")
-        && provider
-            .models
-            .iter()
-            .any(|model| model.id == "decision-model-preview");
-    let (model, path) = if direct {
-        ("decision-model-preview", format!("{path}/systemone"))
-    } else if alias {
-        let prefix = path.strip_suffix("/v1").unwrap_or(path);
-        ("aliyun/decision", format!("{prefix}/typesafe/v1/systemone"))
+    let path = if path.ends_with("/systemone") {
+        path.to_owned()
+    } else if path.ends_with("/compatible-mode/v1") || path.ends_with("/typesafe/v1") {
+        format!("{path}/systemone")
     } else {
-        return None;
+        let prefix = path.strip_suffix("/v1").unwrap_or(path);
+        format!("{prefix}/typesafe/v1/systemone")
     };
     url.set_path(&path);
     url.set_query(None);
@@ -59,6 +50,127 @@ pub(super) fn endpoint(provider: &super::super::AiProvider) -> Option<Endpoint<'
         model,
         url,
     })
+}
+
+pub(super) fn selected_endpoint<'a>(
+    provider: &'a super::super::AiProvider,
+    model: &'a str,
+) -> Option<Endpoint<'a>> {
+    (model_protocol(provider, model) == super::LayoutModelProtocol::Decision)
+        .then(|| endpoint(provider, model))
+        .flatten()
+}
+
+pub(super) fn supports_images(endpoint: &Endpoint<'_>) -> bool {
+    !matches!(endpoint.model, "aliyun/decision" | "decision-model-preview")
+}
+
+type ProbeCell = std::sync::Arc<tokio::sync::OnceCell<super::LayoutModelProtocol>>;
+
+static PROBES: LazyLock<std::sync::Mutex<HashMap<String, ProbeCell>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn probe_key(endpoint: &Endpoint<'_>) -> String {
+    digest(format!("{}\n{}", endpoint.url, endpoint.model).as_bytes())
+}
+
+fn cached_protocol(endpoint: &Endpoint<'_>) -> Option<super::LayoutModelProtocol> {
+    PROBES
+        .try_lock()
+        .ok()?
+        .get(&probe_key(endpoint))?
+        .get()
+        .copied()
+}
+
+pub(super) fn model_protocol(
+    provider: &super::super::AiProvider,
+    model: &str,
+) -> super::LayoutModelProtocol {
+    use super::LayoutModelProtocol::*;
+    let Some(endpoint) = endpoint(provider, model) else {
+        return Unconfirmed;
+    };
+    cached_protocol(&endpoint).unwrap_or_else(|| match model {
+        "aliyun/decision" | FIGURE_MODEL => Decision,
+        "decision-model-preview"
+            if endpoint
+                .url
+                .path()
+                .ends_with("/compatible-mode/v1/systemone") =>
+        {
+            Decision
+        }
+        _ => Unconfirmed,
+    })
+}
+
+fn probe_cache_path(endpoint: &Endpoint<'_>) -> Option<PathBuf> {
+    Some(
+        crate::environment::paths()?
+            .cache_dir()
+            .join("layout-model-protocol-v1")
+            .join(probe_key(endpoint)),
+    )
+}
+
+pub(super) fn restore_protocol(provider: &super::super::AiProvider, model: &str) {
+    let Some(endpoint) = endpoint(provider, model) else {
+        return;
+    };
+    if cached_protocol(&endpoint).is_some() {
+        return;
+    }
+    let Some(protocol) = probe_cache_path(&endpoint)
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<super::LayoutModelProtocol>(&bytes).ok())
+        .and_then(|protocol| protocol.as_cache_value().copied())
+    else {
+        return;
+    };
+    if let Ok(mut probes) = PROBES.lock() {
+        probes.entry(probe_key(&endpoint)).or_insert_with(|| {
+            std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(protocol)))
+        });
+    }
+}
+
+pub(super) async fn probe_model(
+    provider: &super::super::AiProvider,
+    model: &str,
+) -> super::LayoutModelProtocol {
+    use super::LayoutModelProtocol::*;
+    let Some(endpoint) = endpoint(provider, model) else {
+        return Unconfirmed;
+    };
+    restore_protocol(provider, model);
+    let cell = match PROBES.lock() {
+        Ok(mut probes) => probes.entry(probe_key(&endpoint)).or_default().clone(),
+        Err(_) => return Unconfirmed,
+    };
+    let result = cell.get_or_try_init(|| async {
+        let body = json!({
+            "model": model,
+            "state": {"number": 2},
+            "questions": {"probe": {
+                "type": "noul",
+                "instructions": "Is the number equal to 2?",
+                "criteria": {"true": "The number equals 2.", "false": "The number differs from 2."}
+            }}
+        });
+        let protocol = match request_result(&endpoint, &body, Duration::from_secs(5)).await {
+            Ok(answers) if answers.len() == 1 && answers.get("probe").is_some_and(|answer| {
+                answer.kind == "noul" && (0.0..=1.0).contains(&answer.noul)
+            }) => Decision,
+            Err(DecisionError::Unsupported) if model_protocol(provider, model) != Decision => Chat,
+            _ => return Err(()),
+        };
+        if let Some(path) = probe_cache_path(&endpoint) {
+            let _ = crate::persistence::write_json_atomic(&path, &protocol);
+        }
+        Ok(protocol)
+    }).await;
+    result.copied().unwrap_or(Unconfirmed)
 }
 
 const FIGURE_MODEL: &str = "cloudflare/decision-base";
@@ -72,28 +184,10 @@ const FIGURE_TRUE: &str =
 const FIGURE_FALSE: &str =
     "普通正文、引用图号、与图内容不符、属于另一张图、仅是章节标题，或证据不充分。";
 
-pub(super) fn figure_endpoint(provider: &super::super::AiProvider) -> Option<Endpoint<'_>> {
-    if !provider.models.iter().any(|model| model.id == FIGURE_MODEL) {
-        return None;
-    }
-    let mut url = provider_url(provider)?;
-    let path = url.path().trim_end_matches('/');
-    let path = path.strip_suffix("/chat/completions").unwrap_or(path);
-    let prefix = path.strip_suffix("/v1").unwrap_or(path);
-    url.set_path(&format!("{prefix}/typesafe/v1/systemone"));
-    url.set_query(None);
-    url.set_fragment(None);
-    Some(Endpoint {
-        provider,
-        model: FIGURE_MODEL,
-        url,
-    })
-}
-
 impl Endpoint<'_> {
     pub(super) fn figure_identity(&self) -> Value {
         json!([
-            "figure-decisions-v1",
+            "figure-decisions-v2",
             self.provider.id,
             self.model,
             self.url.as_str(),
@@ -107,7 +201,7 @@ impl Endpoint<'_> {
 
     pub(super) fn identity(&self) -> Value {
         json!([
-            "citation-decisions-v1",
+            "citation-decisions-v2",
             self.provider.id,
             self.model,
             self.url.as_str(),
@@ -122,7 +216,7 @@ impl Endpoint<'_> {
 
 // Only use the alternate route where citation validation can complete this
 // window. Preserve the normal combined request for any other plausible role.
-fn citation_only(
+pub(super) fn citation_only(
     section: &Section,
     target: Range<usize>,
     context: Range<usize>,
@@ -275,11 +369,16 @@ fn valid(answers: &BTreeMap<String, Answer>, candidates: &[&WindowCandidate]) ->
         })
 }
 
-async fn request(
+enum DecisionError {
+    Unsupported,
+    Failed,
+}
+
+async fn request_result(
     endpoint: &Endpoint<'_>,
     body: &Value,
     timeout: Duration,
-) -> Option<BTreeMap<String, Answer>> {
+) -> Result<BTreeMap<String, Answer>, DecisionError> {
     #[derive(Deserialize)]
     struct Response {
         answers: BTreeMap<String, Answer>,
@@ -291,27 +390,55 @@ async fn request(
             .ok()
     });
     let mut request = CLIENT
-        .as_ref()?
+        .as_ref()
+        .ok_or(DecisionError::Failed)?
         .post(endpoint.url.clone())
         .timeout(timeout)
         .json(body);
     if !endpoint.provider.api_key.trim().is_empty() {
         request = request.bearer_auth(endpoint.provider.api_key.trim());
     }
-    let response = crate::plugins::llm::budgeted(async {
-        let response = request
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| error.to_string())?;
+    let mut failure = DecisionError::Failed;
+    let result = crate::plugins::llm::budgeted(async {
+        let mut response = request.send().await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let unsupported = matches!(status.as_u16(), 404 | 405 | 501)
+                || (matches!(status.as_u16(), 400 | 422)
+                    && response.chunk().await.ok().flatten().is_some_and(|bytes| {
+                        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+                        let text = text.to_ascii_lowercase();
+                        [
+                            "model_not_found",
+                            "model_not_supported",
+                            "unsupported_model",
+                            "unsupported model",
+                            "model is not supported",
+                            "does not support systemone",
+                        ]
+                        .iter()
+                        .any(|reason| text.contains(reason))
+                    }));
+            if unsupported {
+                failure = DecisionError::Unsupported;
+            }
+            return Err(format!("Decision API returned HTTP {status}"));
+        }
         response
             .json::<Response>()
             .await
             .map_err(|error| error.to_string())
     })
-    .await
-    .ok()?;
-    Some(response.answers)
+    .await;
+    result.map(|response| response.answers).map_err(|_| failure)
+}
+
+async fn request(
+    endpoint: &Endpoint<'_>,
+    body: &Value,
+    timeout: Duration,
+) -> Option<BTreeMap<String, Answer>> {
+    request_result(endpoint, body, timeout).await.ok()
 }
 
 pub(super) async fn resolve(
@@ -319,23 +446,17 @@ pub(super) async fn resolve(
     book_id: &str,
     fingerprint: &str,
     section: &Section,
-    target: Range<usize>,
-    context: Range<usize>,
     candidates: &[WindowCandidate],
 ) -> Option<Vec<String>> {
-    if !citation_only(section, target, context, candidates) {
-        return None;
-    }
-    let (known, pending): (Vec<_>, Vec<_>) = candidates
+    let (known, mut pending): (Vec<_>, Vec<_>) = candidates
         .iter()
         .partition(|candidate| citations::locally_recognized(section, candidate));
-    if pending.len() > MAX_QUESTIONS || pending.iter().any(|c| c.span.end - c.span.start > 160) {
-        return None;
-    }
     let mut selected: Vec<_> = known
         .into_iter()
         .map(|candidate| candidate.id.clone())
         .collect();
+    pending.retain(|candidate| candidate.span.end - candidate.span.start <= 160);
+    pending.truncate(MAX_QUESTIONS);
     if pending.is_empty() {
         return Some(selected);
     }
@@ -373,8 +494,6 @@ pub(super) async fn resolve(
         let probability = answers.get(&candidate.id)?.noul;
         if probability >= YES {
             selected.push(candidate.id.clone());
-        } else if probability > NO {
-            return None;
         }
     }
     Some(selected)
@@ -392,10 +511,10 @@ pub(super) async fn resolve_figures(
             .iter()
             .any(|(_, url)| url.len() > FIGURE_MAX_IMAGE_URL_BYTES)
     {
-        return None;
+        return Some(Vec::new());
     }
-    let pairs =
-        figure_captions::decision_pairs(section, target.clone(), context.clone(), evidence)?;
+    let Some(pairs) = figure_captions::decision_pairs(section, target.clone(), context.clone(), evidence)
+    else { return Some(Vec::new()) };
     let refs: Vec<_> = section.blocks.iter().collect();
     if rebook_layout::semantic_paragraph_groups(&refs)
         .iter()
@@ -429,13 +548,13 @@ pub(super) async fn resolve_figures(
             target.contains(&i) && !plain_prose(text, i, &[], true)
         })
     {
-        return None;
+        return Some(Vec::new());
     }
     let mut state = serde_json::Map::new();
     let mut questions = serde_json::Map::new();
     for (index, (image, neighbors)) in pairs.iter().enumerate() {
         let Block::Image(block) = &section.blocks[*image] else {
-            return None;
+            return Some(Vec::new());
         };
         for &neighbor in neighbors {
             let id = format!("fig{image}_p{neighbor}");
@@ -492,20 +611,19 @@ fn figure_groups(
     let mut groups = Vec::new();
     for (image, neighbors) in pairs {
         let mut caption = None;
+        let mut ambiguous = false;
         for neighbor in neighbors {
             let answer = answers.get(&format!("fig{image}_p{neighbor}"))?;
             if answer.kind != "noul" || !(0.0..=1.0).contains(&answer.noul) {
                 return None;
             }
             if answer.noul >= YES {
-                if caption.replace(*neighbor).is_some() {
-                    return None;
-                }
+                ambiguous |= caption.replace(*neighbor).is_some();
             } else if answer.noul > NO {
-                return None;
+                ambiguous = true;
             }
         }
-        if let Some(caption) = caption {
+        if let Some(caption) = caption.filter(|_| !ambiguous) {
             groups.push(Proposal::Figure {
                 images: vec![*image],
                 captions: vec![caption],
@@ -529,18 +647,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            endpoint(&provider).unwrap().url.as_str(),
+            selected_endpoint(&provider, "aliyun/decision").unwrap().url.as_str(),
             "https://example.com/prefix/typesafe/v1/systemone"
         );
         provider.base_url =
             "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1".into();
         provider.models = vec![AiModelConfig::language("decision-model-preview")];
         assert_eq!(
-            endpoint(&provider).unwrap().url.path(),
+            selected_endpoint(&provider, "decision-model-preview").unwrap().url.path(),
             "/compatible-mode/v1/systemone"
         );
         provider.models.clear();
-        assert!(endpoint(&provider).is_none());
+        assert!(selected_endpoint(&provider, "normal-llm").is_none());
     }
 
     #[test]
@@ -609,6 +727,13 @@ mod tests {
     fn decision_server(
         respond: impl FnOnce(Value) -> Value + Send + 'static,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        decision_server_status("200 OK", respond)
+    }
+
+    fn decision_server_status(
+        status: &'static str,
+        respond: impl FnOnce(Value) -> Value + Send + 'static,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, Read, Write};
         use std::net::TcpListener;
 
@@ -647,9 +772,79 @@ mod tests {
             reader.read_exact(&mut bytes).unwrap();
             let request: Value = serde_json::from_slice(&bytes).unwrap();
             let body = respond(request).to_string();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
         (address, server)
+    }
+
+    #[test]
+    fn probe_detects_a_custom_alias_and_reuses_the_response() {
+        let (address, server) = decision_server(|request| {
+            assert_eq!(request["model"], "my-custom-alias");
+            assert_eq!(request["state"], json!({"number": 2}));
+            json!({"answers":{"probe":{"type":"noul","noul":0.99}}})
+        });
+        let provider = AiProvider {
+            base_url: format!("http://{address}/v1"),
+            ..Default::default()
+        };
+        use super::super::LayoutModelProtocol::{Decision, Unconfirmed};
+        assert_eq!(model_protocol(&provider, "my-custom-alias"), Unconfirmed);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            runtime.block_on(probe_model(&provider, "my-custom-alias")),
+            Decision
+        );
+        server.join().unwrap();
+        assert_eq!(
+            runtime.block_on(probe_model(&provider, "my-custom-alias")),
+            Decision
+        );
+        assert!(selected_endpoint(&provider, "my-custom-alias").is_some());
+        assert!(selected_endpoint(&provider, "another-model").is_none());
+    }
+
+    #[test]
+    fn chat_layout_model_fills_only_an_unconfigured_image_model() {
+        let (address, server) = decision_server_status("400 Bad Request", |request| {
+            assert_eq!(request["model"], "layout-llm");
+            json!({"error":{"code":"model_not_supported"}})
+        });
+        let mut settings = PluginSettings::default().with_test_model();
+        let provider = &mut settings.providers[0];
+        provider.base_url = format!("http://{address}/v1");
+        provider.models.push(AiModelConfig::language("layout-llm"));
+        settings.semantic_layout.provider = provider.id.clone();
+        settings.semantic_layout.model = "layout-llm".into();
+        settings.semantic_layout.reasoning_effort = ReasoningEffort::Low;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            runtime.block_on(probe_model(provider, "layout-llm")),
+            super::super::LayoutModelProtocol::Chat
+        );
+        server.join().unwrap();
+        settings.fill_layout_image_model();
+        assert_eq!(settings.semantic_layout.image_model, "layout-llm");
+        assert_eq!(
+            settings.semantic_layout.image_provider,
+            settings.semantic_layout.provider
+        );
+        assert_eq!(
+            settings.semantic_layout.image_reasoning_effort,
+            ReasoningEffort::Low
+        );
+
+        settings.semantic_layout.image_model = "separately-configured-model".into();
+        settings.fill_layout_image_model();
+        assert_eq!(
+            settings.semantic_layout.image_model,
+            "separately-configured-model"
+        );
+
+        settings.semantic_layout.image_model.clear();
+        settings.semantic_layout.model = "aliyun/decision".into();
+        settings.fill_layout_image_model();
+        assert!(settings.semantic_layout.image_model.is_empty());
     }
 
     #[test]
@@ -677,7 +872,7 @@ mod tests {
         provider.models.push(AiModelConfig::language(FIGURE_MODEL));
         settings.semantic_layout.enabled = true;
         settings.semantic_layout.provider = provider.id.clone();
-        settings.semantic_layout.model = provider.models[0].id.clone();
+        settings.semantic_layout.model = FIGURE_MODEL.into();
 
         let section = section(vec![
             text("prose", "Shapes can vary."),
@@ -696,7 +891,6 @@ mod tests {
                 &fingerprint(&section),
                 0..3,
                 true,
-                None,
                 None,
                 Some(source.as_ref()),
             ))
@@ -730,8 +924,7 @@ mod tests {
             .push(AiModelConfig::language("aliyun/decision"));
         settings.semantic_layout.enabled = true;
         settings.semantic_layout.provider = provider.id.clone();
-        settings.semantic_layout.model = provider.models[0].id.clone();
-        settings.semantic_layout.citation_decisions = true;
+        settings.semantic_layout.model = "aliyun/decision".into();
         let raw = section(vec![text(
             "n1",
             "The report (as documented by Bell, 2019) shares data (adjusted in 2012) with other sources.",

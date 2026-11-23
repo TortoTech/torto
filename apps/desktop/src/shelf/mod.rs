@@ -1159,7 +1159,7 @@ impl ShelfFeature {
                         let settings = icon_button(ui, Icon::Settings);
                         if ui
                             .add_enabled_ui(!interaction_blocked, |ui| {
-                                icon_button(ui, Icon::MessageCircleQuestion)
+                                icon_button(ui, Icon::Mail)
                             })
                             .inner
                             .on_hover_text(self.language.text("反馈问题", "Report an issue"))

@@ -22,6 +22,7 @@ const SETTINGS_FONT_SELECT_WIDTH: f32 = 260.0;
 const SETTINGS_SCROLLBAR_GUTTER: f32 = 14.0;
 const SHORTCUT_CONTROL_WIDTH: f32 = 180.0;
 
+#[derive(Clone)]
 struct ConfiguredModel {
     provider_id: String,
     provider_name: String,
@@ -66,6 +67,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
                 .inner_margin(0),
         )
         .show(ctx, |ui| {
+            ui.visuals_mut().interact_cursor = Some(egui::CursorIcon::PointingHand);
             ui.set_width(modal_size.x);
             ui.set_height(modal_size.y);
             ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -764,7 +766,7 @@ fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
-                settings_row_label(ui, state.draft_language.text("主题", "Theme"));
+                settings_row_label(ui, state.draft_language.text("界面主题", "Interface theme"));
                 settings_row_control_sized(ui, 330.0, |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     for (theme, glyph) in [
@@ -842,6 +844,7 @@ fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
 }
 
 fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+    state.draft_plugin_settings.fill_layout_image_model();
     reader_layout_settings(
         ui,
         state.draft_language,
@@ -852,6 +855,7 @@ fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         &mut state.draft_typesetting,
         &mut state.draft_plugin_settings,
     );
+    state.schedule_layout_probe();
     ui.add_space(12.0);
     reader_typeface_settings(
         ui,
@@ -980,21 +984,23 @@ fn semantic_layout_rows(
     plugin_settings: &mut PluginSettings,
     model_options: &[ConfiguredModel],
 ) {
-    let decisions_available = plugin_settings.providers.iter()
-        .find(|provider| provider.id == plugin_settings.semantic_layout.provider)
-        .is_some_and(rebook_app_core::plugins::semantic_layout::supports_citation_decisions);
+    use rebook_app_core::plugins::semantic_layout::{LayoutModelProtocol, layout_model_protocol};
+    let providers = &plugin_settings.providers;
     let settings = &mut plugin_settings.semantic_layout;
     settings_row_label(ui, language.text("AI排版", "AI layout"));
     settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
         toggle_switch(ui, &mut settings.enabled);
         settings_help_icon(ui, language.text(
-            "补充未识别的引用、文内文献引用、公式图片、图注和小节标题，生成表格图表及公式符号说明",
-            "Recognize missing quotes, inline citations, formula images, captions and section headings; generate table charts and formula symbol notes",
+            "补充未被识别的块（脚注、图注等），公式转latex、图片表格转文字表格、公式符号说明",
+            "Detect missed blocks such as footnotes and captions, convert formulas to LaTeX and table images to text tables, and explain formula symbols.",
         ));
     });
     ui.end_row();
     if settings.enabled {
-        settings_row_label(ui, language.text("排版模型", "Layout model"));
+        settings_row_label(
+            ui,
+            language.text("排版分类模型", "Layout classification model"),
+        );
         settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
             configured_model_selector(
                 ui,
@@ -1005,32 +1011,76 @@ fn semantic_layout_rows(
                 language,
             );
             settings_help_icon(ui, language.text(
-                "使用能识图、速度快的模型（gemini/deepseek/qwen的flash系列）\n思考等级设置“不思考”",
-                "Use a fast, vision-capable model (Flash series from Gemini/DeepSeek/Qwen)\nSet reasoning effort to “None”",
+                "功能说明：补充未被识别的块（脚注、图注等）\n模型选用：用支持图片输入的决策模型或文本模型",
+                "Function: Detect missed blocks such as footnotes and captions.\nModel selection: Use a decision model or LLM that accepts images.",
             ));
         });
         ui.end_row();
-        settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
-        settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
-            reasoning_effort_selector(
-                ui,
-                "semantic-layout-reasoning-effort",
-                &mut settings.reasoning_effort,
-                model_options
+
+        let protocol = providers
+            .iter()
+            .find(|provider| provider.id == settings.provider)
+            .map_or(LayoutModelProtocol::Unconfirmed, |provider| {
+                layout_model_protocol(provider, &settings.model)
+            });
+        if protocol != LayoutModelProtocol::Decision {
+            settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
+            settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                reasoning_effort_selector(
+                    ui,
+                    "semantic-layout-reasoning-effort",
+                    &mut settings.reasoning_effort,
+                    model_options.iter().find(|option| {
+                        option.provider_id == settings.provider && option.model == settings.model
+                    }),
+                    language,
+                );
+            });
+            ui.end_row();
+        }
+
+        let image_options: Vec<_> = model_options
+            .iter()
+            .filter(|option| {
+                providers
                     .iter()
-                    .find(|m| m.provider_id == settings.provider && m.model == settings.model),
+                    .find(|provider| provider.id == option.provider_id)
+                    .is_some_and(|provider| {
+                        layout_model_protocol(provider, &option.model)
+                            != LayoutModelProtocol::Decision
+                    })
+            })
+            .cloned()
+            .collect();
+        settings_row_label(ui, language.text("排版生成模型", "Layout generation model"));
+        settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+            configured_model_selector(
+                ui,
+                "image-recognition-model",
+                &image_options,
+                &mut settings.image_provider,
+                &mut settings.image_model,
                 language,
             );
+            settings_help_icon(ui, language.text(
+                "功能说明：公式转latex、图片表格转文字表格、公式符号说明\n模型选用：用支持图片输入的文本模型，思考等级设置不思考",
+                "Function: Convert formulas to LaTeX and table images to text tables, and explain formula symbols.\nModel selection: Use an LLM that accepts images and set reasoning effort to None.",
+            ));
         });
         ui.end_row();
-        if decisions_available {
-            settings_row_label(ui, language.text("文献引用预判（试验）", "Citation screening (experimental)"));
+        if !settings.image_model.is_empty() {
+            settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
             settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
-                toggle_switch(ui, &mut settings.citation_decisions);
-                settings_help_icon(ui, language.text(
-                    "批量验证文献引用候选。判别不确定时使用排版模型。",
-                    "Batch-check citation candidates. Uncertain batches use the layout model.",
-                ));
+                reasoning_effort_selector(
+                    ui,
+                    "image-recognition-reasoning-effort",
+                    &mut settings.image_reasoning_effort,
+                    image_options.iter().find(|option| {
+                        option.provider_id == settings.image_provider
+                            && option.model == settings.image_model
+                    }),
+                    language,
+                );
             });
             ui.end_row();
         }
@@ -1117,27 +1167,8 @@ fn reader_typeface_settings(
                     &mut typography.font_size,
                     12.0,
                     28.0,
-                    1.0,
+                    2.0,
                     " px",
-                );
-
-                settings_slider_row(
-                    ui,
-                    language.text("最小字号", "Minimum font size"),
-                    &mut typography.minimum_font_size,
-                    8.0,
-                    18.0,
-                    1.0,
-                    " px",
-                );
-
-                settings_u16_slider_row(
-                    ui,
-                    language.text("字重", "Font weight"),
-                    &mut typography.font_weight,
-                    200,
-                    900,
-                    25,
                 );
             });
     });
@@ -1763,12 +1794,6 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                     }
                 });
                 ui.end_row();
-
-                settings_row_label(ui, language.text("翻译目录", "Translate table of contents"));
-                settings_row_control_sized(ui, 44.0, |ui| {
-                    toggle_switch(ui, &mut settings.translate_toc);
-                });
-                ui.end_row();
             });
     });
 }
@@ -2173,7 +2198,7 @@ fn inherited_cjk_font_selector(
     font_families: &[String],
 ) {
     let inherited = language.text("跟随中日韩主要字体", "Follow CJK primary font");
-    egui::ComboBox::from_id_salt("settings-latin-cjk-font")
+    let response = egui::ComboBox::from_id_salt("settings-latin-cjk-font")
         .width(SETTINGS_FONT_SELECT_WIDTH)
         .truncate()
         .selected_text(selected.as_ref().map_or_else(
@@ -2181,7 +2206,11 @@ fn inherited_cjk_font_selector(
             |family| crate::fonts::family_label(ui.ctx(), family),
         ))
         .show_ui(ui, |ui| {
-            if ui.selectable_label(selected.is_none(), inherited).clicked() {
+            if ui
+                .selectable_label(selected.is_none(), inherited)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
                 *selected = None;
                 ui.close();
             }
@@ -2201,6 +2230,9 @@ fn inherited_cjk_font_selector(
                 }
             }
         });
+    response
+        .response
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
 fn font_family_selector(
@@ -2223,11 +2255,13 @@ fn font_family_selector(
         .show_ui(ui, |ui| {
             for family in font_families {
                 let is_selected = *selected == *family;
-                let response = ui.selectable_value(
-                    selected,
-                    family.clone(),
-                    crate::fonts::family_label(ui.ctx(), &font_family_label(family, language)),
-                );
+                let response = ui
+                    .selectable_value(
+                        selected,
+                        family.clone(),
+                        crate::fonts::family_label(ui.ctx(), &font_family_label(family, language)),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if response.clicked() {
                     crate::fonts::request_family(ui.ctx(), family);
                 }
@@ -2236,7 +2270,10 @@ fn font_family_selector(
                 }
             }
         });
-    let is_open = egui::ComboBox::is_open(ui.ctx(), response.response.id);
+    let combo_response = response
+        .response
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let is_open = egui::ComboBox::is_open(ui.ctx(), combo_response.id);
     ui.ctx()
         .data_mut(|data| data.insert_temp(popup_state_id, is_open));
 }
@@ -2499,8 +2536,8 @@ fn target_language_label(value: &str, language: AppLanguage) -> String {
 fn theme_label(language: AppLanguage, theme: AppTheme) -> &'static str {
     match theme {
         AppTheme::System => language.text("跟随系统", "Follow system"),
-        AppTheme::Light => language.text("浅色模式", "Light"),
-        AppTheme::Dark => language.text("深色模式", "Dark"),
+        AppTheme::Light => language.text("浅色主题", "Light theme"),
+        AppTheme::Dark => language.text("深色主题", "Dark theme"),
     }
 }
 
@@ -2652,7 +2689,7 @@ fn settings_u16_slider_row(
     ui.end_row();
 }
 
-fn smooth_numeric_slider(
+pub(crate) fn smooth_numeric_slider(
     ui: &mut egui::Ui,
     value: f32,
     minimum: f32,
@@ -2808,6 +2845,7 @@ mod tests {
             plugin_settings: crate::plugins::PluginSettings::default(),
             language: AppLanguage::English,
             theme: crate::preferences::AppTheme::Light,
+            reader_theme: preferences.reader_theme,
             selection_granularity: preferences.selection_granularity,
             shortcuts: preferences.shortcuts,
             sync_settings: crate::sync::SyncSettings::new_device(),

@@ -1932,7 +1932,7 @@ fn caption_window_retries_with_text_for_a_text_only_model() {
     let client = crate::http::builder().build().unwrap();
     let (groups, skipped) = tokio::runtime::Runtime::new().unwrap().block_on(recognize_windows(
         &client, &settings, &section, "caption-text-fallback", &fingerprint(&section), 0..1, true,
-        None, None, Some(source.as_ref()),
+        None, Some(source.as_ref()),
     )).unwrap();
     server.join().unwrap();
     assert_eq!(skipped, 0);

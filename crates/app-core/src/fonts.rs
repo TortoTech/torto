@@ -15,15 +15,33 @@ pub struct Face {
     pub index: u32,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FontSet {
-    pub faces: [Option<Face>; 3],
+    pub faces: Vec<Option<Face>>,
+}
+
+impl Default for FontSet {
+    fn default() -> Self {
+        Self {
+            faces: vec![None; catalog::catalog().fonts.len()],
+        }
+    }
 }
 
 impl FontSet {
     pub fn reader_fonts(&self) -> Arc<[Blob<u8>]> {
+        let catalog = catalog::catalog();
         let mut blobs: Vec<Blob<u8>> = Vec::new();
-        for face in self.faces.iter().flatten() {
+        for (index, face) in self.faces.iter().enumerate() {
+            let Some(face) = face else {
+                continue;
+            };
+            if let Some(asset) = catalog.fonts.get(index) {
+                rebook_layout::register_font_blob_family_override(
+                    face.data.id(),
+                    asset.family.clone(),
+                );
+            }
             if !blobs.iter().any(|blob| blob.id() == face.data.id()) {
                 blobs.push(face.data.clone());
             }
@@ -31,7 +49,7 @@ impl FontSet {
         blobs.into()
     }
     pub fn cjk(&self) -> Option<Face> {
-        self.faces[0].clone()
+        self.faces.first().cloned().flatten()
     }
 }
 
