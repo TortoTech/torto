@@ -251,7 +251,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                 mutable.update {it.copy(downloadingFontFamily=null)}
                 throw e
             }catch(e:Exception){
-                mutable.update {it.copy(downloadingFontFamily=null,notice=e.message ?: tr("字体下载失败","Font download failed"))}
+                mutable.update {it.copy(downloadingFontFamily=null,notice=e.message ?: if(it.language=="en")"Font download failed" else "字体下载失败")}
             }
         }
     }
@@ -271,9 +271,9 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             }
             result.onSuccess {imported->
                 val catalog=runCatching {core.readerFontCatalog()}.getOrNull()
-                mutable.update {it.copy(fontCatalog=catalog ?: it.fontCatalog,notice=tr("已导入字体：","Imported font: ")+imported.label)}
+                mutable.update {it.copy(fontCatalog=catalog ?: it.fontCatalog,notice=(if(it.language=="en")"Imported font: " else "已导入字体：")+imported.label)}
             }.onFailure {e->
-                mutable.update {it.copy(notice=e.message ?: tr("导入字体失败","Failed to import font"))}
+                mutable.update {it.copy(notice=e.message ?: if(it.language=="en")"Failed to import font" else "导入字体失败")}
             }
         }
     }
@@ -684,7 +684,7 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
                             openComposer()
                         }
                     } else {
-                        val existing=state.value.annotations.find {it.text.trim()==sel.text.trim()&&!it.note.isNullOrBlank()}
+                        val existing=state.value.annotations.find {it.quote.trim()==sel.text.trim()&&!it.note.isNullOrBlank()}
                         if(existing!=null){
                             val notes=r.editAnnotation(existing.id,null)
                             if(token==generation)mutable.update {it.copy(annotations=notes)}
