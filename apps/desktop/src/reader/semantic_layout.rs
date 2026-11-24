@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 mod batching;
 mod enhancements;
 mod preparation;
+mod passage_chart;
 
 const SETTLE: Duration = rebook_app_core::reading_ai::SETTLE;
 const VIEWPORT_SETTLE: Duration = Duration::from_millis(120);
@@ -69,6 +70,8 @@ pub(super) struct SemanticLayoutState {
     semantic_config: Option<(
         crate::plugins::semantic_layout::SemanticLayoutSettings,
         Option<crate::plugins::AiProvider>,
+        Option<crate::plugins::AiProvider>,
+        crate::plugins::semantic_layout::LayoutModelProtocol,
         String,
     )>,
     translation_config: Option<(
@@ -84,6 +87,8 @@ pub(super) struct SemanticLayoutState {
     active: Option<Job>,
     receiver: Option<mpsc::Receiver<(Job, Result<Recognition, String>)>>,
     enhancements: enhancements::State,
+    passage_chart: Option<passage_chart::PendingPassageChart>,
+    passage_chart_translated: bool,
     done: HashMap<(usize, usize), String>,
     groups: Vec<Group>,
     translations: HashMap<Key, BlockTranslation>,
@@ -334,6 +339,11 @@ impl DesktopReader {
         let semantic = (
             self.plugin_settings.semantic_layout.clone(),
             provider(&self.plugin_settings.semantic_layout.provider).cloned(),
+            provider(&self.plugin_settings.semantic_layout.image_provider).cloned(),
+            self.plugin_settings.semantic_layout_endpoint().map_or(
+                crate::plugins::semantic_layout::LayoutModelProtocol::Unconfirmed,
+                |(provider, model)| crate::plugins::semantic_layout::layout_model_protocol(provider, model),
+            ),
             self.plugin_settings.resolved_target_language(
                 crate::preferences::AppLanguage::system_translation_target(),
             ),
@@ -375,6 +385,7 @@ impl DesktopReader {
             self.semantic_layout.translations.clear();
             self.semantic_layout.failed.clear();
             if self.semantic_layout.translation_config.is_some() {
+                self.semantic_source.clear_passage_charts();
                 self.translation.canonical_titles.clear();
                 self.translation.toc_labels.clear();
                 self.translation.toc_task.cancel();
@@ -410,6 +421,7 @@ impl DesktopReader {
         if self.sync_content_config() {
             let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
         }
+        self.tick_passage_chart(runtime, proxy);
         self.poll_semantic_reflow(runtime, proxy);
         let semantic = self.semantic_enabled();
         if !self.translation.enabled {

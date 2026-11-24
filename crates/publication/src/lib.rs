@@ -1169,6 +1169,11 @@ impl ImageLength {
 /// Reflowable image sizing subset modeled after the rebook text-image IR.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImageStyle {
+    /// Physical CSS float side; absent for ordinary media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub float_right: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub float_gap: f32,
     pub width: Option<ImageLength>,
     pub height: Option<ImageLength>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1248,6 +1253,17 @@ pub struct SyntaxColors {
     pub dark: Rgba,
 }
 
+/// Authored floating initial, kept apart from ordinary inline emphasis.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DropCap {
+    pub right: bool,
+    /// Combined physical margin and padding (top, right, bottom, left), in reader ems.
+    pub insets: [f32; 4],
+    pub line_height: f32,
+    /// Size without the initial when there is no room for the authored float.
+    pub ordinary_scale: f32,
+}
+
 /// Renderer-independent inline presentation and semantic subset.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
@@ -1305,6 +1321,8 @@ pub struct TextStyle {
     /// and inherited container sizes are excluded, as are baseline defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline_size_scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_cap: Option<DropCap>,
     pub color: Rgba,
     /// Vertical placement relative to the surrounding text baseline.
     #[serde(default)]
@@ -1344,6 +1362,7 @@ impl Default for TextStyle {
             size_scale: 1.0,
             keyword_size_scale: None,
             inline_size_scale: None,
+            drop_cap: None,
             color: Rgba::BLACK,
             baseline: TextBaseline::Normal,
             link_role: LinkRole::Normal,
@@ -1463,6 +1482,15 @@ pub enum ListMarkerFormat { LowerAlpha, UpperAlpha,
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlockStyle {
+    /// Scalars in an authored floating label, or in its joined display prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floating_label: Option<u32>,
+    /// Clear an authored side float before this block: 1 left, 2 right, 3 both.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub clear_floats: u8,
+    /// Right-floated, authored label of a standalone equation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub right_equation_number: bool,
     /// Keep authored URL text visible inside technical/quotation groups.
     #[serde(default)]
     pub literal_links: bool,
@@ -1497,6 +1525,10 @@ pub struct BlockStyle {
     /// unified typesetting to distinguish authored intent from fallback style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authored_alignment: Option<TextAlignment>,
+    /// A table heading can be authored as a data cell in a thead or with an
+    /// ARIA header role. Preserve its alignment without changing its styling.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_table_alignment: bool,
     /// Alignment recommended by a semantic overlay for unified typesetting.
     /// Kept separate from authored styles so book-mode rendering retains them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1527,6 +1559,9 @@ pub struct BlockStyle {
 impl Default for BlockStyle {
     fn default() -> Self {
         Self {
+            floating_label: None,
+            clear_floats: 0,
+            right_equation_number: false,
             literal_links: false,
             reference_owner: None,
             paragraph_group: None,
@@ -1537,6 +1572,7 @@ impl Default for BlockStyle {
             list_marker_format: None,
             align: TextAlignment::Start,
             authored_alignment: None,
+            keep_table_alignment: false,
             semantic_alignment: None,
             margin_before: 0.0,
             margin_after: 16.0,
@@ -1550,6 +1586,9 @@ impl Default for BlockStyle {
         }
     }
 }
+
+fn is_zero_u8(n: &u8) -> bool { *n == 0 }
+fn is_zero_f32(n: &f32) -> bool { *n == 0.0 }
 
 fn default_logical_alignment() -> bool {
     true

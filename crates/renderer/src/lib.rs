@@ -1841,12 +1841,13 @@ impl ShapedTextRegion {
         if byte_range.end <= byte_range.start {
             return Vec::new();
         }
-        let shared_wrapped_end = self
-            .discretionary_hyphens
-            .iter()
-            .fold(shared_wrapped_content_end(&self.layout), |end, hyphen| {
-                end.max(hyphen.end)
-            });
+        let has_float = self.layout.has_flow_exclusion();
+        let shared_wrapped_end = if has_float {
+            0.0
+        } else {
+            self.discretionary_hyphens.iter()
+                .fold(shared_wrapped_content_end(&self.layout), |end, hyphen| end.max(hyphen.end))
+        };
         let selection = Selection::new(
             Cursor::from_byte_index(&self.layout, byte_range.start, Affinity::Downstream),
             Cursor::from_byte_index(&self.layout, byte_range.end, Affinity::Upstream),
@@ -1874,6 +1875,13 @@ impl ShapedTextRegion {
                 })
             })
             .map(|(rect, line_index)| {
+                // A floating initial owns a separate selection rectangle and
+                // each wrapped line has its own measure; never extend those
+                // rectangles to the full-width lines below the initial.
+                if has_float {
+                    return Rect::new(rect.x0, rect.y0, rect.x1, rect.y1)
+                        + Vec2::new(f64::from(self.origin_x), f64::from(self.origin_y));
+                }
                 let mut x0 = rect.x0;
                 let mut x1 = rect.x1;
 
@@ -3179,7 +3187,7 @@ fn compile_text_commands(
             }
         }
         let body_font_size = line
-            .runs()
+            .body_runs()
             .filter(|run| {
                 run.clusters().any(|cluster| {
                     let brush = cluster.style().brush;

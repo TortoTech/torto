@@ -99,7 +99,7 @@ const fn should_hide_reader_cursor(
 }
 
 const fn reader_menu_close_requested(overlay: ReaderOverlay, escape_pressed: bool) -> bool {
-    matches!(overlay, ReaderOverlay::Menu) && escape_pressed
+    matches!(overlay, ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode) && escape_pressed
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -828,8 +828,14 @@ impl DesktopReader {
                     self.request_frame_repaint(ui.ctx());
 
                 });
-                let visibility = if self.ui.overlay == ReaderOverlay::Menu { 1.0 }
-                    else { self.ui.toolbar_motion.value };
+                let visibility = if matches!(
+                    self.ui.overlay,
+                    ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+                ) {
+                    1.0
+                } else {
+                    self.ui.toolbar_motion.value
+                };
                 paint_reader_header(ui.painter(), header_rect, background_ui, visibility);
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 crate::app::window_chrome::bounded_ui(ui, toolbar_rect, |ui| self.toolbar(ui));
@@ -845,7 +851,12 @@ impl DesktopReader {
             self.floating_sidebar(&ctx, sidebar_progress);
         }
         self.header_sidebar_toggles(&ctx, page_rect, sidebar_progress);
-        if self.ui.toolbar_motion.value > 0.02 || self.ui.overlay == ReaderOverlay::Menu {
+        if self.ui.toolbar_motion.value > 0.02
+            || matches!(
+                self.ui.overlay,
+                ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+            )
+        {
             paint_toolbar_title(
                 root_ui,
                 toolbar_rect,
@@ -1411,7 +1422,10 @@ impl DesktopReader {
         }
         let focus_footnote_requested =
             self.focus_footnote_shortcut_requested(ctx, interaction_blocked);
-        let escape_pressed = self.ui.overlay == ReaderOverlay::Menu
+        let escape_pressed = matches!(
+            self.ui.overlay,
+            ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+        )
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if reader_menu_close_requested(self.ui.overlay, escape_pressed) {
             self.close_overlay();
@@ -2180,9 +2194,7 @@ impl DesktopReader {
                 self.toggle_current_focus_structure();
             }
             Some(4) => {
-                if let Some((source, _)) = self.current_focus_chart_control() {
-                    self.toggle_table_chart(ctx, &source);
-                }
+                self.visualize_current_block(ctx);
             }
             Some(_) => {}
             None => return false,
@@ -2389,7 +2401,12 @@ impl DesktopReader {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn window_menu(&mut self, ctx: &egui::Context) {
-        if self.ui.toolbar_motion.value <= 0.02 && self.ui.overlay != ReaderOverlay::Menu {
+        if self.ui.toolbar_motion.value <= 0.02
+            && !matches!(
+                self.ui.overlay,
+                ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+            )
+        {
             return;
         }
         let screen = ctx.content_rect();
@@ -2428,7 +2445,11 @@ impl DesktopReader {
         if self.focus_assistant_popup_visible() {
             return;
         }
-        let hovered = self.ui.toolbar_motion.value > 0.02 || self.ui.overlay == ReaderOverlay::Menu;
+        let hovered = self.ui.toolbar_motion.value > 0.02
+            || matches!(
+                self.ui.overlay,
+                ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+            );
         let screen = ctx.content_rect();
         let floating = !self.ui.sidebar_pinned && sidebar_progress > 0.001;
         let left = if floating {
@@ -2472,6 +2493,64 @@ impl DesktopReader {
                         .clicked()
                     {
                         self.set_sidebar_open(!self.ui.sidebar_open);
+                    }
+                });
+        }
+        let text_button_left =
+            super::chrome::right_sidebar_button_left(page_rect.right(), menu_left)
+                - TOOLBAR_CONTROL_SIZE;
+        if !self.is_focus_mode() && (hovered || self.ui.overlay == ReaderOverlay::SelectionMode) {
+            let selection_button_left = text_button_left - TOOLBAR_CONTROL_SIZE;
+            egui::Area::new(egui::Id::unique("reader-selection-mode-toggle"))
+                .fade_in(false)
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(selection_button_left, y))
+                .constrain(false)
+                .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
+                .show(ctx, |ui| {
+                    if self.ui.opening_toolbar_pending {
+                        chrome::dim_loading_controls(ui);
+                    }
+                    if selectable_icon_button(
+                        ui,
+                        Icon::TextSelect,
+                        self.ui.overlay == ReaderOverlay::SelectionMode,
+                    )
+                    .on_hover_text(self.language.text("文字选择", "Text selection"))
+                    .clicked()
+                    {
+                        if self.ui.overlay == ReaderOverlay::SelectionMode {
+                            self.close_overlay();
+                        } else {
+                            self.set_overlay(ReaderOverlay::SelectionMode);
+                        }
+                    }
+                });
+        }
+        if hovered || self.ui.overlay == ReaderOverlay::TextSettings {
+            egui::Area::new(egui::Id::unique("reader-text-settings-toggle"))
+                .fade_in(false)
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(text_button_left, y))
+                .constrain(false)
+                .default_size(Vec2::splat(TOOLBAR_CONTROL_SIZE))
+                .show(ctx, |ui| {
+                    if self.ui.opening_toolbar_pending {
+                        chrome::dim_loading_controls(ui);
+                    }
+                    if selectable_icon_button(
+                        ui,
+                        Icon::Type,
+                        self.ui.overlay == ReaderOverlay::TextSettings,
+                    )
+                    .on_hover_text(self.language.text("字体设置", "Font settings"))
+                    .clicked()
+                    {
+                        if self.ui.overlay == ReaderOverlay::TextSettings {
+                            self.close_overlay();
+                        } else {
+                            self.set_overlay(ReaderOverlay::TextSettings);
+                        }
                     }
                 });
         }
@@ -2525,9 +2604,19 @@ impl DesktopReader {
         );
         let content_left = self.toolbar_content_left(toolbar_width);
         let left_opacity = self.left_toolbar_opacity()
-            * if self.ui.overlay == ReaderOverlay::Menu { 1.0 } else { self.ui.toolbar_motion.value.clamp(0.0, 1.0) };
+            * if matches!(
+                self.ui.overlay,
+                ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+            ) {
+                1.0
+            } else {
+                self.ui.toolbar_motion.value.clamp(0.0, 1.0)
+            };
         let toolbar_actions_visible = self.ui.toolbar_motion.value.clamp(0.0, 1.0) > 0.02
-            || self.ui.overlay == ReaderOverlay::Menu;
+            || matches!(
+                self.ui.overlay,
+                ReaderOverlay::Menu | ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+            );
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(0, vertical_padding))
             .show(ui, |ui| {
@@ -2750,7 +2839,6 @@ impl DesktopReader {
             return &self.display_metadata.title;
         };
         if self.translation.enabled
-            && self.plugin_settings.translate_toc
             && let Some(label) = self.translation.toc_labels.get(active_id)
         {
             return label;
@@ -3528,7 +3616,9 @@ impl DesktopReader {
         reason = "the compact focus toolbar keeps its actions and editor transitions together"
     )]
     fn focus_actions_overlay(&mut self, ctx: &egui::Context, page_rect: Rect) {
-        if !self.ui.focus_actions_visible {
+        let pending = self.focus_units.get(self.focus_unit_index)
+            .is_some_and(|unit| self.passage_chart_pending(&unit.range));
+        if !self.ui.focus_actions_visible && !pending {
             return;
         }
         let viewport = crate::ui::overlay_rect(ctx);
@@ -3552,7 +3642,7 @@ impl DesktopReader {
         };
         let chart_control = self.current_focus_chart_control();
         let mut y = focus_actions_overlay_y(note_open, anchor_y, viewport);
-        if !note_open && chart_control.is_some() {
+        if !note_open && (chart_control.is_some() || pending) {
             y = y.min((viewport.bottom() - 190.0).max(viewport.top() + 12.0));
         }
         let mut chat = false;
@@ -3602,7 +3692,9 @@ impl DesktopReader {
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
-                if let Some(draft) = self.annotation_note_draft.as_mut() {
+                if pending && !self.ui.focus_actions_visible {
+                    ui.add(crate::ui::LoadingSpinner::new().color(palette().accent));
+                } else if let Some(draft) = self.annotation_note_draft.as_mut() {
                     focus_assistant_frame(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
                         ui.set_width((width - 20.0).max(100.0));
                         match focus_annotation_editor(ui, draft, self.language) {
@@ -3636,6 +3728,8 @@ impl DesktopReader {
                             switch_chart = table_chart_toggle_button(
                                 ui, self.language, *active, Some(&self.shortcuts.focus_table_chart),
                             ).clicked();
+                        } else if pending {
+                            ui.add(crate::ui::LoadingSpinner::new().color(palette().accent));
                         }
                     });
                 }
@@ -3657,9 +3751,7 @@ impl DesktopReader {
             self.ui.focus_actions_visible = false;
             self.toggle_current_focus_structure();
         } else if switch_chart {
-            if let Some((source, _)) = chart_control {
-                self.toggle_table_chart(ctx, &source);
-            }
+            self.visualize_current_block(ctx);
         } else if save_note {
             let note = self
                 .annotation_note_draft
@@ -3801,7 +3893,7 @@ impl DesktopReader {
             let row = self.reader.toc_items()[row_indices[visible_index]].clone();
             let selected = active == Some(&row.id);
             let keyboard_focused = keyboard_row == Some(visible_index);
-            let display_label = if self.translation.enabled && self.plugin_settings.translate_toc {
+            let display_label = if self.translation.enabled {
                 self.translation
                     .toc_labels
                     .get(&row.id)
@@ -4698,10 +4790,6 @@ impl DesktopReader {
         reason = "the compact reader menu keeps its mutually exclusive mode actions together"
     )]
     fn menu(&mut self, ctx: &egui::Context) {
-        let progress = self.ui.menu_motion.value.clamp(0.0, 1.0);
-        if progress <= 0.001 {
-            return;
-        }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let assistant_inset = if self.is_focus_mode() {
             0.0
@@ -4710,18 +4798,54 @@ impl DesktopReader {
         };
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let assistant_inset = crate::app::window_chrome::reserve_width(ctx);
+        self.text_settings_popup(ctx, assistant_inset);
+        self.selection_mode_popup(ctx);
+        if matches!(
+            self.ui.overlay,
+            ReaderOverlay::TextSettings | ReaderOverlay::SelectionMode
+        ) {
+            return;
+        }
+        let progress = self.ui.menu_motion.value.clamp(0.0, 1.0);
+        if progress <= 0.001 {
+            return;
+        }
+        let backdrop_rect = ctx.content_rect();
+        egui::Area::new(egui::Id::unique("reader-menu-backdrop"))
+            .order(egui::Order::Middle)
+            .fixed_pos(backdrop_rect.min)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    backdrop_rect,
+                    0.0,
+                    egui::Color32::BLACK.gamma_multiply(0.06 * progress),
+                );
+            });
         let menu = egui::Area::new(egui::Id::unique("reader-menu"))
             .order(egui::Order::Tooltip)
             .anchor(
                 egui::Align2::RIGHT_TOP,
                 Vec2::new(
-                    -12.0 - assistant_inset,
+                    -16.0,
                     TOOLBAR_HEIGHT + 8.0 - (1.0 - progress) * 8.0,
                 ),
             )
             .show(ctx, |ui| {
+                ui.visuals_mut().interact_cursor = Some(egui::CursorIcon::PointingHand);
+                ui.multiply_opacity(progress);
                 egui::Frame::popup(ui.style())
-                    .fill(palette().surface)
+                    .fill(palette().surface.gamma_multiply(progress))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        palette().border.gamma_multiply(progress),
+                    ))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 28,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha((32.0 * progress) as u8),
+                    })
                     .corner_radius(9)
                     .inner_margin(6)
                     .show(ui, |ui| {
@@ -4740,7 +4864,11 @@ impl DesktopReader {
                         let mode_button = ui.add_enabled_ui(focus_allowed, |ui| {
                             navigation_button(
                                 ui,
-                                Icon::BrainCircuit,
+                                if self.is_focus_mode() {
+                                    Icon::Target
+                                } else {
+                                    Icon::BookText
+                                },
                                 if self.is_focus_mode() {
                                     self.language.text("专注模式", "Focus mode")
                                 } else {
@@ -4790,32 +4918,34 @@ impl DesktopReader {
                             };
                             self.request_settings_change(ReaderSettingsChange::Spread(spread));
                         }
-                        let theme = crate::ui::theme_preference();
+                        let reader_theme = crate::preferences::ReaderTheme::from_dark(
+                            crate::ui::palette().dark,
+                        );
                         if navigation_button(
                             ui,
-                            match theme {
-                                AppTheme::System => Icon::Monitor,
-                                AppTheme::Light => Icon::Sun,
-                                AppTheme::Dark => Icon::Moon,
+                            match reader_theme {
+                                crate::preferences::ReaderTheme::Light => Icon::Sun,
+                                crate::preferences::ReaderTheme::Dark => Icon::Moon,
                             },
-                            match theme {
-                                AppTheme::System => self.language.text("跟随系统", "Follow system"),
-                                AppTheme::Light => self.language.text("浅色模式", "Light mode"),
-                                AppTheme::Dark => self.language.text("黑夜模式", "Dark mode"),
+                            match reader_theme {
+                                crate::preferences::ReaderTheme::Light => {
+                                    self.language.text("浅色主题", "Light theme")
+                                }
+                                crate::preferences::ReaderTheme::Dark => {
+                                    self.language.text("深色主题", "Dark theme")
+                                }
                             },
                             false,
                         )
                         .clicked()
                         {
-                            self.request_settings_change(ReaderSettingsChange::Theme(theme.next()));
+                            self.request_settings_change(ReaderSettingsChange::Theme(
+                                reader_theme.toggle(),
+                            ));
                         }
-                        if !self.is_focus_mode() {
-                            self.selection_mode_menu(ui);
-                        }
-                        ui.separator();
                         if navigation_button(
                             ui,
-                            Icon::MessageCircleQuestion,
+                            Icon::Mail,
                             self.language.text("反馈问题", "Report an issue"),
                             false,
                         )
@@ -4837,6 +4967,373 @@ impl DesktopReader {
         if clicked_outside {
             self.close_overlay();
         }
+    }
+
+    fn text_settings_popup(&mut self, ctx: &egui::Context, _assistant_inset: f32) {
+        let is_open = self.ui.overlay == ReaderOverlay::TextSettings;
+        let visible = ctx.animate_bool_with_time(
+            egui::Id::unique("reader-text-settings-overlay-motion"),
+            is_open,
+            0.18,
+        );
+        if visible <= f32::EPSILON {
+            return;
+        }
+        let screen = crate::ui::overlay_rect(ctx);
+        let modal_width = 420.0_f32.min((screen.width() - 32.0).max(320.0));
+        let target_height: f32 = 404.0;
+        let modal_height = target_height.min((screen.height() - 72.0).max(340.0));
+        let offset = Vec2::new(-16.0, 52.0 + (1.0 - visible) * 8.0);
+        let modal_id = egui::Id::unique("reader-text-settings-modal");
+        let modal_area = crate::ui::modal_area(ctx, modal_id).anchor(
+            egui::Align2::RIGHT_TOP,
+            offset,
+        );
+        let mut close_requested = false;
+        let response = crate::ui::modal(ctx, modal_id, 0.06 * visible)
+            .area(modal_area)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette().background.gamma_multiply(visible))
+                    .stroke(egui::Stroke::new(1.0, palette().border.gamma_multiply(visible)))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 28,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha((32.0 * visible) as u8),
+                    })
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(20, 16)),
+            )
+            .show(ctx, |ui| {
+                ui.visuals_mut().interact_cursor = Some(egui::CursorIcon::PointingHand);
+                ui.multiply_opacity(visible);
+                ui.set_width((modal_width - 40.0).max(1.0));
+                ui.set_min_height((modal_height - 32.0).max(1.0));
+                ui.set_max_height((modal_height - 32.0).max(1.0));
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
+                ui.style_mut().visuals.widgets.hovered.expansion = 0.0;
+                ui.style_mut().visuals.widgets.active.expansion = 0.0;
+                ui.style_mut().visuals.widgets.open.expansion = 0.0;
+
+                ui.label(
+                    RichText::new(self.language.text("字号", "Font size"))
+                        .size(crate::ui::scaled_font_size(13.5)),
+                );
+
+                self.text_settings_menu(ui);
+            });
+        if is_open && (close_requested || response.should_close()) {
+            self.close_overlay();
+        }
+    }
+
+    fn selection_mode_popup(&mut self, ctx: &egui::Context) {
+        let is_open = !self.is_focus_mode() && self.ui.overlay == ReaderOverlay::SelectionMode;
+        let visible = ctx.animate_bool_with_time(
+            egui::Id::unique("reader-selection-mode-modal-anim"),
+            is_open,
+            0.18,
+        );
+        if visible <= 0.001 {
+            return;
+        }
+        let offset = Vec2::new(-16.0, 52.0 + (1.0 - visible) * 8.0);
+        let modal_id = egui::Id::unique("reader-selection-mode-modal");
+        let modal_area = crate::ui::modal_area(ctx, modal_id)
+            .anchor(egui::Align2::RIGHT_TOP, offset);
+        let mut close_requested = false;
+        let response = crate::ui::modal(ctx, modal_id, 0.06 * visible)
+            .area(modal_area)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette().background.gamma_multiply(visible))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        palette().border.gamma_multiply(visible),
+                    ))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 28,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha((32.0 * visible) as u8),
+                    })
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(12, 12)),
+            )
+            .show(ctx, |ui| {
+                ui.visuals_mut().interact_cursor = Some(egui::CursorIcon::PointingHand);
+                ui.multiply_opacity(visible);
+                ui.set_width(148.0);
+                ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
+                ui.style_mut().visuals.widgets.hovered.expansion = 0.0;
+                ui.style_mut().visuals.widgets.active.expansion = 0.0;
+                ui.style_mut().visuals.widgets.open.expansion = 0.0;
+
+                let choices = [
+                    (
+                        SelectionGranularity::Free,
+                        self.language.text("自由选择", "Free"),
+                    ),
+                    (
+                        SelectionGranularity::Word,
+                        self.language.text("按单词选择", "Word"),
+                    ),
+                    (
+                        SelectionGranularity::Sentence,
+                        self.language.text("按句子选择", "Sentence"),
+                    ),
+                    (
+                        SelectionGranularity::Paragraph,
+                        self.language.text("按段落选择", "Paragraph"),
+                    ),
+                ];
+                for (granularity, label) in choices {
+                    let selected = self.selection_granularity == granularity;
+                    let btn = egui::Button::new(
+                        RichText::new(label)
+                            .size(crate::ui::scaled_font_size(13.0))
+                            .color(if selected {
+                                palette().accent
+                            } else {
+                                palette().text
+                            }),
+                    )
+                    .fill(if selected {
+                        palette().accent.gamma_multiply(0.10)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(7));
+                    if ui
+                        .add_sized(egui::vec2(ui.available_width(), 32.0), btn)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.selection_granularity = granularity;
+                        self.request_settings_change(
+                            ReaderSettingsChange::SelectionGranularity(granularity),
+                        );
+                        close_requested = true;
+                    }
+                }
+            });
+        if is_open && (close_requested || response.should_close()) {
+            self.close_overlay();
+        }
+    }
+
+    fn text_settings_menu(&mut self, ui: &mut egui::Ui) {
+        let typography = self.reader.style().typography.clone();
+        let current_size = ((typography.font_size / 2.0).round() * 2.0).clamp(12.0, 28.0);
+        let is_cjk_book = self.source.book().metadata.languages.iter().any(|lang| {
+            let l = lang.to_ascii_lowercase();
+            l.starts_with("zh") || l.starts_with("ja") || l.starts_with("ko")
+        });
+
+        let picker_id = egui::Id::unique("reader-menu-font-picker-tab");
+        let mut active_tab = ui
+            .data(|data| data.get_temp::<u8>(picker_id))
+            .unwrap_or(0);
+
+        if let Some(next) = capsule_font_size_slider(ui, current_size, 12.0, 28.0, 2.0) {
+            self.request_settings_change(ReaderSettingsChange::FontSize(next));
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(self.language.text("字体", "Font"))
+                    .size(crate::ui::scaled_font_size(13.5)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let secondary_label = if is_cjk_book {
+                    self.language.text("拉丁字体", "Latin")
+                } else {
+                    self.language.text("中日韩字体", "CJK")
+                };
+                let pill_w = if is_cjk_book { 192.0 } else { 204.0 };
+                let btn_w = pill_w / 3.0;
+                egui::Frame::new()
+                    .fill(palette().surface_muted)
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(2))
+                    .show(ui, |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(pill_w, 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for (tab_idx, tab_label) in [
+                                    (0u8, self.language.text("主要字体", "Primary")),
+                                    (1u8, secondary_label),
+                                    (2u8, self.language.text("代码字体", "Code")),
+                                ] {
+                                    let selected = active_tab == tab_idx;
+                                    let btn = egui::Button::new(
+                                        RichText::new(tab_label)
+                                            .size(crate::ui::scaled_font_size(11.5))
+                                            .color(if selected {
+                                                palette().text
+                                            } else {
+                                                palette().muted
+                                            }),
+                                    )
+                                    .fill(if selected {
+                                        palette().surface
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(egui::CornerRadius::same(10));
+                                    if ui
+                                        .add_sized(egui::vec2(btn_w, 22.0), btn)
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        active_tab = tab_idx;
+                                    }
+                                }
+                            },
+                        );
+                    });
+            });
+        });
+        ui.data_mut(|data| data.insert_temp(picker_id, active_tab));
+        ui.add_space(6.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 248.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_height(248.0);
+                if active_tab == 2 {
+                    match grouped_monospace_font_picker(
+                        ui,
+                        self.language,
+                        &typography.monospace_font,
+                    ) {
+                        Some(FontPickerAction::Select(chosen)) => {
+                            let change = ReaderSettingsChange::MonospaceFont(chosen.clone());
+                            if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                self.request_settings_change(change);
+                            } else {
+                                crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                            }
+                        }
+                        Some(FontPickerAction::OpenCustomSearch) => {
+                            crate::fonts::request_custom_import(
+                                ui.ctx(),
+                                crate::fonts::CustomImportTarget::Monospace,
+                            );
+                        }
+                        None => {}
+                    }
+                } else if is_cjk_book {
+                    if active_tab == 0 {
+                        match grouped_cjk_font_picker(
+                            ui,
+                            self.language,
+                            &typography.default_cjk_font,
+                        ) {
+                            Some(FontPickerAction::Select(chosen)) => {
+                                let change = ReaderSettingsChange::CjkFont(chosen.clone());
+                                if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                    self.request_settings_change(change);
+                                } else {
+                                    crate::fonts::request_family_with_apply(
+                                        ui.ctx(),
+                                        &chosen,
+                                        change,
+                                    );
+                                }
+                            }
+                            Some(FontPickerAction::OpenCustomSearch) => {
+                                crate::fonts::request_custom_import(
+                                    ui.ctx(),
+                                    crate::fonts::CustomImportTarget::Cjk,
+                                );
+                            }
+                            None => {}
+                        }
+                    } else {
+                        let current = typography
+                            .cjk_default_font
+                            .as_ref()
+                            .map(|c| c.family.as_str())
+                            .unwrap_or("Literata");
+                        match grouped_latin_font_picker(ui, self.language, current) {
+                            Some(FontPickerAction::Select(chosen)) => {
+                                let change =
+                                    ReaderSettingsChange::CjkLatinFont(Some(chosen.clone()));
+                                if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                    self.request_settings_change(change);
+                                } else {
+                                    crate::fonts::request_family_with_apply(
+                                        ui.ctx(),
+                                        &chosen,
+                                        change,
+                                    );
+                                }
+                            }
+                            Some(FontPickerAction::OpenCustomSearch) => {
+                                crate::fonts::request_custom_import(
+                                    ui.ctx(),
+                                    crate::fonts::CustomImportTarget::CjkLatin,
+                                );
+                            }
+                            None => {}
+                        }
+                    }
+                } else if active_tab == 0 {
+                    let current = match typography.default_font {
+                        rebook_layout::ReaderDefaultFont::Serif => typography.serif_font.as_str(),
+                        rebook_layout::ReaderDefaultFont::SansSerif => {
+                            typography.sans_serif_font.as_str()
+                        }
+                        rebook_layout::ReaderDefaultFont::Other => typography.other_font.as_str(),
+                    };
+                    match grouped_latin_font_picker(ui, self.language, current) {
+                        Some(FontPickerAction::Select(chosen)) => {
+                            let change = ReaderSettingsChange::LatinFont(chosen.clone());
+                            if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                self.request_settings_change(change);
+                            } else {
+                                crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                            }
+                        }
+                        Some(FontPickerAction::OpenCustomSearch) => {
+                            crate::fonts::request_custom_import(
+                                ui.ctx(),
+                                crate::fonts::CustomImportTarget::Latin,
+                            );
+                        }
+                        None => {}
+                    }
+                } else {
+                    let current = typography
+                        .latin_cjk_font
+                        .as_deref()
+                        .unwrap_or(&typography.default_cjk_font);
+                    match grouped_cjk_font_picker(ui, self.language, current) {
+                        Some(FontPickerAction::Select(chosen)) => {
+                            let change = ReaderSettingsChange::LatinCjkFont(Some(chosen.clone()));
+                            if crate::fonts::is_family_ready(ui.ctx(), &chosen) {
+                                self.request_settings_change(change);
+                            } else {
+                                crate::fonts::request_family_with_apply(ui.ctx(), &chosen, change);
+                            }
+                        }
+                        Some(FontPickerAction::OpenCustomSearch) => {
+                            crate::fonts::request_custom_import(
+                                ui.ctx(),
+                                crate::fonts::CustomImportTarget::LatinCjk,
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            },
+        );
     }
 
     fn selection_mode_menu(&mut self, ui: &mut egui::Ui) {
@@ -4874,7 +5371,621 @@ impl DesktopReader {
             self.request_settings_change(ReaderSettingsChange::SelectionGranularity(granularity));
         }
     }
+}
 
+fn capsule_font_size_slider(
+    ui: &mut egui::Ui,
+    value: f32,
+    min: f32,
+    max: f32,
+    step: f32,
+) -> Option<f32> {
+    let height = 38.0;
+    let width = ui.available_width().max(160.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    let mut next_value = None;
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, height * 0.5, palette().surface_muted);
+
+    let side_w = 40.0;
+    let left_rect = Rect::from_min_size(rect.min, Vec2::new(side_w, height));
+    let right_rect = Rect::from_min_size(
+        Pos2::new(rect.right() - side_w, rect.top()),
+        Vec2::new(side_w, height),
+    );
+    let track_rect = Rect::from_min_max(
+        Pos2::new(left_rect.right(), rect.top()),
+        Pos2::new(right_rect.left(), rect.bottom()),
+    );
+
+    let left_resp = ui
+        .interact(
+            left_rect,
+            ui.id().with("capsule-font-dec"),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if left_resp.clicked() && value > min {
+        next_value = Some((value - step).max(min));
+    }
+    let right_resp = ui
+        .interact(
+            right_rect,
+            ui.id().with("capsule-font-inc"),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if right_resp.clicked() && value < max {
+        next_value = Some((value + step).min(max));
+    }
+
+    let left_color = if value > min {
+        palette().text
+    } else {
+        palette().muted
+    };
+    let right_color = if value < max {
+        palette().text
+    } else {
+        palette().muted
+    };
+    painter.text(
+        left_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "A",
+        egui::FontId::proportional(crate::ui::scaled_font_size(12.0)),
+        left_color,
+    );
+    painter.text(
+        right_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "A",
+        egui::FontId::proportional(crate::ui::scaled_font_size(17.0)),
+        right_color,
+    );
+
+    let thumb_h = height - 8.0;
+    let thumb_w = thumb_h;
+    let usable_w = (track_rect.width() - thumb_w).max(1.0);
+    let track_resp = ui
+        .interact(
+            track_rect,
+            ui.id().with("capsule-font-track"),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if (track_resp.clicked() || track_resp.dragged())
+        && let Some(pos) = track_resp.interact_pointer_pos()
+    {
+        let ratio = ((pos.x - track_rect.left() - thumb_w * 0.5) / usable_w).clamp(0.0, 1.0);
+        let raw = min + ratio * (max - min);
+        let snapped = ((raw / step).round() * step).clamp(min, max);
+        if (snapped - value).abs() >= 0.5 {
+            next_value = Some(snapped);
+        }
+    }
+
+    let display_val = next_value.unwrap_or(value);
+    let ratio = ((display_val - min) / (max - min)).clamp(0.0, 1.0);
+    let thumb_x = track_rect.left() + ratio * usable_w;
+    let thumb_rect = Rect::from_min_size(
+        Pos2::new(thumb_x, rect.center().y - thumb_h * 0.5),
+        Vec2::new(thumb_w, thumb_h),
+    );
+    painter.rect(
+        thumb_rect,
+        thumb_h * 0.5,
+        palette().surface,
+        egui::Stroke::new(1.0, palette().border),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        thumb_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{}", display_val as i32),
+        egui::FontId::proportional(crate::ui::scaled_font_size(13.0)),
+        palette().text,
+    );
+
+    next_value
+}
+
+fn system_cjk_font_families(language: crate::preferences::AppLanguage) -> &'static [String] {
+    static SYSTEM_CJK_ZH: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static SYSTEM_CJK_EN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let prefer_cjk = language.text("zh", "en") == "zh";
+    let slot = if prefer_cjk {
+        &SYSTEM_CJK_ZH
+    } else {
+        &SYSTEM_CJK_EN
+    };
+    slot.get_or_init(|| {
+        let mut engine = rebook_layout::LayoutEngine::new();
+        let found = engine.available_reader_font_families_with_locale(prefer_cjk);
+        found
+            .chinese
+            .into_iter()
+            .filter(|family| {
+                !family.starts_with('.') && crate::fonts::catalog::group_for_family(family).is_none()
+            })
+            .collect()
+    })
+}
+
+enum FontPickerAction {
+    Select(String),
+    OpenCustomSearch,
+}
+
+fn grouped_cjk_font_picker(
+    ui: &mut egui::Ui,
+    language: crate::preferences::AppLanguage,
+    current_family: &str,
+) -> Option<FontPickerAction> {
+    let custom_fonts = crate::fonts::custom_cjk_families(ui.ctx());
+    let groups: [(&str, &str, usize); 4] = [
+        ("system", language.text("内置", "Built-in"), 3 + custom_fonts.len()),
+        (
+            "canger",
+            language.text("仓耳", "Tsanger"),
+            crate::fonts::catalog::cjk_families_in_group("canger").len(),
+        ),
+        (
+            "fangzheng",
+            language.text("方正", "Founder"),
+            crate::fonts::catalog::cjk_families_in_group("fangzheng").len(),
+        ),
+        (
+            "other",
+            language.text("其他", "Other"),
+            crate::fonts::catalog::cjk_families_in_group("other").len(),
+        ),
+    ];
+    let tab_id = egui::Id::unique("reader-menu-cjk-font-group");
+    let default_group = crate::fonts::catalog::group_for_family(current_family).unwrap_or("system");
+    let mut active_group = ui
+        .data(|data| data.get_temp::<String>(tab_id))
+        .unwrap_or_else(|| default_group.to_owned());
+
+    ui.add_space(4.0);
+    let bar_width = ui.available_width();
+    egui::Frame::new()
+        .fill(palette().surface_muted)
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(3))
+        .show(ui, |ui| {
+            let inner_w = (bar_width - 6.0).max(120.0);
+            let tab_w = inner_w / groups.len() as f32;
+            ui.set_width(inner_w);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                for (group_key, group_label, count) in groups {
+                    let selected = active_group == group_key;
+                    let text = format!("{group_label}({count})");
+                    let btn = egui::Button::new(
+                        RichText::new(text)
+                            .size(crate::ui::scaled_font_size(12.0))
+                            .color(if selected { palette().text } else { palette().muted }),
+                    )
+                    .fill(if selected {
+                        palette().surface
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(13));
+                    if ui
+                        .add_sized(egui::vec2(tab_w, 26.0), btn)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        active_group = group_key.to_owned();
+                    }
+                }
+            });
+        });
+    ui.data_mut(|data| data.insert_temp(tab_id, active_group.clone()));
+    ui.add_space(6.0);
+
+    let items: Vec<(String, String)> = if active_group == "system" {
+        let mut list = vec![
+            (
+                "sans-serif".to_owned(),
+                language.text("系统字体", "System font").to_owned(),
+            ),
+            (
+                "LXGW WenKai GB Screen".to_owned(),
+                crate::fonts::catalog::display_name("LXGW WenKai GB Screen").to_owned(),
+            ),
+        ];
+        list.extend(custom_fonts);
+        list.push((
+            "__custom__".to_owned(),
+            language.text("导入字体", "Import font").to_owned(),
+        ));
+        list
+    } else {
+        crate::fonts::catalog::cjk_families_in_group(&active_group)
+            .into_iter()
+            .map(|(f, l)| (f.to_owned(), l.to_owned()))
+            .collect()
+    };
+    let mut chosen = None;
+    let card_width = ((ui.available_width() - 16.0) / 3.0).max(96.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .min_scrolled_height(196.0)
+        .max_height(196.0)
+        .show(ui, |ui| {
+            egui::Grid::new("reader-menu-cjk-font-grid")
+                .num_columns(3)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    let any_downloading = crate::fonts::any_downloading(ui.ctx());
+                    for (idx, (family, label)) in items.iter().enumerate() {
+                        let is_custom = family == "__custom__";
+                        let status = if is_custom {
+                            None
+                        } else {
+                            crate::fonts::family_status(ui.ctx(), family)
+                        };
+                        let is_downloading = matches!(status, Some(crate::fonts::Status::Downloading(_)));
+                        let selected = !is_custom && !any_downloading && family == current_family;
+                        let card_text = if is_downloading {
+                            language.text("下载中", "Downloading")
+                        } else {
+                            label.as_str()
+                        };
+                        let stroke = if selected || is_downloading {
+                            egui::Stroke::new(1.5, palette().accent)
+                        } else {
+                            egui::Stroke::new(1.0, palette().border)
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(card_text)
+                                .size(crate::ui::scaled_font_size(12.5))
+                                .color(if selected || is_downloading {
+                                    palette().accent
+                                } else {
+                                    palette().text
+                                }),
+                        )
+                        .truncate()
+                        .fill(palette().surface)
+                        .stroke(stroke)
+                        .corner_radius(egui::CornerRadius::same(8));
+                        let mut response = ui
+                            .add_sized(egui::vec2(card_width, 36.0), btn)
+                            .on_hover_text(label);
+                        if !any_downloading {
+                            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }
+                        if let Some(crate::fonts::Status::Downloading(p)) = status {
+                            let frac = (p as f32 / 100.0).clamp(0.06, 1.0);
+                            let rect = response.rect.shrink(1.0);
+                            let clip = egui::Rect::from_min_max(
+                                rect.min,
+                                egui::pos2(rect.left() + rect.width() * frac, rect.max.y),
+                            );
+                            ui.painter().with_clip_rect(clip).rect_filled(
+                                rect,
+                                egui::CornerRadius::same(7),
+                                palette().accent.gamma_multiply(0.18),
+                            );
+                        }
+                        if !any_downloading && response.clicked() {
+                            chosen = Some(if is_custom {
+                                FontPickerAction::OpenCustomSearch
+                            } else {
+                                FontPickerAction::Select(family.clone())
+                            });
+                        }
+                        if idx % 3 == 2 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    chosen
+}
+
+fn system_latin_font_families() -> &'static [String] {
+    static SYSTEM_LATIN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SYSTEM_LATIN.get_or_init(|| {
+        let mut engine = rebook_layout::LayoutEngine::new();
+        let found = engine.available_reader_font_families_with_locale(false);
+        let mut seen = std::collections::HashSet::new();
+        let mut list = Vec::new();
+        for family in found.latin {
+            if crate::fonts::catalog::group_for_family(&family).is_none()
+                && seen.insert(family.clone())
+            {
+                list.push(family);
+            }
+        }
+        list.sort();
+        list
+    })
+}
+
+fn grouped_latin_font_picker(
+    ui: &mut egui::Ui,
+    language: crate::preferences::AppLanguage,
+    current_family: &str,
+) -> Option<FontPickerAction> {
+    let custom_fonts = crate::fonts::custom_latin_families(ui.ctx());
+    let extra_fonts = crate::fonts::catalog::cjk_families_in_group("latin-extra");
+    let groups: [(&str, &str, usize); 2] = [
+        ("builtin", language.text("内置", "Built-in"), 3 + custom_fonts.len()),
+        ("latin-extra", language.text("其他", "Other"), extra_fonts.len()),
+    ];
+    let tab_id = egui::Id::unique("reader-menu-latin-font-group");
+    let default_group = if crate::fonts::catalog::group_for_family(current_family) == Some("latin-extra") {
+        "latin-extra"
+    } else {
+        "builtin"
+    };
+    let mut active_group = ui
+        .data(|data| data.get_temp::<String>(tab_id))
+        .unwrap_or_else(|| default_group.to_owned());
+
+    ui.add_space(4.0);
+    let bar_width = ui.available_width();
+    egui::Frame::new()
+        .fill(palette().surface_muted)
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(3))
+        .show(ui, |ui| {
+            let inner_w = (bar_width - 6.0).max(120.0);
+            let tab_w = inner_w / groups.len() as f32;
+            ui.set_width(inner_w);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                for (group_key, group_label, count) in groups {
+                    let selected = active_group == group_key;
+                    let text = format!("{group_label}({count})");
+                    let btn = egui::Button::new(
+                        RichText::new(text)
+                            .size(crate::ui::scaled_font_size(12.0))
+                            .color(if selected { palette().text } else { palette().muted }),
+                    )
+                    .fill(if selected {
+                        palette().surface
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(13));
+                    if ui
+                        .add_sized(egui::vec2(tab_w, 26.0), btn)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        active_group = group_key.to_owned();
+                    }
+                }
+            });
+        });
+    ui.data_mut(|data| data.insert_temp(tab_id, active_group.clone()));
+    ui.add_space(6.0);
+
+    let items: Vec<(String, String)> = if active_group == "builtin" {
+        let mut list = vec![
+            (
+                "serif".to_owned(),
+                language.text("系统字体", "System font").to_owned(),
+            ),
+            ("Literata".to_owned(), "Literata".to_owned()),
+        ];
+        list.extend(custom_fonts);
+        list.push((
+            "__custom__".to_owned(),
+            language.text("导入字体", "Import font").to_owned(),
+        ));
+        list
+    } else {
+        extra_fonts
+            .into_iter()
+            .map(|(f, l)| (f.to_owned(), l.to_owned()))
+            .collect()
+    };
+
+    let mut chosen = None;
+    let card_width = ((ui.available_width() - 16.0) / 3.0).max(96.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .min_scrolled_height(196.0)
+        .max_height(196.0)
+        .show(ui, |ui| {
+            egui::Grid::new("reader-menu-latin-font-grid")
+                .num_columns(3)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    let any_downloading = crate::fonts::any_downloading(ui.ctx());
+                    for (idx, (family, label)) in items.iter().enumerate() {
+                        let is_custom = family == "__custom__";
+                        let status = if is_custom {
+                            None
+                        } else {
+                            crate::fonts::family_status(ui.ctx(), family)
+                        };
+                        let is_downloading =
+                            matches!(status, Some(crate::fonts::Status::Downloading(_)));
+                        let selected = !is_custom && !any_downloading && family == current_family;
+                        let card_text = if is_downloading {
+                            language.text("下载中", "Downloading")
+                        } else {
+                            label.as_str()
+                        };
+                        let stroke = if selected || is_downloading {
+                            egui::Stroke::new(1.5, palette().accent)
+                        } else {
+                            egui::Stroke::new(1.0, palette().border)
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(card_text)
+                                .size(crate::ui::scaled_font_size(12.5))
+                                .color(if selected || is_downloading {
+                                    palette().accent
+                                } else {
+                                    palette().text
+                                }),
+                        )
+                        .truncate()
+                        .fill(palette().surface)
+                        .stroke(stroke)
+                        .corner_radius(egui::CornerRadius::same(8));
+                        let mut response = ui
+                            .add_sized(egui::vec2(card_width, 36.0), btn)
+                            .on_hover_text(label);
+                        if !any_downloading {
+                            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }
+                        if let Some(crate::fonts::Status::Downloading(p)) = status {
+                            let frac = (p as f32 / 100.0).clamp(0.06, 1.0);
+                            let rect = response.rect.shrink(1.0);
+                            let clip = egui::Rect::from_min_max(
+                                rect.min,
+                                egui::pos2(rect.left() + rect.width() * frac, rect.max.y),
+                            );
+                            ui.painter().with_clip_rect(clip).rect_filled(
+                                rect,
+                                egui::CornerRadius::same(7),
+                                palette().accent.gamma_multiply(0.18),
+                            );
+                        }
+                        if !any_downloading && response.clicked() {
+                            chosen = Some(if is_custom {
+                                FontPickerAction::OpenCustomSearch
+                            } else {
+                                FontPickerAction::Select(family.clone())
+                            });
+                        }
+                        if idx % 3 == 2 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    chosen
+}
+
+fn system_monospace_font_families() -> &'static [String] {
+    static SYSTEM_MONO: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SYSTEM_MONO.get_or_init(|| {
+        let mut engine = rebook_layout::LayoutEngine::new();
+        let found = engine.available_reader_font_families_with_locale(false);
+        let default_mono = rebook_layout::default_monospace_font();
+        let mut seen = std::collections::HashSet::new();
+        let mut list = Vec::new();
+        for family in found.monospace {
+            if !family.starts_with('.')
+                && !family.eq_ignore_ascii_case(default_mono)
+                && seen.insert(family.clone())
+            {
+                list.push(family);
+            }
+        }
+        list.sort();
+        list
+    })
+}
+
+fn grouped_monospace_font_picker(
+    ui: &mut egui::Ui,
+    language: crate::preferences::AppLanguage,
+    current_family: &str,
+) -> Option<FontPickerAction> {
+    let mut items: Vec<(String, String)> = vec![
+        (
+            "monospace".to_owned(),
+            language.text("系统字体", "System font").to_owned(),
+        ),
+        ("Maple Mono".to_owned(), "Maple Mono".to_owned()),
+        ("Fira Code".to_owned(), "Fira Code".to_owned()),
+    ];
+    for (family, label) in crate::fonts::custom_latin_families(ui.ctx()) {
+        if !items.iter().any(|(f, _)| f.eq_ignore_ascii_case(&family)) {
+            items.push((family, label));
+        }
+    }
+    items.push((
+        "__custom__".to_owned(),
+        language.text("导入字体", "Import font").to_owned(),
+    ));
+
+    let mut chosen = None;
+    let card_width = ((ui.available_width() - 16.0) / 3.0).max(96.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .min_scrolled_height(232.0)
+        .max_height(232.0)
+        .show(ui, |ui| {
+            egui::Grid::new("reader-menu-mono-font-grid")
+                .num_columns(3)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    let any_downloading = crate::fonts::any_downloading(ui.ctx());
+                    for (idx, (family, label)) in items.iter().enumerate() {
+                        let is_custom = family == "__custom__";
+                        let status = if is_custom {
+                            None
+                        } else {
+                            crate::fonts::family_status(ui.ctx(), family)
+                        };
+                        let is_downloading =
+                            matches!(status, Some(crate::fonts::Status::Downloading(_)));
+                        let selected = !is_custom
+                            && !any_downloading
+                            && family.eq_ignore_ascii_case(current_family);
+                        let highlight = selected || is_downloading;
+                        let stroke = if highlight {
+                            egui::Stroke::new(1.5, palette().accent)
+                        } else {
+                            egui::Stroke::new(1.0, palette().border)
+                        };
+                        let text = if is_downloading {
+                            language.text("下载中", "Downloading")
+                        } else {
+                            label.as_str()
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(text)
+                                .size(crate::ui::scaled_font_size(12.5))
+                                .color(if highlight {
+                                    palette().accent
+                                } else {
+                                    palette().text
+                                }),
+                        )
+                        .truncate()
+                        .fill(palette().surface)
+                        .stroke(stroke)
+                        .corner_radius(egui::CornerRadius::same(8));
+                        let mut response = ui
+                            .add_sized(egui::vec2(card_width, 36.0), btn)
+                            .on_hover_text(label);
+                        if !any_downloading {
+                            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }
+                        if !any_downloading && response.clicked() {
+                            chosen = Some(if is_custom {
+                                FontPickerAction::OpenCustomSearch
+                            } else {
+                                FontPickerAction::Select(family.clone())
+                            });
+                        }
+                        if idx % 3 == 2 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    chosen
+}
+
+impl DesktopReader {
     fn selection_action_anchor(
         &mut self,
         rects: &[rebook_reader::ReaderSelectionRect],
@@ -5599,6 +6710,34 @@ impl DesktopReader {
         self.refresh_semantic_layout();
         ctx.request_repaint();
         true
+    }
+
+    fn focus_passage_chart_target(&self) -> Option<(rebook_publication::SourceRange, usize)> {
+        if !self.is_focus_mode() || !self.focus_units_ready { return None; }
+        let unit = self.focus_units.get(self.focus_unit_index)?;
+        if self.semantic_source.passage_chart_control(&unit.range).is_none()
+            && (unit.is_image || unit.is_table || unit.text.trim().chars().take(16).count() < 16
+                || self.plugin_settings.semantic_layout_image_endpoint().is_none())
+        { return None; }
+        Some((unit.range.clone(), unit.position.section_index))
+    }
+
+    fn visualize_current_block(&mut self, ctx: &egui::Context) {
+        if let Some((source, _)) = self.current_focus_chart_control() {
+            self.toggle_table_chart(ctx, &source);
+        } else if let Some((source, index)) = self.focus_passage_chart_target() {
+            // Translation may arrive after an on-demand result. An active
+            // cache entry without a displayed image no longer matches the text.
+            let result_is_stale = self.semantic_source.passage_chart_control(&source) == Some(true)
+                && self.focus_units.get(self.focus_unit_index).is_some_and(|unit| !unit.is_image);
+            if !result_is_stale && self.semantic_source.toggle_passage_chart(&source) {
+                self.semantic_layout.presentation_anchor = Some(source);
+                self.refresh_semantic_layout();
+            } else {
+                self.queue_passage_chart(index, source);
+            }
+            ctx.request_repaint();
+        }
     }
 
     fn current_focus_chart_control(&self) -> Option<(rebook_publication::SourceRange, bool)> {
@@ -8589,8 +9728,8 @@ mod reference_suggestion_label_tests {
                     .expect("preview covers the full window");
                 if !fullscreen {
                     let controls = Rect::from_min_size(
-                        Pos2::new(screen.right() - 138.0, 0.0),
-                        Vec2::new(138.0, window_chrome::HEIGHT),
+                        Pos2::new(screen.right() - window_chrome::CONTROLS_WIDTH, 0.0),
+                        Vec2::new(window_chrome::CONTROLS_WIDTH, window_chrome::HEIGHT),
                     );
                     let caption_index = output
                         .shapes

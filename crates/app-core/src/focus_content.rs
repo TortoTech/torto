@@ -64,10 +64,7 @@ pub fn units_in_ranges(
     allowed: Option<&[SourceRange]>,
 ) -> Vec<Unit> {
     let refs = blocks.iter().collect::<Vec<_>>();
-    let scopes = rebook_layout::semantic_list_groups(&refs)
-        .into_iter()
-        .chain(rebook_layout::semantic_paragraph_groups(&refs))
-        .collect::<Vec<_>>();
+    let scopes = rebook_layout::focus_group_scopes(&refs);
     let mut units: Vec<Unit> = Vec::new();
     let mut headings = Vec::new();
     let mut root: Option<(usize, u8)> = None;
@@ -154,13 +151,13 @@ pub fn units_in_ranges(
     while index < units.len() {
         let scope = scopes
             .iter()
-            .find(|scope| scope.contains(&units[index].index));
+            .find(|scope| scope.range.contains(&units[index].index));
         let Some(scope) = scope else {
             index += 1;
             continue;
         };
         let mut end = index + 1;
-        while end < units.len() && scope.contains(&units[end].index) {
+        while end < units.len() && scope.range.contains(&units[end].index) {
             end += 1;
         }
         let mut key = units[index].ranges[0].clone();
@@ -318,6 +315,61 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].ranges.len(), 2);
     }
+
+    #[test]
+    fn colon_introduction_joins_the_next_authored_paragraph_group() {
+        for (colon, group) in [
+            (':', "<div><p>One.</p><p>Two.</p></div>"),
+            ('：', "<div class='aside' style='border:1px solid'><p>One.</p><p>Two.</p></div>"),
+            (':', "<section class='note'><p>Appendix C.2</p><p>Expectation</p><div/></section>"),
+        ] {
+            let blocks = parse(&format!(
+                "<p>Before.</p><p>Here is the example<em>{colon}</em></p>{group}<p>After.</p>"
+            ));
+            for unified in [true, false] {
+                let parts = units(&blocks, unified);
+                assert_eq!(parts[1].group.as_ref().unwrap().parts, 3);
+                assert_eq!(parts[1].group, parts[3].group);
+                assert!(parts[0].group.is_none() && parts[4].group.is_none());
+            }
+            let refs: Vec<_> = blocks.iter().collect();
+            assert_eq!(rebook_layout::semantic_paragraph_groups(&refs), vec![2..4]);
+        }
+        for other in [
+            "<h2>An independent heading</h2><div><p>One.</p><p>Two.</p></div>",
+            "<p>&#160;</p><div><p>One.</p><p>Two.</p></div>",
+            "<p>Ordinary paragraph.</p>",
+        ] {
+            let blocks = parse(&format!("<p>See the following:</p>{other}<p>After.</p>"));
+            assert!(units(&blocks, true)[0].group.is_none(), "{other}");
+        }
+    }
+
+    #[test]
+    fn list_focus_includes_colon_introduction_across_blank_spacing() {
+        for spacing in ["<p>&#160;</p>", "<div style='height:1em'/>"] {
+            let blocks = parse(&format!(
+                "<p>These steps:</p>{spacing}<ol><li>One.</li><li>Two.</li></ol><p>After.</p>"
+            ));
+            let parts = units(&blocks, true);
+            assert_eq!(parts[0].group.as_ref().unwrap().parts, 3);
+            assert_eq!(parts[0].group, parts[2].group);
+            assert!(parts[3].group.is_none());
+            let refs: Vec<_> = blocks.iter().collect();
+            assert_eq!(rebook_layout::semantic_list_groups(&refs), vec![2..4]);
+        }
+        for boundary in ["<hr/>", "<p>•••</p>", "<h2>New topic</h2>"] {
+            let blocks = parse(&format!(
+                "<p>These steps:</p>{boundary}<ol><li>One.</li><li>Two.</li></ol>"
+            ));
+            let parts = units(&blocks, true);
+            assert!(parts[0].group.is_none(), "{boundary}");
+            assert_eq!(parts.last().unwrap().group.as_ref().unwrap().parts, 2);
+        }
+        let blocks = parse("<p>Unrelated prose.</p><p>&#160;</p><ol><li>One.</li><li>Two.</li></ol>");
+        assert!(units(&blocks, true)[0].group.is_none());
+    }
+
     #[test]
     fn reading_unit_ranges_do_not_inherit_another_units_headings() {
         let blocks = parse(

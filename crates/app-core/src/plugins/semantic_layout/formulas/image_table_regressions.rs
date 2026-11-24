@@ -1,5 +1,7 @@
 use super::*;
 use rebook_publication::{Book, PublicationError, Resource, SpineItem, SpineItemId};
+use image::ImageFormat;
+use std::io::Cursor;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -163,7 +165,7 @@ fn check(source: Arc<dyn BookSource>, original: Section, expected_images: usize)
                 let data = pair[1]["image_url"]["url"]
                     .as_str()
                     .unwrap()
-                    .strip_prefix("data:image/png;base64,")
+                    .strip_prefix("data:image/jpeg;base64,")
                     .unwrap();
                 let pixels = image::load_from_memory(
                     &base64::engine::general_purpose::STANDARD
@@ -171,10 +173,9 @@ fn check(source: Arc<dyn BookSource>, original: Section, expected_images: usize)
                         .unwrap(),
                 )
                 .unwrap();
-                assert!(pixels.height() > 240);
-                assert!(pixels.width() <= 1616 && pixels.height() <= 1616);
+                assert_eq!([pixels.width(), pixels.height()], [1216, 413]);
                 let inline = metadata["md"]["in"].as_bool().unwrap();
-                results.push(json!({"ii":metadata["ii"],"ss":if inline {"no"} else {"tb"},"rs":!inline,"th":if inline {Value::Null} else {json!(TABLE)},"t":null,"lt":false,"l":null,"n":null}));
+                results.push(json!({"ii":metadata["ii"],"ss":if inline {"no"} else {"tb"},"rs":!inline,"th":if inline {Value::Null} else {json!(TABLE)},"t":null,"lt":false,"l":null,"n":null,"chart_trace":null}));
                 images += 1;
             }
             let result = json!({"r":results});

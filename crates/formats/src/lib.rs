@@ -19,6 +19,7 @@ mod typography;
 mod font_size_tests;
 mod html_context;
 mod kf8;
+mod lit;
 mod markup;
 mod mobi;
 mod numeric_attributes;
@@ -27,6 +28,7 @@ pub mod reflow;
 #[cfg(test)]
 mod reflow_format_tests;
 mod source;
+mod txt;
 mod xml;
 #[cfg(test)]
 mod zip_tests;
@@ -57,6 +59,8 @@ pub enum BookFormat {
     Fbz,
     Cbz,
     Chm,
+    Lit,
+    Txt,
     Pdf,
 }
 
@@ -77,6 +81,8 @@ impl BookFormat {
             "fbz" => Some(Self::Fbz),
             "cbz" => Some(Self::Cbz),
             "chm" => Some(Self::Chm),
+            "lit" => Some(Self::Lit),
+            "txt" => Some(Self::Txt),
             "pdf" => Some(Self::Pdf),
             _ => None,
         }
@@ -93,6 +99,8 @@ impl BookFormat {
             Self::Fbz => "FBZ",
             Self::Cbz => "CBZ",
             Self::Chm => "CHM",
+            Self::Lit => "LIT",
+            Self::Txt => "TXT",
             Self::Pdf => "PDF",
         }
     }
@@ -108,6 +116,8 @@ impl BookFormat {
             Self::Fbz => "fbz",
             Self::Cbz => "cbz",
             Self::Chm => "chm",
+            Self::Lit => "lit",
+            Self::Txt => "txt",
             Self::Pdf => "pdf",
         }
     }
@@ -227,6 +237,8 @@ fn open_shared_source(
         BookFormat::Fb2 | BookFormat::Fbz => Arc::new(fb2::open(bytes.as_ref(), file_name)?),
         BookFormat::Cbz => Arc::new(cbz::open(bytes.as_ref(), file_name)?),
         BookFormat::Chm => Arc::new(chm::open_bytes(bytes.as_ref(), file_name)?),
+        BookFormat::Lit => Arc::new(lit::open(&bytes, file_name)?),
+        BookFormat::Txt => Arc::new(txt::open(&bytes, file_name)?),
         BookFormat::Pdf => unreachable!("PDF bytes use the zero-copy owned/shared paths"),
     };
     Ok(source)
@@ -326,5 +338,7 @@ mod tests {
             BookFormat::from_file_name("book.CHM"),
             Some(BookFormat::Chm)
         );
+        assert_eq!(BookFormat::from_file_name("book.TXT"), Some(BookFormat::Txt));
+        assert_eq!(BookFormat::from_file_name("book.LIT"), Some(BookFormat::Lit));
     }
 }

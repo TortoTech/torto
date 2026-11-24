@@ -12,8 +12,9 @@ struct ReaderScreen: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("reader.fontSize") private var fontSize = 20
-    @AppStorage("reader.focus") private var preferFocus = false
+    @AppStorage("reader.focus") private var preferFocus = true
     @AppStorage("reader.unified") private var unified = false
+    @AppStorage("interface.theme") private var interfaceTheme = "system"
     @AppStorage("reader.theme") private var theme = "system"
     @AppStorage("reader.brightness") private var savedBrightness = -1.0
     @State private var brightness = 0.5
@@ -53,7 +54,11 @@ struct ReaderScreen: View {
         _model = StateObject(wrappedValue: ReaderModel(core: core, book: book))
     }
 
-    private var dark: Bool { theme == "dark" || (theme == "system" && colorScheme == .dark) }
+    private var dark: Bool {
+        if theme == "dark" { return true }
+        if theme == "light" { return false }
+        return interfaceTheme == "dark" || (interfaceTheme == "system" && colorScheme == .dark)
+    }
     private var immersive: Bool { model.frame?.info.isScroll ?? preferFocus }
     private var hideStatusBar: Bool {
         (model.preview?.isImage == true && model.preview?.isFormula != true) || immersive && !model.showingChrome && panel == nil && model.previewedNote == nil && !model.finished && !assistant && !feedback
@@ -74,7 +79,11 @@ struct ReaderScreen: View {
                             ReadingCanvas(frame: frame, selection: model.selection,
                                           enabled: !model.working && !model.finished && panel == nil && model.preview?.document == nil && !leaving,
                                           turn: model.turn, activate: model.activate, select: model.select,
-                                          splitSentences: model.setSentenceSplit, moving: { moving = $0 },
+                                          splitSentences: model.setSentenceSplit,
+                                          focusHighlight: model.focusHighlightGesture,
+                                          focusNote: { add in model.focusNoteGesture(add) { panel = .compose } },
+                                          focusChat: { assistant = true },
+                                          moving: { moving = $0 },
                                           turnMotion: model.turnMotion, turnPending: model.turnPending, neighbours: model.neighbours,
                                           beginHandle: model.beginHandle, moveHandle: model.moveHandle)
                             .opacity(firstFrameVisible ? 1 : 0)
@@ -266,7 +275,7 @@ struct ReaderScreen: View {
             if panel == nil {
                 if model.selection == nil && showFontNotice {
                     HStack {
-                        Text(mobileText("新字体已下载完成", "Reading fonts downloaded")).font(.footnote)
+                        Text(mobileText("默认字体下载完成", "Default fonts downloaded")).font(.footnote)
                         Button(mobileText("应用", "Apply")) { showFontNotice = false; model.applyFonts() }.disabled(model.working)
                     }.padding(12).background(palette.surface, in: .capsule).padding(.bottom, 8)
                 } else if model.selection == nil && model.showingChrome && model.previewedNote == nil && model.frame != nil {
@@ -283,12 +292,12 @@ struct ReaderScreen: View {
                     .background((panel.isLarge ? palette.background : panel == .compose ? palette.background : palette.surface)
                         .ignoresSafeArea(edges: .bottom))
                     .offset(y: panelDrag)
-                    .transition(.offset(y: 24).combined(with: .opacity))
+                    .transition(panel.isLarge ? .move(edge: .bottom) : .opacity)
             }
             if let note = model.previewedNote, panel == nil { noteFooter(note).padding(.horizontal, 16).padding(.bottom, 12) }
             else if (model.showingChrome || panel != nil) && panel != .compose { footer }
         }
-        .animation(.easeOut(duration: 0.15), value: panel)
+        .animation(.easeOut(duration: panel?.isLarge == true ? 0.3 : 0.15), value: panel)
         .animation(.easeOut(duration: 0.15), value: model.showingChrome)
     }
 
@@ -437,12 +446,13 @@ struct ReaderScreen: View {
             }, fonts: { self.panel = .fonts }, layout: { self.panel = .layout }, mode: { self.panel = .mode })
                 .simultaneousGesture(dragPanel())
         case .fonts:
+            let isCjk = model.bookLanguages.isEmpty || model.bookLanguages.contains { lang in
+                let l = lang.lowercased()
+                return l.hasPrefix("zh") || l.hasPrefix("ja") || l.hasPrefix("ko")
+            }
             VStack(spacing: 0) {
                 panelHeader(mobileText("字体样式", "Font styles")) { self.panel = .typography }
-                SettingsScroll {
-                    FontSettings(core: core, library: library, apply: model.applyFonts) { EmptyView() }
-                    if !library.fontsReady { MobileGroup { FontDownloadRow(library: library) } }
-                }.frame(maxHeight: height * 0.58)
+                ReaderFontStylePanel(core: core, library: library, isCjkBook: isCjk, apply: model.applyFonts)
             }
         case .layout:
             VStack(spacing: 0) {

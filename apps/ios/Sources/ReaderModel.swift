@@ -199,11 +199,11 @@ final class ReaderModel: ObservableObject {
                     let available = try await opened.focusModeAvailable()
                     let language = try await opened.bookLanguages()
                     let autoLayout = (try? await core.aiOptions().layoutEnabled) ?? false
-                    try await opened.setTranslationEnabled(enabled: false)
+                    let bookTranslated = opened.translationEnabled()
                     let configured = try await opened.configure(fontSize: font, unified: unified, dark: dark)
                     let page = focus && available ? try await opened.focusMode(enabled: true) : configured
                     let mode = Self.preferredSelection(focus && available, words: Self.supportsWords(language))
-                    try await opened.selectionMode(mode: mode)
+                    try await opened.selectionMode(mode: bookTranslated ? "paragraph" : mode)
                     let rendered = try ReadingFrame(page, viewport: viewport, retaining: nil)
                     guard !closing else {
                         try await opened.shutdown()
@@ -214,6 +214,7 @@ final class ReaderModel: ObservableObject {
                     bookLanguages = language
                     selectionMode = mode
                     aiEnabled = autoLayout
+                    translated = bookTranslated
                     appearancePending = dark != paperDark
                     frame = rendered
                     prepareReferences(opened)
@@ -680,6 +681,46 @@ final class ReaderModel: ObservableObject {
     func setSentenceSplit(_ split: Bool) {
         guard let control = frame?.info.controls.first(where: { $0.kind == "sentences" }), control.active != split else { return }
         toggleControl(control)
+    }
+
+    func focusHighlightGesture(_ add: Bool) {
+        guard let reader, let bounds = frame?.info.focusBounds, let first = bounds.first, let last = bounds.last,
+              frame?.info.isScroll == true else { return }
+        run { [self] in
+            if let sel = try await reader.select(startX: first.x + 2, startY: first.y + first.height / 2,
+                                                 endX: last.x + last.width - 2, endY: last.y + last.height / 2),
+               sel.highlighted != add {
+                annotations = try await reader.toggleSelectionHighlight(remove: !add)
+            }
+            try await reader.clearSelection()
+            selection = nil
+            try show(try await reader.page())
+        }
+    }
+
+    func focusNoteGesture(_ add: Bool, openComposer: @escaping () -> Void) {
+        guard let reader, let bounds = frame?.info.focusBounds, let first = bounds.first, let last = bounds.last,
+              frame?.info.isScroll == true else { return }
+        run { [self] in
+            guard let sel = try await reader.select(startX: first.x + 2, startY: first.y + first.height / 2,
+                                                    endX: last.x + last.width - 2, endY: last.y + last.height / 2) else { return }
+            if add {
+                selection = sel
+                showingChrome = false
+                openComposer()
+            } else {
+                let trimmed = sel.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let existing = annotations.first(where: {
+                    $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed &&
+                    !($0.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }) {
+                    annotations = try await reader.editAnnotation(id: existing.id, note: nil)
+                }
+                try await reader.clearSelection()
+                selection = nil
+                try show(try await reader.page())
+            }
+        }
     }
 
     func toggleControl(_ control: ReadingControl) {

@@ -1,5 +1,6 @@
 package org.tortotech.torto
 
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.ui.Alignment
@@ -102,6 +103,8 @@ private val symbolResources=mapOf(
     "person" to R.drawable.ic_symbol_person,
     "search" to R.drawable.ic_symbol_search,
     "chat" to R.drawable.ic_symbol_chat,
+    "focus-chat" to R.drawable.ic_symbol_focus_chat,
+    "gesture" to R.drawable.ic_symbol_gesture,
     "toc" to R.drawable.ic_symbol_toc,
     "marks" to R.drawable.ic_symbol_marks,
     "note" to R.drawable.ic_symbol_note,
@@ -152,13 +155,26 @@ private val filledSymbolResources=mapOf(
     }
 }
 /** A transparent 48dp target; only the unchanged icon's ink reacts to input. */
-@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,modifier:Modifier=Modifier,iconSize:Dp=IconSizes.Standard,onClick:()->Unit) {
+@Composable fun ActionIcon(name:String,label:String,enabled:Boolean=true,selected:Boolean=false,spinning:Boolean=false,modifier:Modifier=Modifier,iconSize:Dp=IconSizes.Standard,onClick:()->Unit) {
     val interaction=remember {androidx.compose.foundation.interaction.MutableInteractionSource()}
     val pressed by interaction.collectIsPressedAsState()
-    val target=when { !enabled->defaultIconColor().copy(alpha=.38f);selected||pressed->brandControlColor();else->defaultIconColor() }
+    val target=when { !enabled&&!spinning->defaultIconColor().copy(alpha=.38f);spinning||selected||pressed->brandControlColor();else->defaultIconColor() }
     val ink by androidx.compose.animation.animateColorAsState(target,androidx.compose.animation.core.tween(100),label="icon ink")
+    val rotation = if (spinning) {
+        val transition = androidx.compose.animation.core.rememberInfiniteTransition(label = "iconSpin")
+        val angle by transition.animateFloat(
+            initialValue = 0f,
+            targetValue = -360f,
+            animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+                animation = androidx.compose.animation.core.tween(900, easing = androidx.compose.animation.core.LinearEasing),
+                repeatMode = androidx.compose.animation.core.RepeatMode.Restart,
+            ),
+            label = "iconSpinAngle",
+        )
+        angle
+    } else 0f
     Box(modifier.size(IconSizes.TouchTarget).semantics {this.selected=selected}
-        .clickable(interactionSource=interaction,indication=null,enabled=enabled,role=Role.Button,onClick=onClick),contentAlignment=Alignment.Center){
-        AppIcon(name,label,size=iconSize,tint=ink)
+        .clickable(interactionSource=interaction,indication=null,enabled=enabled&&!spinning,role=Role.Button,onClick=onClick),contentAlignment=Alignment.Center){
+        AppIcon(name,label,Modifier.graphicsLayer { rotationZ = rotation },size=iconSize,tint=ink)
     }
 }

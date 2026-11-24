@@ -1,0 +1,25 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Soft rounded speech bubble -->
+    <path
+        android:pathData="M13,4.5H7.5C5.01,4.5 3,6.51 3,9V14.5C3,16.99 5.01,19 7.5,19H8L10.5,21V19H15.5C17.99,19 20,16.99 20,14.5V12"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@android:color/white"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- Subtle inner lines -->
+    <path
+        android:pathData="M7.5,10.5H13.5M7.5,14H11.5"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@android:color/white"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round" />
+    <!-- Top-right AI 4-point sparkle -->
+    <path
+        android:pathData="M18.5,2.5L19.35,4.9L21.75,5.75L19.35,6.6L18.5,9L17.65,6.6L15.25,5.75L17.65,4.9Z"
+        android:fillColor="@android:color/white" />
+</vector>

@@ -14,10 +14,10 @@ struct ProviderList: View {
                 MobileGroup {
                     HStack(spacing: 0) {
                         Button { edit(provider) } label: {
-                            VStack(alignment: .leading, spacing: 4) {
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text(provider.name).font(.system(size: 16, weight: .medium)).foregroundStyle(palette.ink)
                                 Text(mobileText("\(provider.models.count) 个模型", "\(provider.models.count) models"))
-                                    .font(.system(size: 16)).foregroundStyle(palette.secondary)
+                                    .font(.system(size: 12)).foregroundStyle(palette.secondary)
                             }.frame(maxWidth: .infinity, minHeight: 48, alignment: .leading).contentShape(Rectangle())
                         }.buttonStyle(MobileInkButtonStyle())
                         MobileIconButton(icon: "edit", label: mobileText("编辑提供商", "Edit provider")) { edit(provider) }
@@ -60,7 +60,6 @@ struct ProviderEditor: View {
     @State private var draft: Provider
     @State private var kinds: [ProviderKind] = []
     @State private var key = ""
-    @State private var manual = ""
     @State private var query = ""
     @State private var discovered: [String] = []
     @State private var choice: ChoiceRequest?
@@ -100,19 +99,20 @@ struct ProviderEditor: View {
                     HStack {
                         Text(mobileText("模型", "Models")).font(.system(size: 16, weight: .semibold))
                         Spacer()
-                        MobileIconButton(icon: "sync", label: mobileText("刷新模型列表", "Refresh model list"), action: fetch)
+                        MobileIconButton(icon: "sync", label: busy ? mobileText("正在刷新模型列表…", "Refreshing model list…") : mobileText("刷新模型列表", "Refresh model list"), action: fetch)
+                            .rotationEffect(.degrees(busy ? -360 : 0))
+                            .animation(busy ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default, value: busy)
                             .disabled(draft.baseUrl.isEmpty)
                     }.padding(.leading, 16).padding(.trailing, 4)
-                    HStack {
-                        MobileFormField(title: mobileText("手动添加模型 ID", "Add model ID"), text: $manual)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        MobileIconButton(icon: "add", label: mobileText("添加模型", "Add model"), action: addModel)
-                            .disabled(manual.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }.padding(.leading, 16).padding(.trailing, 4)
                     MobileFormField(title: mobileText("搜索模型", "Search models"), text: $query)
-                        .padding(.horizontal, 16).padding(.top, 12)
+                        .padding(.horizontal, 16).padding(.top, 8)
+                    let sortedModels = Set(discovered + draft.models).sorted { a, b in
+                        let sa = draft.models.contains(a), sb = draft.models.contains(b)
+                        if sa != sb { return sa }
+                        return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+                    }
                     LazyVStack(spacing: 0) {
-                        ForEach(Set(discovered + draft.models).sorted().filter { query.isEmpty || $0.localizedCaseInsensitiveContains(query) }, id: \.self) { id in
+                        ForEach(sortedModels.filter { query.isEmpty || $0.localizedCaseInsensitiveContains(query) }, id: \.self) { id in
                             MobileRow(title: id, check: draft.models.contains(id)) {
                                 if draft.models.contains(id) { draft.models.removeAll { $0 == id } }
                                 else { draft.models.append(id) }
@@ -122,23 +122,16 @@ struct ProviderEditor: View {
                 }
                 if let error { Text(error).font(.footnote).foregroundStyle(.red) }
             }.disabled(busy)
-            HStack(spacing: 12) {
-                Button(mobileText("取消", "Cancel"), action: done).disabled(busy)
-                Button(mobileText("保存", "Save"), action: save)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(busy || draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.baseUrl.isEmpty)
-            }.frame(maxWidth: .infinity, alignment: .trailing).padding(16)
-                .background(palette.background.ignoresSafeArea(edges: .bottom))
         }
-        .task { kinds = (try? await core.providerKinds()) ?? [] }
+        .task {
+            kinds = (try? await core.providerKinds()) ?? []
+            if !initial.id.isEmpty {
+                discovered = (try? await core.cachedModels(providerId: initial.id)) ?? []
+            }
+        }
         .onChange(of: draft.baseUrl) { _, _ in discovered = [] }
+        .onDisappear { saveIfChanged() }
         .fullScreenCover(item: $choice) { request in request.page { choice = nil } }
-    }
-
-    private func addModel() {
-        let id = manual.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !id.isEmpty && !draft.models.contains(id) { draft.models.append(id) }
-        manual = ""
     }
 
     private func fetch() {
@@ -152,19 +145,14 @@ struct ProviderEditor: View {
         }
     }
 
-    private func save() {
-        guard !busy else { return }
-        busy = true
-        error = nil
+    private func saveIfChanged() {
         var value = draft
         value.baseUrl = value.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         value.name = value.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (value != initial || !key.isEmpty), !value.name.isEmpty, !value.baseUrl.isEmpty else { return }
+        let apiKey = key.isEmpty ? nil : key
         Task {
-            defer { busy = false }
-            do {
-                try await core.saveProvider(provider: value, key: key.isEmpty ? nil : key, clearKey: false)
-                done()
-            } catch { self.error = message(error) }
+            try? await core.saveProvider(provider: value, key: apiKey, clearKey: false)
         }
     }
 }
@@ -213,6 +201,18 @@ struct AiRoleSettings: View {
     @State private var error: String?
     @State private var custom = false
     @State private var customLanguage = ""
+    private struct ProbeSelection: Equatable {
+        let provider: String
+        let address: String
+        let model: String
+    }
+    @State private var layoutProtocol: (selection: ProbeSelection, value: String)?
+    private var probeSelection: ProbeSelection? {
+        guard role == .layout, let draft, !draft.layoutModel.isEmpty,
+              let provider = providers.first(where: { $0.id == draft.layoutProvider }) else { return nil }
+        return ProbeSelection(provider: provider.id, address: provider.baseUrl, model: draft.layoutModel)
+    }
+
     @FocusState private var editingLanguage: Bool
 
     var body: some View {
@@ -220,6 +220,8 @@ struct AiRoleSettings: View {
             if let draft {
                 let provider = providers.first { $0.id == draft[keyPath: role.provider] }
                 let model = draft[keyPath: role.model]
+                let decision = provider.map { isLayoutDecisionModel(baseUrl: $0.baseUrl, model: model) } == true
+                    || (layoutProtocol?.selection == probeSelection && layoutProtocol?.value == "decision")
                 let effort = (try? aiReasoningLevels(providerKind: provider?.kind ?? "custom", model: model)) ?? ["default", "none", "low", "medium", "high"]
                 if role == .layout {
                     MobileGroup {
@@ -227,22 +229,35 @@ struct AiRoleSettings: View {
                             .disabled(model.isEmpty)
                     }
                 }
+                let multiProvider = providers.count > 1
+                let allModelChoices = providers.flatMap { p in
+                    p.models.map { m in MobileChoice("\(p.id)\n\(m)", multiProvider ? "\(m) · \(p.name)" : m) }
+                }
+                let selectedKey = model.isEmpty ? "" : "\(draft[keyPath: role.provider])\n\(model)"
+                let modelDesc: String? = switch role {
+                case .layout: mobileText("具备视觉能力的决策/文本模型", "Vision-capable decision or text model")
+                case .translation: nil
+                case .assistant: mobileText("要求视觉能力", "Requires vision")
+                }
+                let effortDesc: String? = role == .translation ? mobileText("建议设为「低」或「不思考」", "Recommended: Low or None") : nil
                 MobileGroup {
-                    choiceRow(mobileText("提供商", "Provider"), draft[keyPath: role.provider],
-                              providers.map { MobileChoice($0.id, $0.name) }) { id in
-                        change { value in
-                            value[keyPath: role.provider] = id
-                            value[keyPath: role.model] = providers.first { $0.id == id }?.models.first ?? ""
+                    choiceRow(modelLabel, selectedKey, allModelChoices, description: modelDesc, searchable: true) { key in
+                        let parts = key.split(separator: "\n", maxSplits: 1)
+                        guard parts.count == 2 else { return }
+                        change {
+                            $0[keyPath: role.provider] = String(parts[0])
+                            $0[keyPath: role.model] = String(parts[1])
                         }
                     }
-                    choiceRow(modelLabel, model, (provider?.models ?? []).map { MobileChoice($0, $0) }, searchable: true) { id in
-                        change { $0[keyPath: role.model] = id }
-                    }
-                    choiceRow(mobileText("思考等级", "Reasoning effort"), draft[keyPath: role.effort], effort.map { MobileChoice($0, effortName($0)) }) { id in
-                        change { $0[keyPath: role.effort] = id }
+                    if role != .layout || !decision {
+                        choiceRow(mobileText("思考等级", "Reasoning effort"), draft[keyPath: role.effort], effort.map { MobileChoice($0, effortName($0)) }, description: effortDesc) { id in
+                            change { $0[keyPath: role.effort] = id }
+                        }
                     }
                 }
-                SectionCaption(title: hint)
+                if role == .layout {
+                    imageModelSettings(draft)
+                }
                 if role == .translation {
                     MobileGroup {
                         choiceRow(mobileText("目标语言", "Target language"), custom ? "custom" : draft.targetLanguage, [
@@ -260,8 +275,7 @@ struct AiRoleSettings: View {
                             .focused($editingLanguage).onSubmit { editingLanguage = false }
                         }
                         MobileToggle(title: mobileText("显示原文", "Show original text"), value: bool(\.showOriginal))
-                        MobileToggle(title: mobileText("翻译目录", "Translate contents"), value: bool(\.translateToc))
-                        MobileToggle(title: mobileText("专家翻译", "Expert translation"), value: bool(\.expertTranslation))
+                        MobileToggle(title: mobileText("提取术语表", "Extract glossary"), value: bool(\.expertTranslation))
                     }
                 }
             }
@@ -281,13 +295,55 @@ struct AiRoleSettings: View {
             } catch { if !Task.isCancelled { self.error = message(error) } }
         }
         .accessibilityHidden(choice != nil)
+        .task(id: probeSelection.map { [$0.provider, $0.address, $0.model] }) {
+            guard let selection = probeSelection else { return }
+            let type = (try? await core.probeLayoutModel(provider: selection.provider, model: selection.model))
+                ?? "unconfirmed"
+            guard !Task.isCancelled, probeSelection == selection else { return }
+            layoutProtocol = (selection, type)
+            if type == "chat" && draft?.imageModel.isEmpty == true {
+                change {
+                    $0.imageProvider = selection.provider
+                    $0.imageModel = selection.model
+                    $0.imageReasoning = $0.layoutReasoning
+                }
+            }
+        }
         .onDisappear { if choice == nil { commit() } }
         .fullScreenCover(item: $choice) { request in request.page { choice = nil } }
     }
 
+    private func imageModelSettings(_ options: AiOptions) -> some View {
+        let provider = providers.first { $0.id == options.imageProvider }
+        let multi = providers.count > 1
+        let models = providers.flatMap { entry in
+            entry.models.filter { !isLayoutDecisionModel(baseUrl: entry.baseUrl, model: $0) }
+                .map { m in MobileChoice("\(entry.id)\n\(m)", multi ? "\(m) · \(entry.name)" : m) }
+        }
+        let selectedKey = options.imageModel.isEmpty ? "" : "\(options.imageProvider)\n\(options.imageModel)"
+        let levels = (try? aiReasoningLevels(providerKind: provider?.kind ?? "custom", model: options.imageModel))
+            ?? ["default", "none", "low", "medium", "high"]
+        return MobileGroup {
+            choiceRow(mobileText("排版生成模型", "Layout generation model"), selectedKey,
+                      models, description: mobileText("要求视觉能力", "Requires vision"), searchable: true) { key in
+                let parts = key.split(separator: "\n", maxSplits: 1)
+                guard parts.count == 2 else { return }
+                change {
+                    $0.imageProvider = String(parts[0])
+                    $0.imageModel = String(parts[1])
+                }
+            }
+            choiceRow(mobileText("生成模型思考等级", "Generation reasoning effort"),
+                      options.imageReasoning, levels.map { MobileChoice($0, effortName($0)) },
+                      description: mobileText("建议设为「不思考」", "Recommended: None")) { id in
+                change { $0.imageReasoning = id }
+            }
+        }
+    }
+
     private func choiceRow(_ title: String, _ value: String, _ choices: [MobileChoice],
-                           searchable: Bool = false, choose: @escaping (String) -> Void) -> some View {
-        MobileRow(title: title, value: choices.first { $0.id == value }?.title ?? (value.isEmpty ? mobileText("未选择", "Not selected") : value)) {
+                           description: String? = nil, searchable: Bool = false, choose: @escaping (String) -> Void) -> some View {
+        MobileRow(title: title, value: choices.first { $0.id == value }?.title ?? (value.isEmpty ? mobileText("未选择", "Not selected") : value), description: description) {
             choice = ChoiceRequest(title: title, choices: choices, value: value, searchable: searchable, choose: choose)
         }.disabled(choices.isEmpty)
     }
@@ -318,7 +374,12 @@ struct AiRoleSettings: View {
                     if edited[keyPath: key] != original[keyPath: key] { latest[keyPath: key] = edited[keyPath: key] }
                 }
                 apply(role.provider); apply(role.model); apply(role.effort)
-                if role == .layout { apply(\.layoutEnabled) }
+                if role == .layout {
+                    apply(\.layoutEnabled)
+                    apply(\.imageProvider)
+                    apply(\.imageModel)
+                    apply(\.imageReasoning)
+                }
                 if role == .translation {
                     apply(\.targetLanguage); apply(\.showOriginal); apply(\.translateToc); apply(\.expertTranslation)
                 }
@@ -331,7 +392,7 @@ struct AiRoleSettings: View {
 
     private var modelLabel: String {
         switch role {
-        case .layout: mobileText("排版模型", "Layout model")
+        case .layout: mobileText("排版分类模型", "Layout classification model")
         case .translation: mobileText("翻译模型", "Translation model")
         case .assistant: mobileText("对话模型", "Chat model")
         }
@@ -339,7 +400,7 @@ struct AiRoleSettings: View {
 
     private var hint: String {
         switch role {
-        case .layout: mobileText("使用能识图、速度快的模型，思考等级设为“不思考”。", "Use a fast vision model with reasoning off.")
+        case .layout: mobileText("图片识别使用能识图的模型。", "Use a vision model for image recognition.")
         case .translation: mobileText("使用文字能力强、速度快的模型，思考等级设为“低”或“不思考”。", "Use a fast language model with low or no reasoning.")
         case .assistant: mobileText("使用能识图的模型。", "Use a model with vision.")
         }

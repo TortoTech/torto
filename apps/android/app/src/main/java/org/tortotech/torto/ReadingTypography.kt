@@ -22,17 +22,24 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.tortotech.torto.core.FontOption
+import org.tortotech.torto.core.ReaderFontCatalog
 import org.tortotech.torto.core.ReadingOptions
 
 internal enum class ReadingFontSetting { Cjk, CjkLatin, Latin, LatinCjk, Code }
 
 private data class FontChoice(val title:String,val pageTitle:String,val value:String,val options:List<Pair<String,String>>)
 
+private fun fontDisplayName(family:String)=when(family){
+    "LXGW WenKai GB Screen"->"霞鹜文楷"
+    else->family
+}
+
 @Composable private fun fontChoice(setting:ReadingFontSetting,state:ScreenState):FontChoice {
     val reading=state.reading
     val fonts=state.fontFamilies
-    val cjk=fonts?.cjk.orEmpty().map {it to it}
-    val latin=fonts?.latin.orEmpty().map {it to it}
+    val cjk=fonts?.cjk.orEmpty().map {it to fontDisplayName(it)}
+    val latin=fonts?.latin.orEmpty().map {it to fontDisplayName(it)}
     return when(setting){
         ReadingFontSetting.Cjk->FontChoice(tr("主要字体","Primary font"),tr("中日韩主要字体","CJK primary font"),reading?.cjkFont.orEmpty(),cjk)
         ReadingFontSetting.CjkLatin->FontChoice(tr("拉丁字体","Latin font"),tr("拉丁字体","Latin font"),reading?.cjkLatinFont.orEmpty(),listOf("" to tr("跟随其他语言字体","Use other-language font"))+latin)
@@ -120,11 +127,151 @@ private fun ReadingOptions.withFont(setting:ReadingFontSetting,value:String)=whe
         })
 }
 
-@Composable internal fun ReadingFontStylePanel(state:ScreenState,model:ReaderModel,back:()->Unit,choose:(ReadingFontSetting)->Unit){
+@Composable internal fun ReadingFontStylePanel(state:ScreenState,model:ReaderModel,back:()->Unit,onImportFont:()->Unit={}){
+    LaunchedEffect(state.active?.id){model.loadFonts(force=true)}
+    val isCjkBook=state.activeBookIsCjk
+    val tabs=remember(isCjkBook){
+        if(isCjkBook) listOf(ReadingFontSetting.Cjk,ReadingFontSetting.CjkLatin,ReadingFontSetting.Code)
+        else listOf(ReadingFontSetting.Latin,ReadingFontSetting.LatinCjk,ReadingFontSetting.Code)
+    }
+    var activeTab by rememberSaveable(isCjkBook){mutableStateOf(tabs.first())}
+    if(activeTab !in tabs) activeTab=tabs.first()
+    val catalog=state.fontCatalog
+    val reading=state.reading
+
     ReadingPanelPage(tr("字体样式","Font styles"),back,fill=false){
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
-            TypographyFontGroups(state,model,choose)
-            TypographyFontDownloads(state,model)
+        Column(Modifier.fillMaxWidth().padding(horizontal=16.dp).padding(bottom=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
+            // Top 3 tabs
+            Surface(Modifier.fillMaxWidth(),shape=RoundedCornerShape(16.dp),color=MaterialTheme.colorScheme.surfaceContainerHigh){
+                Row(Modifier.fillMaxWidth().padding(3.dp)){
+                    tabs.forEach {tab->
+                        val selected=activeTab==tab
+                        val label=when(tab){
+                            ReadingFontSetting.Cjk->tr("中文字体","CJK")
+                            ReadingFontSetting.LatinCjk->tr("中日韩字体","CJK")
+                            ReadingFontSetting.Latin,ReadingFontSetting.CjkLatin->tr("拉丁字体","Latin")
+                            ReadingFontSetting.Code->tr("代码字体","Code")
+                        }
+                        Surface(
+                            onClick={activeTab=tab},
+                            modifier=Modifier.weight(1f).height(30.dp),
+                            shape=RoundedCornerShape(13.dp),
+                            color=if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,
+                        ){
+                            Box(contentAlignment=Alignment.Center){
+                                Text(label,fontSize=13.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                    color=if(selected)MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if(catalog==null||reading==null){
+                Box(Modifier.fillMaxWidth().height(160.dp),contentAlignment=Alignment.Center){
+                    CircularProgressIndicator(Modifier.size(24.dp),strokeWidth=2.dp)
+                }
+            } else {
+                val currentFamily=when(activeTab){
+                    ReadingFontSetting.Cjk->reading.cjkFont
+                    ReadingFontSetting.CjkLatin->reading.cjkLatinFont.ifEmpty {reading.latinFont}
+                    ReadingFontSetting.Latin->reading.latinFont
+                    ReadingFontSetting.LatinCjk->reading.latinCjkFont.ifEmpty {reading.cjkFont}
+                    ReadingFontSetting.Code->reading.monospaceFont
+                }
+                val groups=when(activeTab){
+                    ReadingFontSetting.Cjk,ReadingFontSetting.LatinCjk->catalog.cjkGroups
+                    ReadingFontSetting.Latin,ReadingFontSetting.CjkLatin->catalog.latinGroups
+                    ReadingFontSetting.Code->emptyList()
+                }
+                var activeGroupId by rememberSaveable(activeTab){
+                    mutableStateOf(groups.firstOrNull {g->g.items.any {it.family.equals(currentFamily,true)}}?.id ?: groups.firstOrNull()?.id ?: "")
+                }
+                if(groups.isNotEmpty()&&groups.none {it.id==activeGroupId}) activeGroupId=groups.first().id
+
+                if(groups.isNotEmpty()){
+                    Surface(Modifier.fillMaxWidth(),shape=RoundedCornerShape(14.dp),color=MaterialTheme.colorScheme.surfaceContainerHigh){
+                        Row(Modifier.fillMaxWidth().padding(3.dp)){
+                            groups.forEach {group->
+                                val selected=group.id==activeGroupId
+                                val extra=if(group.id=="system"||group.id=="builtin") 1 else 0
+                                val text="${tr(group.titleZh,group.titleEn)}(${group.items.size+extra})"
+                                Surface(
+                                    onClick={activeGroupId=group.id},
+                                    modifier=Modifier.weight(1f).height(26.dp),
+                                    shape=RoundedCornerShape(11.dp),
+                                    color=if(selected)MaterialTheme.colorScheme.surface else Color.Transparent,
+                                ){
+                                    Box(contentAlignment=Alignment.Center){
+                                        Text(text,fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                            color=if(selected)MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val showImport=activeTab==ReadingFontSetting.Code||activeGroupId=="system"||activeGroupId=="builtin"
+                val rawItems=if(activeTab==ReadingFontSetting.Code) catalog.monospace else groups.firstOrNull {it.id==activeGroupId}?.items.orEmpty()
+                val cards=buildList<Pair<String,FontOption?>> {
+                    rawItems.forEach {add(it.family to it)}
+                    if(showImport) add("__import__" to null)
+                }
+                val isDefaultPreload={family:String->family=="LXGW WenKai GB Screen"||family=="Literata"||family=="Maple Mono"}
+                val anyDownloading=state.downloadingFontFamily!=null||(state.fontsDownloading&&rawItems.any {!it.downloaded&&isDefaultPreload(it.family)})
+                val busy=state.busy||state.downloadingFontFamily!=null
+                val gridHeight=if(groups.isEmpty()) 276.dp else 232.dp
+                Column(Modifier.fillMaxWidth().height(gridHeight).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(8.dp)){
+                    cards.chunked(3).forEach {row->
+                        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)){
+                            row.forEach {(key,option)->
+                                if(option==null){
+                                    Surface(
+                                        onClick=onImportFont,
+                                        enabled=!busy,
+                                        modifier=Modifier.weight(1f).height(40.dp),
+                                        shape=RoundedCornerShape(8.dp),
+                                        color=MaterialTheme.colorScheme.surface,
+                                        border=BorderStroke(1.dp,MaterialTheme.colorScheme.outlineVariant),
+                                    ){
+                                        Box(Modifier.padding(horizontal=6.dp),contentAlignment=Alignment.Center){
+                                            Text(tr("导入字体","Import font"),fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                                color=MaterialTheme.colorScheme.onSurface)
+                                        }
+                                    }
+                                } else {
+                                    val selected=!anyDownloading&&option.family.equals(currentFamily,true)
+                                    val downloading=state.downloadingFontFamily==option.family||(state.fontsDownloading&&!option.downloaded&&isDefaultPreload(option.family))
+                                    val label=if(downloading) tr("下载中","Downloading") else if(option.label=="系统字体") tr("系统字体","System font") else option.label
+                                    Surface(
+                                        onClick={
+                                            model.selectFont(option.family,option.downloaded){opts->opts.withFont(activeTab,option.family)}
+                                        },
+                                        enabled=!busy,
+                                        modifier=Modifier.weight(1f).height(40.dp),
+                                        shape=RoundedCornerShape(8.dp),
+                                        color=MaterialTheme.colorScheme.surface,
+                                        border=BorderStroke(if(selected||downloading)1.5.dp else 1.dp,if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant),
+                                    ){
+                                        Box(Modifier.fillMaxSize()){
+                                            if(downloading){
+                                                val frac=(state.downloadingFontProgress/100f).coerceIn(0.06f,1f)
+                                                Box(Modifier.fillMaxHeight().fillMaxWidth(frac).background(MaterialTheme.colorScheme.primary.copy(alpha=0.18f)))
+                                            }
+                                            Box(Modifier.fillMaxSize().padding(horizontal=6.dp),contentAlignment=Alignment.Center){
+                                                Text(label,fontSize=12.sp,maxLines=1,overflow=TextOverflow.Ellipsis,
+                                                    color=if(selected||downloading)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            repeat(3-row.size){Spacer(Modifier.weight(1f))}
+                        }
+                    }
+                }
+            }
         }
     }
 }

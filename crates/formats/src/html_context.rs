@@ -87,6 +87,7 @@ impl HtmlContext {
                 .headings
                 .get(descriptor.href.path())
                 .map_or(&[], Vec::as_slice),
+            linked_footnote_document: None,
         }
     }
 

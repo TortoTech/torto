@@ -12,14 +12,18 @@ use std::{
 };
 
 pub fn path(root: &Path, asset: &Asset) -> PathBuf {
-    root.join(&catalog().version)
-        .join(format!("{}-{}.ttf", asset.id, asset.sha256))
+    let filename = if asset.sha256.is_empty() {
+        format!("{}.ttf", asset.id)
+    } else {
+        format!("{}-{}.ttf", asset.id, asset.sha256)
+    };
+    root.join(&catalog().version).join(filename)
 }
 pub fn validate(asset: &Asset, bytes: Vec<u8>, pinned: bool) -> Result<Face, String> {
     if bytes.is_empty() || bytes.len() > 40 * 1024 * 1024 {
         return Err("字体文件大小无效 / Invalid font size".into());
     }
-    if pinned {
+    if pinned && !asset.sha256.is_empty() && asset.size > 0 {
         crate::http::verify_sized_sha256(
             &bytes,
             asset.size as u64,
@@ -40,6 +44,9 @@ pub fn validate(asset: &Asset, bytes: Vec<u8>, pinned: bool) -> Result<Face, Str
             },
             weight: Weight::NORMAL,
             ..Query::default()
+        })
+        .or_else(|| {
+            (!asset.preload).then(|| db.faces().next().map(|face| face.id)).flatten()
         })
         .ok_or("字体名称无效 / Unexpected font family")?;
     if db
@@ -67,7 +74,8 @@ pub fn validate(asset: &Asset, bytes: Vec<u8>, pinned: bool) -> Result<Face, Str
 }
 pub fn load_cached(root: &Path, asset: &Asset) -> Option<Face> {
     let file = path(root, asset);
-    if fs::metadata(&file).ok()?.len() != asset.size as u64 {
+    let len = fs::metadata(&file).ok()?.len();
+    if asset.size > 0 && len != asset.size as u64 {
         return None;
     }
     validate(asset, fs::read(file).ok()?, true).ok()

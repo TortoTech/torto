@@ -565,6 +565,9 @@ impl ApplicationHandler<UserEvent> for Application {
         let callback_started = Instant::now();
         match event {
             UserEvent::Fonts(message) => self.app.complete_fonts(message, &self.egui_ctx),
+            UserEvent::CustomFontsImported(message) => {
+                self.app.complete_custom_fonts_imported(message, &self.egui_ctx)
+            }
             UserEvent::RepaintAfter(delay) => {
                 if let Some(when) = Instant::now().checked_add(delay) {
                     self.repaint.external(when);
@@ -1035,7 +1038,7 @@ mod tests {
         assert!(wix.contains("Title='E-book file associations'"));
         assert!(wix.contains("Value='&quot;[APPLICATIONFOLDER]torto.exe&quot; &quot;%1&quot;'"));
         for extension in [
-            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "pdf",
+            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "lit", "txt", "pdf",
         ] {
             assert!(
                 wix.contains(&format!(
@@ -1091,7 +1094,8 @@ mod tests {
         assert!(document_types.contains("<key>CFBundleDocumentTypes</key>"));
         assert!(document_types.contains("<string>org.idpf.epub-container</string>"));
         assert!(document_types.contains("<string>com.adobe.pdf</string>"));
-        for extension in ["mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm"] {
+        assert!(document_types.contains("<string>public.plain-text</string>"));
+        for extension in ["mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "lit"] {
             assert!(
                 document_types.contains(&format!("<string>{extension}</string>")),
                 "missing macOS document declaration for .{extension}"

@@ -390,7 +390,7 @@ async fn update(
             replan(&reader);
         });
     }
-    if translated && settings.translate_toc {
+    if translated {
         let key = format!("{context}:contents");
         let request = {
             let mut state = reader.ai.lock().map_err(error)?;

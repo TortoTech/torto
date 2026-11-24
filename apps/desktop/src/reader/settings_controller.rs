@@ -169,8 +169,17 @@ impl DesktopReader {
                 .show(&mut self.notice, hint.into(), std::time::Instant::now());
             return;
         }
+        let keep_overlay = matches!(
+            change,
+            ReaderSettingsChange::FontSize(_)
+                | ReaderSettingsChange::CjkFont(_)
+                | ReaderSettingsChange::LatinFont(_)
+                | ReaderSettingsChange::CjkLatinFont(_)
+        );
         self.cancel_text_selection();
-        self.close_overlay();
+        if !keep_overlay {
+            self.close_overlay();
+        }
         self.settings_change_requested = Some(change);
     }
 
@@ -229,8 +238,6 @@ impl DesktopReader {
             || self.plugin_settings.translation_model != plugin_settings.translation_model
             || self.plugin_settings.target_language != plugin_settings.target_language
             || self.plugin_settings.providers != plugin_settings.providers;
-        let toc_translation_setting_changed =
-            self.plugin_settings.translate_toc != plugin_settings.translate_toc;
         let old_ocr_provider = self
             .plugin_settings
             .providers
@@ -348,8 +355,6 @@ impl DesktopReader {
                     self.translation.toc_task.cancel();
                     self.translation.toc_labels.clear();
                     self.translation.canonical_titles.clear();
-                } else if toc_translation_setting_changed && !self.plugin_settings.translate_toc {
-                    self.translation.toc_task.cancel();
                 }
                 if !self.plugin_settings.ocr_enabled {
                     self.pdf_toc.task.cancel();

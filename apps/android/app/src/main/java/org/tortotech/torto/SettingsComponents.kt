@@ -29,8 +29,8 @@ import androidx.compose.ui.unit.sp
         val iconInk=defaultIconColor().copy(alpha=if(enabled)1f else .38f)
         if(icon!=null){AppIcon(icon,size=IconSizes.Compact,tint=iconInk);Spacer(Modifier.width(12.dp))}
         Column(Modifier.weight(1f)){
-            Text(title,fontSize=16.sp,color=ink)
-            if(description!=null){Spacer(Modifier.height(4.dp));Text(description,fontSize=14.sp,color=secondary)}
+            Text(title,fontSize=16.sp,lineHeight=20.sp,color=ink)
+            if(description!=null){Spacer(Modifier.height(2.dp));Text(description,fontSize=12.sp,lineHeight=16.sp,color=secondary)}
         }
         if(value!=null){
             Spacer(Modifier.width(12.dp))
@@ -46,8 +46,8 @@ import androidx.compose.ui.unit.sp
 @Composable internal fun SettingsSwitch(title:String,checked:Boolean,enabled:Boolean=true,description:String?=null,change:(Boolean)->Unit){
     Row(Modifier.fillMaxWidth().heightIn(min=56.dp).toggleable(value=checked,enabled=enabled,role=Role.Switch,onValueChange=change).padding(horizontal=16.dp,vertical=10.dp),verticalAlignment=Alignment.CenterVertically){
         Column(Modifier.weight(1f)){
-            Text(title,fontSize=16.sp,color=MaterialTheme.colorScheme.onSurface.copy(alpha=if(enabled)1f else .38f))
-            if(description!=null){Spacer(Modifier.height(4.dp));Text(description,fontSize=14.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}
+            Text(title,fontSize=16.sp,lineHeight=20.sp,color=MaterialTheme.colorScheme.onSurface.copy(alpha=if(enabled)1f else .38f))
+            if(description!=null){Spacer(Modifier.height(2.dp));Text(description,fontSize=12.sp,lineHeight=16.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}
         }
         Spacer(Modifier.width(16.dp))
         Switch(checked,onCheckedChange=null,enabled=enabled,colors=tortoSwitchColors())

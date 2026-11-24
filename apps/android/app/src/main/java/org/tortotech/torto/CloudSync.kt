@@ -139,6 +139,16 @@ internal object CloudRuntime {
         if (!config.enabled) return@withLock null
         if (worker != null && foreground) return@withLock null
         val control = ChatRequest(); request = control; worker?.control = control
+        mutable.update {
+            it.copy(
+                running = trigger == CloudSyncTrigger.MANUAL,
+                stage = "preparing",
+                completed = 0u,
+                total = 0u,
+                booksCompleted = 0u,
+                booksTotal = 0u
+            )
+        }
         // Finish below WorkManager's execution limit; native journals the mode
         // and retains validated per-book checkpoints when this budget expires.
         val budget = if (worker != null) scope.launch {

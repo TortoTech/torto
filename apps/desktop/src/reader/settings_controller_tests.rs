@@ -171,6 +171,7 @@ fn unchanged_settings_keep_prepared_pages_focus_units_and_restore_target() {
         plugin_settings: reader.plugin_settings.clone(),
         language: reader.language,
         theme: Default::default(),
+        reader_theme: None,
         selection_granularity: reader.selection_granularity,
         shortcuts: reader.shortcuts.clone(),
         sync_settings: reader.sync_settings.clone(),

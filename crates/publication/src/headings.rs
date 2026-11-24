@@ -36,10 +36,27 @@ pub fn heading_ordinal_key(text: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
-    if rest
-        .split('.')
-        .all(|part| !part.is_empty() && part.bytes().all(|ch| ch.is_ascii_digit()))
-    {
+    if rest.split('.').all(|part| {
+        if part.is_empty() {
+            return false;
+        }
+        let mut chars = part.chars().peekable();
+        let mut has_digit = false;
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            chars.next();
+            has_digit = true;
+        }
+        let rest_chars: String = chars.collect();
+        if rest_chars.is_empty() {
+            has_digit
+        } else {
+            // Support fractional chapter ordinals such as "5½" or "½".
+            rest_chars.chars().count() == 1
+                && rest_chars
+                    .chars()
+                    .all(|ch| "¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞".contains(ch))
+        }
+    }) {
         return Some(rest.to_owned());
     }
     if rest
@@ -97,6 +114,8 @@ mod tests {
         for value in [
             "2",
             "1.1",
+            "5½",
+            "Chapter 5½",
             "CHAPTER 2",
             "Part II",
             "— ONE —",

@@ -21,7 +21,8 @@ fn fixture(index: usize) -> Vec<u8> {
 #[test]
 fn pinned_assets_register_both_reader_families_and_true_italic() {
     let mut set = FontSet::default();
-    for (index, asset) in catalog::catalog().fonts.iter().enumerate() {
+    for index in catalog::preload_indices() {
+        let asset = &catalog::catalog().fonts[index];
         set.faces[index] = Some(store::validate(asset, fixture(index), true).unwrap());
     }
     let mut engine = LayoutEngine::with_fonts(set.reader_fonts().iter().cloned());
@@ -264,15 +265,16 @@ fn unavailable_or_invalid_github_assets_fall_back_to_the_mirror() {
 #[test]
 fn lab_sources_keep_the_existing_font_cache_identity() {
     assert_eq!(catalog::catalog().version, "1");
-    for asset in &catalog::catalog().fonts {
-        assert!(asset.github_asset_id > 0);
+    for asset in catalog::catalog().fonts.iter().filter(|a| a.preload) {
+        let asset_id = asset.github_asset_id.expect("preload asset must have github_asset_id");
+        assert!(asset_id > 0);
         let sources = catalog::sources(asset);
         assert!(matches!(&sources[0], catalog::Source::GitHubAsset(_)));
         assert_eq!(
             sources[0].url(),
             format!(
                 "https://api.github.com/repos/TortoTech/lab/releases/assets/{}",
-                asset.github_asset_id
+                asset_id
             )
         );
         assert_eq!(

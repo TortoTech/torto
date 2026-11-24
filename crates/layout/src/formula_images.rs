@@ -768,7 +768,8 @@ impl LayoutEngine {
         style: &ReaderStyle,
         width: f32,
     ) -> Result<bool, LayoutError> {
-        let formula = image.formula.as_ref();
+        let formula = image.formula.as_ref()
+            .filter(|_| style.typesetting.mode == TypesettingMode::Unified);
         if formula.is_none() && (number.is_none() || original_run.is_none()) {
             return Ok(false);
         }

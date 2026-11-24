@@ -117,7 +117,6 @@ struct SyncUiState {
     password: String,
     task: TaskSlot<SyncTask>,
     button: SyncButtonState,
-    ready_books: (u64,u64),
     schedule: SyncSchedule,
     import_error: Option<String>,
     monitor: sync_monitor::SyncMonitor,
@@ -304,7 +303,6 @@ impl ShelfFeature {
                 password,
                 task: TaskSlot::default(),
                 button: SyncButtonState::default(),
-                ready_books: (0,0),
                 schedule: SyncSchedule::default(),
                 import_error: None,
                 monitor: sync_monitor::SyncMonitor::default(),
@@ -612,12 +610,7 @@ impl ShelfFeature {
         if !self.sync.schedule.start_requested(mode, Instant::now()) {
             return;
         }
-        self.sync.ready_books=(0,0);
-        self.sync.button = SyncButtonState::Running {
-            stage: SyncStage::Preparing,
-            completed: 0,
-            total: 0,
-        };
+        self.sync.button = SyncButtonState::starting();
         if let Err(error) = self.sync.settings.validate() {
             self.sync.schedule.completed(mode, false, Instant::now());
             self.sync_failed(format!(
@@ -774,7 +767,7 @@ impl ShelfFeature {
                     .add_filter(
                         "E-books",
                         &[
-                            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "pdf",
+                            "epub", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "lit", "txt", "pdf",
                         ],
                     )
                     .pick_files()
@@ -806,6 +799,7 @@ impl ShelfFeature {
                     tracing::warn!(%log_error, "failed to append WebDAV sync log");
                 }
                 let progress_proxy = proxy.clone();
+                let mut last_stage = None;
                 let mut rate_limit = None;
                 let result = match run_sync(
                     payload.settings,
@@ -817,6 +811,16 @@ impl ShelfFeature {
                             && let Err(error) = append_sync_log("INFO", &message)
                         {
                             tracing::warn!(%error, "failed to append WebDAV sync log");
+                        }
+                        if let SyncProgress::Stage { stage, .. } = &progress {
+                            if *stage == SyncStage::Uploading {
+                                return;
+                            }
+                            if last_stage.replace(*stage) == Some(*stage)
+                                && !matches!(stage, SyncStage::Books | SyncStage::UploadingBooks | SyncStage::ReadingApplied)
+                            {
+                                return;
+                            }
                         }
                         let _ = progress_proxy.send_event(
                             crate::platform::UserEvent::ShelfSyncProgress(SyncProgressMessage {
@@ -938,17 +942,11 @@ impl ShelfFeature {
                 completed,
                 total,
             } => {
-                if stage==SyncStage::ReadingApplied {return;}
-                if stage==SyncStage::Books {self.sync.ready_books=(completed,total);}
-                let (stage,completed,total)=if stage==SyncStage::Downloading&&self.sync.ready_books.1>0 {
-                    (SyncStage::Books,self.sync.ready_books.0,self.sync.ready_books.1)
-                }else{(stage,completed,total)};
-                self.sync.button = SyncButtonState::Running {stage,completed,total};
+                self.sync.button.update_stage(stage, completed, total);
             }
             SyncProgress::Downloaded {
                 book,
                 cache_path,
-                books_completed,
                 books_total,
                 ..
             } => {
@@ -958,6 +956,7 @@ impl ShelfFeature {
                             self.cover_textures.clear();
                         }
                         fs::remove_file(&cache_path).ok();
+                        self.sync.button.book_ready(books_total);
                     }
                     Err(error) => {
                         self.sync.import_error = Some(format!(
@@ -967,10 +966,6 @@ impl ShelfFeature {
                         ));
                     }
                 }
-                self.sync.ready_books=(books_completed,books_total);
-                self.sync.button = SyncButtonState::Running {
-                    stage: SyncStage::Books,completed:books_completed,total:books_total,
-                };
             }
             SyncProgress::CoverDownloaded { book_id, bytes } => {
                 let result = self.shelf.library.update_missing_covers(&[(book_id.clone(), bytes)])
@@ -1156,6 +1151,7 @@ impl ShelfFeature {
                         .layout(egui::Layout::right_to_left(egui::Align::Center)),
                     |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(actions_rect));
+                        ui.spacing_mut().item_spacing.x = 0.0;
                         if interaction_blocked {
                             // The modal backdrop dims this entire action row.
                             // Keep disabled actions inert without fading them twice.
@@ -1164,7 +1160,7 @@ impl ShelfFeature {
                         let settings = icon_button(ui, Icon::Settings);
                         if ui
                             .add_enabled_ui(!interaction_blocked, |ui| {
-                                icon_button(ui, Icon::MessageCircleQuestion)
+                                icon_button(ui, Icon::Mail)
                             })
                             .inner
                             .on_hover_text(self.language.text("反馈问题", "Report an issue"))
@@ -1862,7 +1858,6 @@ fn sort_shelf_books(books: &mut [LibraryBook], read_activity: &HashMap<String, u
 
 #[cfg(test)]
 mod tests {
-    use super::sync_button::sync_progress_text;
     use super::*;
 
     #[test]
@@ -1913,31 +1908,6 @@ mod tests {
             }
         }
         assert!(saw_target, "offscreen keyboard target must become visible");
-    }
-
-    #[test]
-    fn sync_percentage_only_reaches_100_when_complete() {
-        assert_eq!(
-            sync_progress_text(AppLanguage::English, SyncStage::Uploading, 999, 1000),
-            "Syncing · Uploading 99%"
-        );
-        assert_eq!(
-            sync_progress_text(AppLanguage::English, SyncStage::Uploading, 1000, 1000),
-            "Syncing · Uploading 100%"
-        );
-        assert_eq!(
-            sync_progress_text(
-                AppLanguage::English,
-                SyncStage::Uploading,
-                u64::MAX - 1,
-                u64::MAX
-            ),
-            "Syncing · Uploading 99%"
-        );
-        assert_eq!(
-            sync_progress_text(AppLanguage::English, SyncStage::Preparing, 0, 0),
-            "Syncing…"
-        );
     }
 
     fn book(id: &str, added_at: u64) -> LibraryBook {

@@ -44,6 +44,34 @@ impl AppTheme {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReaderTheme {
+    Light,
+    Dark,
+}
+
+impl ReaderTheme {
+    pub(crate) const fn from_dark(dark: bool) -> Self {
+        if dark {
+            Self::Dark
+        } else {
+            Self::Light
+        }
+    }
+
+    pub(crate) const fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    pub(crate) const fn toggle(self) -> Self {
+        match self {
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Light,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReaderPreferences {
     pub(crate) interface_typography: InterfaceTypography,
@@ -55,6 +83,7 @@ pub(crate) struct ReaderPreferences {
     pub(crate) focus_style: FocusStyle,
     pub(crate) hide_cursor_in_focus_mode: bool,
     pub(crate) theme: AppTheme,
+    pub(crate) reader_theme: Option<ReaderTheme>,
     pub(crate) selection_granularity: SelectionGranularity,
     pub(crate) shortcuts: ShortcutPreferences,
 }
@@ -71,6 +100,7 @@ impl Default for ReaderPreferences {
             focus_style: FocusStyle::default(),
             hide_cursor_in_focus_mode: false,
             theme: AppTheme::default(),
+            reader_theme: None,
             selection_granularity: SelectionGranularity::Free,
             shortcuts: ShortcutPreferences::default(),
         }
@@ -397,6 +427,8 @@ struct StoredReaderPreferences {
     language: AppLanguage,
     #[serde(default)]
     theme: StoredAppTheme,
+    #[serde(default)]
+    reader_theme: Option<ReaderTheme>,
     #[serde(default = "default_spread")]
     spread: StoredSpreadMode,
     #[serde(default)]
@@ -583,6 +615,7 @@ fn load_from(path: PathBuf) -> PreferencesResult<ReaderPreferences> {
         focus_style: stored.focus_style,
         hide_cursor_in_focus_mode: stored.hide_cursor_in_focus_mode,
         theme: stored.theme.into(),
+        reader_theme: stored.reader_theme,
         selection_granularity: stored.selection_granularity.into(),
         shortcuts: stored.shortcuts,
     })
@@ -622,6 +655,7 @@ fn save_to(path: &Path, preferences: &ReaderPreferences) -> PreferencesResult<()
         focus_style: preferences.focus_style,
         hide_cursor_in_focus_mode: preferences.hide_cursor_in_focus_mode,
         theme: preferences.theme.into(),
+        reader_theme: preferences.reader_theme,
         selection_granularity: preferences.selection_granularity.into(),
         shortcuts: preferences.shortcuts.clone(),
     };
@@ -697,6 +731,7 @@ mod tests {
             focus_style: FocusStyle::SurroundingDim,
             hide_cursor_in_focus_mode: true,
             theme: AppTheme::Dark,
+            reader_theme: None,
             selection_granularity: SelectionGranularity::Sentence,
             shortcuts: ShortcutPreferences {
                 toggle_left_sidebar: egui::KeyboardShortcut::new(

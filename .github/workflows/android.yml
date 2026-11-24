@@ -55,7 +55,7 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - name: Install host font dependencies for UniFFI generator
         run: |
           sudo apt-get update
@@ -66,7 +66,7 @@ jobs:
           log-accepted-android-sdk-licenses: false
       - name: Install Android toolchain
         run: |
-          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+          sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358'
           rustup target add aarch64-linux-android x86_64-linux-android
           cargo install cargo-ndk --version 4.1.2 --locked
       - name: Build per-ABI debug APKs and device tests

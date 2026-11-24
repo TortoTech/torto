@@ -15,7 +15,8 @@ impl DesktopApp {
         if reader.has_status_notice() {
             return;
         }
-        let ready = self.fonts.settled() && self.settings.font_apply_available;
+        let ready =
+            self.fonts.settled() && self.fonts.preload_ready() && self.settings.font_apply_available;
         let missing = reader.missing_font_resources();
         if !ready && !missing {
             return;
@@ -26,8 +27,8 @@ impl DesktopApp {
         let mut retry = false;
         let message = if ready {
             language.text(
-                "新字体已下载完成",
-                "New fonts downloaded",
+                "默认字体下载完成",
+                "Default fonts downloaded",
             )
         } else {
             language.text("此 PDF 缺少可用字体，部分文字可能显示不全。默认字体就绪后可应用修复", "This PDF needs a missing font. Apply the default fonts when ready to restore its text")

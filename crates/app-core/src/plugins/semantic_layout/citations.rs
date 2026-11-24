@@ -634,6 +634,14 @@ pub(super) struct WindowCandidate {
     pub paragraph_text: String,
 }
 
+pub(super) fn locally_recognized(section: &Section, candidate: &WindowCandidate) -> bool {
+    let mut paragraphs = Vec::new();
+    texts(std::slice::from_ref(&section.blocks[candidate.block]), &mut paragraphs);
+    paragraphs.get(candidate.paragraph).is_some_and(|text| {
+        heuristics::is_known(text, &candidate.span)
+    })
+}
+
 pub(super) fn window_candidates(
     section: &Section,
     target: std::ops::Range<usize>,

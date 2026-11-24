@@ -427,6 +427,8 @@ impl PluginSettings {
         if let Ok(value) = env::var("REBOOK_AI_API_KEY")
             && let Some(provider) = settings.providers.first_mut()
         { provider.api_key = value; }
+        semantic_layout::restore_layout_model_protocol(&settings);
+        settings.fill_layout_image_model();
         Ok(settings)
     }
 
@@ -598,7 +600,11 @@ impl PluginSettings {
         if self.providers.len() <= 1 || index >= self.providers.len() {
             return;
         }
-        self.providers.remove(index);
+        let removed = self.providers.remove(index);
+        if self.semantic_layout.image_provider == removed.id {
+            self.semantic_layout.image_provider.clear();
+            self.semantic_layout.image_model.clear();
+        }
         normalize_selection(
             &self.providers,
             &mut self.chat_provider,
@@ -630,6 +636,43 @@ impl PluginSettings {
             &self.semantic_layout.model,
             "排版 → 布局",
         )
+    }
+
+    pub fn fill_layout_image_model(&mut self) {
+        let layout = &mut self.semantic_layout;
+        if !layout.image_model.is_empty() || layout.model.is_empty() {
+            return;
+        }
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == layout.provider)
+        else {
+            return;
+        };
+        if semantic_layout::layout_model_protocol(provider, &layout.model)
+            == semantic_layout::LayoutModelProtocol::Chat
+        {
+            layout.image_provider.clone_from(&layout.provider);
+            layout.image_model.clone_from(&layout.model);
+            layout.image_reasoning_effort = layout.reasoning_effort;
+        }
+    }
+
+    pub fn semantic_layout_image_endpoint(&self) -> Option<(&AiProvider, &str, ReasoningEffort)> {
+        let layout = &self.semantic_layout;
+        let (provider, model, effort) = if layout.image_model.is_empty() {
+            let (provider, model) = self.semantic_layout_endpoint().ok()?;
+            (provider, model, layout.reasoning_effort)
+        } else {
+            let (provider, model) = self
+                .endpoint(&layout.image_provider, &layout.image_model, "图片识别")
+                .ok()?;
+            (provider, model, layout.image_reasoning_effort)
+        };
+        (semantic_layout::layout_model_protocol(provider, model)
+            != semantic_layout::LayoutModelProtocol::Decision)
+            .then_some((provider, model, effort))
     }
 
     pub fn resolved_target_language(&self, system_language: &str) -> String {

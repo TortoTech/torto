@@ -16,7 +16,7 @@ import androidx.compose.ui.unit.sp
 
 @Composable internal fun InterfaceSettingsRows(state:ScreenState,open:(String)->Unit){
     SettingsItem(tr("深色模式","Dark mode"),icon="moon",value=when(state.appTheme){
-        "dark"->tr("已开启","On");"light"->tr("未开启","Off");else->tr("跟随系统","Follow system")
+        "dark"->tr("深色模式","Dark mode");"light"->tr("浅色模式","Light mode");else->tr("跟随系统","Follow system")
     }){open("dark-mode")}
     SettingsItem(tr("界面语言","Interface language"),icon="translate",value=when(state.language){
         "zh-CN"->"中文";"en"->"English";else->tr("跟随系统","Follow system")
@@ -27,7 +27,7 @@ import androidx.compose.ui.unit.sp
     val systemDark=isSystemInDarkTheme()
     InterfaceChoiceScreen(state.appTheme,
         tr("开启后，将跟随系统打开或关闭深色模式","When enabled, dark mode follows your system settings"),
-        listOf("light" to tr("浅色","Light"),"dark" to tr("深色","Dark")),!state.busy,
+        listOf("light" to tr("浅色模式","Light mode"),"dark" to tr("深色模式","Dark mode")),!state.busy,
         onFollow={model.interfaceSettings(if(it)"system"else if(systemDark)"dark"else"light",state.language)},
         onSelect={model.interfaceSettings(it,state.language)})
 }
@@ -44,7 +44,7 @@ import androidx.compose.ui.unit.sp
 /** Shared follow-system switch and manual choice cards; changes save immediately. */
 @Composable private fun InterfaceChoiceScreen(value:String,description:String,choices:List<Pair<String,String>>,enabled:Boolean,onFollow:(Boolean)->Unit,onSelect:(String)->Unit){
     val follows=value=="system"
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start=16.dp,end=16.dp,top=8.dp,bottom=16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
         SettingsGroup {SettingsSwitch(tr("跟随系统","Follow system"),follows,enabled,description=description,change=onFollow)}
         if(!follows){
             SectionLabel(tr("手动选择","Manual selection"))

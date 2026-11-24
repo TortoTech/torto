@@ -18,7 +18,7 @@ mod egui_view;
 mod font_downloads;
 mod provider_models;
 
-pub(crate) use egui_view::{choice_button, settings_overlay};
+pub(crate) use egui_view::{choice_button, settings_overlay, smooth_numeric_slider};
 pub(crate) use provider_models::ProviderModelsMessage;
 use provider_models::{ProviderModelsRequest, fetch_provider_models};
 
@@ -39,22 +39,29 @@ pub(crate) struct AppliedSettings {
     pub(crate) plugin_settings: PluginSettings,
     pub(crate) language: AppLanguage,
     pub(crate) theme: AppTheme,
+    pub(crate) reader_theme: Option<crate::preferences::ReaderTheme>,
     pub(crate) selection_granularity: SelectionGranularity,
     pub(crate) shortcuts: ShortcutPreferences,
     pub(crate) sync_settings: SyncSettings,
     pub(crate) sync_password: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ReaderSettingsChange {
     Spread(SpreadMode),
     ReadingMode(ReadingMode),
-    Theme(AppTheme),
+    Theme(crate::preferences::ReaderTheme),
     SelectionGranularity(SelectionGranularity),
+    FontSize(f32),
+    CjkFont(String),
+    LatinFont(String),
+    CjkLatinFont(Option<String>),
+    LatinCjkFont(Option<String>),
+    MonospaceFont(String),
 }
 
 pub(crate) struct SettingsFeature {
-    pub(crate) font_statuses: [crate::fonts::Status; 3],
+    pub(crate) font_statuses: Vec<crate::fonts::Status>,
     pub(crate) font_retry_requested: bool,
     pub(crate) font_apply_requested: bool,
     pub(crate) font_apply_available: bool,
@@ -81,6 +88,8 @@ pub(crate) struct SettingsFeature {
     error: Option<String>,
     open: bool,
     capturing_shortcut: Option<ShortcutAction>,
+    layout_probe_selection: Option<(String, String, String)>,
+    pending_layout_probe: Option<(rebook_app_core::plugins::AiProvider, String)>,
     provider_models_task: TaskSlot<ProviderModelsRequest>,
     provider_models_cache: HashMap<String, Vec<String>>,
     provider_models_errors: HashMap<String, String>,
@@ -137,6 +146,7 @@ impl SettingsFeature {
             plugin_settings,
             language: preferences.language,
             theme: preferences.theme,
+            reader_theme: preferences.reader_theme,
             selection_granularity: preferences.selection_granularity,
             shortcuts: preferences.shortcuts,
             sync_settings,
@@ -184,8 +194,12 @@ impl SettingsFeature {
             error: None,
             open: false,
             capturing_shortcut: None,
+            layout_probe_selection: None,
+            pending_layout_probe: None,
             provider_models_task: TaskSlot::default(),
-            provider_models_cache: HashMap::new(),
+            provider_models_cache: rebook_app_core::environment::paths()
+                .map(|p| rebook_app_core::provider_models::load_provider_models_cache(p.data_dir()))
+                .unwrap_or_default(),
             provider_models_errors: HashMap::new(),
             provider_models_loading: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -229,6 +243,36 @@ impl SettingsFeature {
         &self.applied
     }
 
+    fn schedule_layout_probe(&mut self) {
+        let config = &self.draft_plugin_settings;
+        let selection =
+            if config.semantic_layout.enabled && !config.semantic_layout.model.is_empty() {
+                config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == config.semantic_layout.provider)
+                    .map(|provider| {
+                        (
+                            provider.id.clone(),
+                            provider.base_url.clone(),
+                            config.semantic_layout.model.clone(),
+                        )
+                    })
+            } else {
+                None
+            };
+        if self.layout_probe_selection != selection {
+            self.pending_layout_probe = selection.as_ref().and_then(|(id, _, model)| {
+                config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == *id)
+                    .map(|provider| (provider.clone(), model.clone()))
+            });
+            self.layout_probe_selection = selection;
+        }
+    }
+
     pub(crate) fn spawn_pending_tasks(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -247,6 +291,13 @@ impl SettingsFeature {
                     id: request.id,
                     result,
                 }));
+            });
+        }
+        if let Some((provider, model)) = self.pending_layout_probe.take() {
+            let proxy = proxy.clone();
+            runtime.spawn(async move {
+                rebook_app_core::plugins::semantic_layout::probe_layout_model(&provider, &model).await;
+                let _ = proxy.send_event(UserEvent::RepaintAfter(std::time::Duration::ZERO));
             });
         }
         let Some(request) = self.provider_models_task.take_pending() else {
@@ -289,6 +340,13 @@ impl SettingsFeature {
         match message.result {
             Ok(models) => {
                 self.provider_models_errors.remove(&request.provider_id);
+                if let Some(paths) = rebook_app_core::environment::paths() {
+                    let _ = rebook_app_core::provider_models::save_provider_models_cache(
+                        paths.data_dir(),
+                        &request.provider_id,
+                        &models,
+                    );
+                }
                 self.provider_models_cache
                     .insert(request.provider_id, models);
             }
@@ -354,6 +412,7 @@ impl SettingsFeature {
             focus_style: self.applied.focus_style,
             hide_cursor_in_focus_mode: self.applied.hide_cursor_in_focus_mode,
             theme: self.applied.theme,
+            reader_theme: self.applied.reader_theme,
             selection_granularity: self.applied.selection_granularity,
             shortcuts: self.applied.shortcuts.clone(),
         };
@@ -362,20 +421,60 @@ impl SettingsFeature {
             ReaderSettingsChange::Spread(_)
                 | ReaderSettingsChange::ReadingMode(_)
                 | ReaderSettingsChange::Theme(_)
+                | ReaderSettingsChange::FontSize(_)
+                | ReaderSettingsChange::CjkFont(_)
+                | ReaderSettingsChange::LatinFont(_)
+                | ReaderSettingsChange::CjkLatinFont(_)
+                | ReaderSettingsChange::LatinCjkFont(_)
+                | ReaderSettingsChange::MonospaceFont(_)
         );
         match change {
             ReaderSettingsChange::Spread(spread) => preferences.spread = spread,
             ReaderSettingsChange::ReadingMode(mode) => preferences.reading_mode = mode,
-            ReaderSettingsChange::Theme(theme) => preferences.theme = theme,
+            ReaderSettingsChange::Theme(theme) => preferences.reader_theme = Some(theme),
             ReaderSettingsChange::SelectionGranularity(granularity) => {
                 preferences.selection_granularity = granularity;
+            }
+            ReaderSettingsChange::FontSize(size) => {
+                preferences.typography.font_size = size;
+                preferences.typography.normalize();
+            }
+            ReaderSettingsChange::CjkFont(family) => {
+                preferences.typography.default_cjk_font = family;
+                preferences.typography.normalize();
+            }
+            ReaderSettingsChange::LatinFont(family) => {
+                preferences.typography.default_font = rebook_layout::ReaderDefaultFont::Other;
+                preferences.typography.other_font = family;
+                preferences.typography.normalize();
+            }
+            ReaderSettingsChange::CjkLatinFont(family) => {
+                preferences.typography.cjk_default_font =
+                    family.filter(|f| !f.trim().is_empty()).map(|family| {
+                        rebook_layout::ReaderFontChoice {
+                            category: rebook_layout::ReaderDefaultFont::Other,
+                            family,
+                        }
+                    });
+                preferences.typography.normalize();
+            }
+            ReaderSettingsChange::LatinCjkFont(family) => {
+                preferences.typography.latin_cjk_font =
+                    family.filter(|f| !f.trim().is_empty());
+                preferences.typography.normalize();
+            }
+            ReaderSettingsChange::MonospaceFont(family) => {
+                preferences.typography.monospace_font = family;
+                preferences.typography.normalize();
             }
         }
         let values_unchanged = preferences.spread == self.applied.spread
             && preferences.reading_mode == self.applied.reading_mode
             && preferences.hide_cursor_in_focus_mode == self.applied.hide_cursor_in_focus_mode
             && preferences.theme == self.applied.theme
-            && preferences.selection_granularity == self.applied.selection_granularity;
+            && preferences.reader_theme == self.applied.reader_theme
+            && preferences.selection_granularity == self.applied.selection_granularity
+            && preferences.typography == self.applied.typography;
         if !reader_change_needs_apply(values_unchanged, layout_changed) {
             return Ok(());
         }
@@ -394,12 +493,15 @@ impl SettingsFeature {
         self.applied.focus_style = preferences.focus_style;
         self.applied.hide_cursor_in_focus_mode = preferences.hide_cursor_in_focus_mode;
         self.applied.theme = preferences.theme;
+        self.applied.reader_theme = preferences.reader_theme;
         self.applied.selection_granularity = preferences.selection_granularity;
+        self.applied.typography = preferences.typography.clone();
         self.draft_spread = preferences.spread;
         self.draft_reading_mode = preferences.reading_mode;
         self.draft_focus_style = preferences.focus_style;
         self.draft_hide_cursor_in_focus_mode = preferences.hide_cursor_in_focus_mode;
         self.draft_theme = preferences.theme;
+        self.draft_typography = preferences.typography;
         if layout_changed {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -431,6 +533,7 @@ impl SettingsFeature {
             plugin_settings: self.draft_plugin_settings.clone(),
             language: self.draft_language,
             theme: self.draft_theme,
+            reader_theme: self.applied.reader_theme,
             selection_granularity: self.applied.selection_granularity,
             shortcuts: self.draft_shortcuts.clone(),
             sync_settings: self.draft_sync_settings.clone(),
@@ -457,6 +560,7 @@ impl SettingsFeature {
         }
         let mut plugin_settings = self.draft_plugin_settings.clone();
         plugin_settings.normalize();
+        plugin_settings.fill_layout_image_model();
         let mut typography = self.draft_typography.clone();
         typography.normalize();
         let mut typesetting = self.draft_typesetting.clone();
@@ -495,6 +599,7 @@ impl SettingsFeature {
             typesetting: typesetting.clone(),
             language,
             theme,
+            reader_theme: self.applied.reader_theme,
             spread: self.draft_spread,
             reading_mode: self.draft_reading_mode,
             focus_style: self.draft_focus_style,
@@ -527,6 +632,7 @@ impl SettingsFeature {
             plugin_settings,
             language,
             theme,
+            reader_theme: self.applied.reader_theme,
             selection_granularity: self.applied.selection_granularity,
             shortcuts: self.draft_shortcuts.clone(),
             sync_settings,
@@ -797,6 +903,7 @@ mod tests {
             plugin_settings: PluginSettings::default(),
             language: preferences.language,
             theme: preferences.theme,
+            reader_theme: preferences.reader_theme,
             selection_granularity: preferences.selection_granularity,
             shortcuts: preferences.shortcuts,
             sync_settings: SyncSettings::new_device(),

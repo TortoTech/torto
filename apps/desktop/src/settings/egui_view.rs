@@ -1,5 +1,5 @@
 use egui::{Align2, Color32, Response, RichText, Vec2};
-use rebook_layout::{ReaderDefaultFont, ReaderFontChoice, SpreadMode, TypesettingMode};
+use rebook_layout::{SpreadMode, TypesettingMode};
 
 use super::{ProviderModelsRequest, SettingsFeature, SettingsTab, ShortcutAction};
 use crate::plugins::{
@@ -22,6 +22,7 @@ const SETTINGS_FONT_SELECT_WIDTH: f32 = 260.0;
 const SETTINGS_SCROLLBAR_GUTTER: f32 = 14.0;
 const SHORTCUT_CONTROL_WIDTH: f32 = 180.0;
 
+#[derive(Clone)]
 struct ConfiguredModel {
     provider_id: String,
     provider_name: String,
@@ -66,6 +67,7 @@ pub(crate) fn settings_overlay(ctx: &egui::Context, state: &mut SettingsFeature)
                 .inner_margin(0),
         )
         .show(ctx, |ui| {
+            ui.visuals_mut().interact_cursor = Some(egui::CursorIcon::PointingHand);
             ui.set_width(modal_size.x);
             ui.set_height(modal_size.y);
             ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -411,7 +413,7 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             ),
             (
                 ShortcutAction::FocusTableChart,
-                language.text("可视化表格", "Visualize table"),
+                language.text("可视化当前块", "Visualize current block"),
             ),
             (
                 ShortcutAction::FocusImagePreview,
@@ -698,6 +700,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 }
             });
         } else {
+            #[cfg(target_os = "windows")]
             ui.label(
                 RichText::new(state.draft_language.text(
                     "更新由 Microsoft Store 管理。",
@@ -742,7 +745,7 @@ fn about_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         ui.label(
             RichText::new(state.draft_language.text(
                 "当前平台暂不支持应用内自动更新。",
@@ -763,7 +766,7 @@ fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             .num_columns(2)
             .spacing([24.0, 16.0])
             .show(ui, |ui| {
-                settings_row_label(ui, state.draft_language.text("主题", "Theme"));
+                settings_row_label(ui, state.draft_language.text("界面主题", "Interface theme"));
                 settings_row_control_sized(ui, 330.0, |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     for (theme, glyph) in [
@@ -841,6 +844,7 @@ fn system_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
 }
 
 fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
+    state.draft_plugin_settings.fill_layout_image_model();
     reader_layout_settings(
         ui,
         state.draft_language,
@@ -851,13 +855,7 @@ fn typography_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
         &mut state.draft_typesetting,
         &mut state.draft_plugin_settings,
     );
-    ui.add_space(12.0);
-    reader_typeface_settings(
-        ui,
-        state.draft_language,
-        &mut state.draft_typography,
-        &state.available_reader_font_families,
-    );
+    state.schedule_layout_probe();
     super::font_downloads::show(ui, state);
 }
 
@@ -979,18 +977,23 @@ fn semantic_layout_rows(
     plugin_settings: &mut PluginSettings,
     model_options: &[ConfiguredModel],
 ) {
+    use rebook_app_core::plugins::semantic_layout::{LayoutModelProtocol, layout_model_protocol};
+    let providers = &plugin_settings.providers;
     let settings = &mut plugin_settings.semantic_layout;
     settings_row_label(ui, language.text("AI排版", "AI layout"));
     settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
         toggle_switch(ui, &mut settings.enabled);
         settings_help_icon(ui, language.text(
-            "补充未识别的引用、文内文献引用、公式图片、图注和小节标题，生成表格图表及公式符号说明",
-            "Recognize missing quotes, inline citations, formula images, captions and section headings; generate table charts and formula symbol notes",
+            "补充未被识别的块（脚注、图注等），公式转latex、图片表格转文字表格、公式符号说明",
+            "Detect missed blocks such as footnotes and captions, convert formulas to LaTeX and table images to text tables, and explain formula symbols.",
         ));
     });
     ui.end_row();
     if settings.enabled {
-        settings_row_label(ui, language.text("排版模型", "Layout model"));
+        settings_row_label(
+            ui,
+            language.text("排版分类模型", "Layout classification model"),
+        );
         settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
             configured_model_selector(
                 ui,
@@ -1001,8 +1004,60 @@ fn semantic_layout_rows(
                 language,
             );
             settings_help_icon(ui, language.text(
-                "使用能识图、速度快的模型（gemini/deepseek/qwen的flash系列）\n思考等级设置“不思考”",
-                "Use a fast, vision-capable model (Flash series from Gemini/DeepSeek/Qwen)\nSet reasoning effort to “None”",
+                "功能说明：补充未被识别的块（脚注、图注等）\n模型选用：用支持图片输入的决策模型或文本模型",
+                "Function: Detect missed blocks such as footnotes and captions.\nModel selection: Use a decision model or LLM that accepts images.",
+            ));
+        });
+        ui.end_row();
+
+        let protocol = providers
+            .iter()
+            .find(|provider| provider.id == settings.provider)
+            .map_or(LayoutModelProtocol::Unconfirmed, |provider| {
+                layout_model_protocol(provider, &settings.model)
+            });
+        if protocol != LayoutModelProtocol::Decision {
+            settings_row_label(ui, language.text("思考等级", "Reasoning effort"));
+            settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+                reasoning_effort_selector(
+                    ui,
+                    "semantic-layout-reasoning-effort",
+                    &mut settings.reasoning_effort,
+                    model_options.iter().find(|option| {
+                        option.provider_id == settings.provider && option.model == settings.model
+                    }),
+                    language,
+                );
+            });
+            ui.end_row();
+        }
+
+        let image_options: Vec<_> = model_options
+            .iter()
+            .filter(|option| {
+                providers
+                    .iter()
+                    .find(|provider| provider.id == option.provider_id)
+                    .is_some_and(|provider| {
+                        layout_model_protocol(provider, &option.model)
+                            != LayoutModelProtocol::Decision
+                    })
+            })
+            .cloned()
+            .collect();
+        settings_row_label(ui, language.text("排版生成模型", "Layout generation model"));
+        settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
+            configured_model_selector(
+                ui,
+                "image-recognition-model",
+                &image_options,
+                &mut settings.image_provider,
+                &mut settings.image_model,
+                language,
+            );
+            settings_help_icon(ui, language.text(
+                "功能说明：公式转latex、公式符号说明、可视化\n模型选用：用支持图片输入的文本模型，思考等级设置不思考",
+                "Function: Convert formulas to LaTeX, explain formula symbols, and generate visualizations.\nModel selection: Use an LLM that accepts images and set reasoning effort to None.",
             ));
         });
         ui.end_row();
@@ -1010,122 +1065,17 @@ fn semantic_layout_rows(
         settings_row_control_sized(ui, SETTINGS_MODEL_SELECT_WIDTH, |ui| {
             reasoning_effort_selector(
                 ui,
-                "semantic-layout-reasoning-effort",
-                &mut settings.reasoning_effort,
-                model_options
-                    .iter()
-                    .find(|m| m.provider_id == settings.provider && m.model == settings.model),
+                "image-recognition-reasoning-effort",
+                &mut settings.image_reasoning_effort,
+                image_options.iter().find(|option| {
+                    option.provider_id == settings.image_provider
+                        && option.model == settings.image_model
+                }),
                 language,
             );
         });
         ui.end_row();
     }
-}
-
-fn reader_typeface_settings(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    typography: &mut rebook_layout::ReaderTypography,
-    font_families: &rebook_layout::ReaderFontFamilies,
-) {
-    settings_card(ui, |ui| {
-        settings_module_label(ui, language.text("字体", "Fonts"));
-        ui.add_space(4.0);
-        egui::Grid::new("typography-font-settings-grid")
-            .num_columns(2)
-            .spacing([24.0, 16.0])
-            .show(ui, |ui| {
-                settings_subgroup_row_label(ui, language.text("中日韩书籍", "CJK books"));
-                ui.label("");
-                ui.end_row();
-
-                font_family_row(
-                    ui,
-                    language.text("主要字体", "Primary font"),
-                    "settings-cjk-primary-font",
-                    &mut typography.default_cjk_font,
-                    &font_families.chinese,
-                    None,
-                );
-
-                settings_row_label(ui, language.text("拉丁字体", "Latin font"));
-                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-                    inherited_western_font_selector(
-                        ui,
-                        language,
-                        &mut typography.cjk_default_font,
-                        font_families,
-                    );
-                });
-                ui.end_row();
-
-                settings_subgroup_row_label(
-                    ui,
-                    language.text("其他语言书籍", "Other-language books"),
-                );
-                ui.label("");
-                ui.end_row();
-
-                settings_row_label(ui, language.text("主要字体", "Primary font"));
-                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-                    default_font_selector(ui, language, typography, font_families);
-                });
-                ui.end_row();
-
-                settings_row_label(ui, language.text("中日韩字体", "CJK font"));
-                settings_row_control_sized(ui, SETTINGS_FONT_SELECT_WIDTH, |ui| {
-                    inherited_cjk_font_selector(
-                        ui,
-                        language,
-                        &mut typography.latin_cjk_font,
-                        &font_families.chinese,
-                    );
-                });
-                ui.end_row();
-
-                settings_subgroup_row_label(ui, language.text("通用", "General"));
-                ui.label("");
-                ui.end_row();
-
-                font_family_row(
-                    ui,
-                    language.text("代码字体", "Code font"),
-                    "settings-monospace-font",
-                    &mut typography.monospace_font,
-                    &font_families.monospace,
-                    None,
-                );
-
-                settings_slider_row(
-                    ui,
-                    language.text("字号", "Font size"),
-                    &mut typography.font_size,
-                    12.0,
-                    28.0,
-                    1.0,
-                    " px",
-                );
-
-                settings_slider_row(
-                    ui,
-                    language.text("最小字号", "Minimum font size"),
-                    &mut typography.minimum_font_size,
-                    8.0,
-                    18.0,
-                    1.0,
-                    " px",
-                );
-
-                settings_u16_slider_row(
-                    ui,
-                    language.text("字重", "Font weight"),
-                    &mut typography.font_weight,
-                    200,
-                    900,
-                    25,
-                );
-            });
-    });
 }
 
 fn classic_content_settings_visible(reading_mode: ReadingMode) -> bool {
@@ -1259,12 +1209,7 @@ fn ai_provider_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             state.invalidate_provider_models(&provider_id);
         }
         let provider = state.draft_plugin_settings.providers[index].clone();
-        let needs_initial_fetch = !state.provider_models_cache.contains_key(&provider.id)
-            && !state.provider_models_errors.contains_key(&provider.id)
-            && !state.provider_models_task.is_pending()
-            && !provider_changed
-            && !provider.base_url.trim().is_empty();
-        if refresh_requested || needs_initial_fetch {
+        if refresh_requested && !provider.base_url.trim().is_empty() {
             state.request_provider_models(ProviderModelsRequest {
                 provider_id: provider.id,
                 kind: provider.kind,
@@ -1319,6 +1264,12 @@ fn provider_models_selector(
             .map(|model| model.id.trim().to_owned())
             .filter(|model| !model.is_empty()),
     );
+    let mut options: Vec<String> = options.into_iter().collect();
+    options.sort_by(|a, b| {
+        let sa = selected_models.iter().any(|c| c.id == *a);
+        let sb = selected_models.iter().any(|c| c.id == *b);
+        sb.cmp(&sa).then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+    });
     egui::ComboBox::from_id_salt(("ai-provider-models", provider_id))
         .width(SETTINGS_MODEL_SELECT_WIDTH)
         .truncate()
@@ -1359,10 +1310,17 @@ fn provider_models_selector(
                 }
             }
         });
-    let refresh_requested = secondary_button(ui, language.text("刷新", "Refresh")).clicked();
-    if loading {
-        ui.add(crate::ui::LoadingSpinner::new());
-    } else if let Some(error) = error {
+    let refresh_requested = crate::ui::spinning_icon_button(ui, Icon::RefreshCw, loading)
+        .on_hover_text(if loading {
+            language.text("正在刷新模型列表…", "Refreshing model list…")
+        } else {
+            language.text("刷新模型列表", "Refresh model list")
+        })
+        .clicked()
+        && !loading;
+    if !loading
+        && let Some(error) = error
+    {
         ui.add(icon(Icon::AlertCircle).size(16.0).color(palette().error))
             .on_hover_text(error);
     }
@@ -1727,7 +1685,7 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 });
                 ui.end_row();
 
-                settings_row_label(ui, language.text("专家翻译", "Expert translation"));
+                settings_row_label(ui, language.text("提取术语表", "Extract glossary"));
                 settings_row_control_sized(ui, 44.0, |ui| {
                     toggle_switch(ui, &mut settings.expert_translation).on_hover_text(language.text(
                         "自动积累本书的专业术语译法，用于后续翻译，保持术语一致。已有译文不会自动重译。",
@@ -1746,12 +1704,6 @@ fn translation_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                             TranslationMode::Replace
                         };
                     }
-                });
-                ui.end_row();
-
-                settings_row_label(ui, language.text("翻译目录", "Translate table of contents"));
-                settings_row_control_sized(ui, 44.0, |ui| {
-                    toggle_switch(ui, &mut settings.translate_toc);
                 });
                 ui.end_row();
             });
@@ -1876,318 +1828,6 @@ fn configured_model_selector(
         });
 }
 
-fn default_font_selector(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    typography: &mut rebook_layout::ReaderTypography,
-    font_families: &rebook_layout::ReaderFontFamilies,
-) {
-    let (category, family) = match typography.default_font {
-        ReaderDefaultFont::Serif => (language.text("衬线", "Serif"), &typography.serif_font),
-        ReaderDefaultFont::SansSerif => (
-            language.text("无衬线", "Sans serif"),
-            &typography.sans_serif_font,
-        ),
-        ReaderDefaultFont::Other => (language.text("其他", "Other"), &typography.other_font),
-    };
-    let selected_text = format!(
-        "{category} · {}",
-        crate::fonts::family_label(ui.ctx(), family)
-    );
-    let arrow_id = egui::IdSalt::new("settings-default-font-arrow");
-    let arrow_size = 14.0;
-    let button = egui::Button::new((
-        selected_text,
-        egui::Atom::grow(),
-        egui::Atom::custom(arrow_id, Vec2::splat(arrow_size)),
-    ))
-    .min_size(Vec2::new(SETTINGS_FONT_SELECT_WIDTH, 0.0))
-    .truncate()
-    .corner_radius(6);
-    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
-        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
-        default_font_submenu(
-            ui,
-            language.text("衬线", "Serif"),
-            ReaderDefaultFont::Serif,
-            typography,
-            &font_families.serif,
-            language,
-        );
-        default_font_submenu(
-            ui,
-            language.text("无衬线", "Sans serif"),
-            ReaderDefaultFont::SansSerif,
-            typography,
-            &font_families.sans_serif,
-            language,
-        );
-        default_font_submenu(
-            ui,
-            language.text("其他", "Other"),
-            ReaderDefaultFont::Other,
-            typography,
-            &font_families.other,
-            language,
-        );
-    });
-    if ui.is_rect_visible(response.rect) {
-        let padding = ui.spacing().button_padding;
-        let arrow_rect = egui::Rect::from_center_size(
-            egui::pos2(
-                response.rect.right() - padding.x - arrow_size / 2.0,
-                response.rect.center().y,
-            ),
-            Vec2::splat(arrow_size),
-        );
-        paint_icon(
-            ui,
-            arrow_rect,
-            Icon::ChevronDown,
-            ui.style().interact(&response).fg_stroke.color,
-        );
-    }
-}
-
-fn default_font_submenu(
-    ui: &mut egui::Ui,
-    label: &str,
-    category: ReaderDefaultFont,
-    typography: &mut rebook_layout::ReaderTypography,
-    font_families: &[String],
-    language: AppLanguage,
-) {
-    let current_category = typography.default_font == category;
-    let label = RichText::new(label).color(if current_category {
-        palette().accent
-    } else {
-        palette().text
-    });
-    ui.menu_button(label, |ui| {
-        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
-        egui::ScrollArea::vertical()
-            .max_height(320.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
-                if font_families.is_empty() {
-                    ui.weak(language.text("没有可用字体", "No available fonts"));
-                    return;
-                }
-                for family in font_families {
-                    let selected_family = match category {
-                        ReaderDefaultFont::Serif => &typography.serif_font,
-                        ReaderDefaultFont::SansSerif => &typography.sans_serif_font,
-                        ReaderDefaultFont::Other => &typography.other_font,
-                    };
-                    let selected = current_category && selected_family == family;
-                    let row_width = ui.available_width();
-                    if ui
-                        .add(
-                            egui::Button::selectable(
-                                selected,
-                                crate::fonts::family_label(ui.ctx(), family),
-                            )
-                            .min_size(Vec2::new(row_width, 0.0))
-                            .truncate(),
-                        )
-                        .on_hover_text(family)
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        crate::fonts::request_family(ui.ctx(), family);
-                        typography.default_font = category;
-                        match category {
-                            ReaderDefaultFont::Serif => typography.serif_font.clone_from(family),
-                            ReaderDefaultFont::SansSerif => {
-                                typography.sans_serif_font.clone_from(family);
-                            }
-                            ReaderDefaultFont::Other => typography.other_font.clone_from(family),
-                        }
-                        ui.close();
-                    }
-                }
-            });
-    });
-}
-
-fn inherited_western_font_selector(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    selected: &mut Option<ReaderFontChoice>,
-    font_families: &rebook_layout::ReaderFontFamilies,
-) {
-    let inherited = language.text("跟随拉丁主要字体", "Follow Latin primary font");
-    let selected_text = selected.as_ref().map_or_else(
-        || inherited.to_owned(),
-        |choice| {
-            let category = match choice.category {
-                ReaderDefaultFont::Serif => language.text("衬线", "Serif"),
-                ReaderDefaultFont::SansSerif => language.text("无衬线", "Sans serif"),
-                ReaderDefaultFont::Other => language.text("其他", "Other"),
-            };
-            format!(
-                "{category} · {}",
-                crate::fonts::family_label(ui.ctx(), &choice.family)
-            )
-        },
-    );
-    let arrow_id = egui::IdSalt::new("settings-cjk-default-font-arrow");
-    let arrow_size = 14.0;
-    let button = egui::Button::new((
-        selected_text,
-        egui::Atom::grow(),
-        egui::Atom::custom(arrow_id, Vec2::splat(arrow_size)),
-    ))
-    .min_size(Vec2::new(SETTINGS_FONT_SELECT_WIDTH, 0.0))
-    .truncate()
-    .corner_radius(6);
-    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
-        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
-        let row_width = ui.available_width();
-        if ui
-            .add(
-                egui::Button::selectable(selected.is_none(), inherited)
-                    .min_size(Vec2::new(row_width, 0.0))
-                    .truncate(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            *selected = None;
-            ui.close();
-        }
-        ui.separator();
-        for (category, label, families) in [
-            (
-                ReaderDefaultFont::Serif,
-                language.text("衬线", "Serif"),
-                font_families.serif.as_slice(),
-            ),
-            (
-                ReaderDefaultFont::SansSerif,
-                language.text("无衬线", "Sans serif"),
-                font_families.sans_serif.as_slice(),
-            ),
-            (
-                ReaderDefaultFont::Other,
-                language.text("其他", "Other"),
-                font_families.other.as_slice(),
-            ),
-        ] {
-            inherited_western_font_submenu(ui, label, category, selected, families, language);
-        }
-    });
-    if ui.is_rect_visible(response.rect) {
-        let padding = ui.spacing().button_padding;
-        let arrow_rect = egui::Rect::from_center_size(
-            egui::pos2(
-                response.rect.right() - padding.x - arrow_size / 2.0,
-                response.rect.center().y,
-            ),
-            Vec2::splat(arrow_size),
-        );
-        paint_icon(
-            ui,
-            arrow_rect,
-            Icon::ChevronDown,
-            ui.style().interact(&response).fg_stroke.color,
-        );
-    }
-}
-
-fn inherited_western_font_submenu(
-    ui: &mut egui::Ui,
-    label: &str,
-    category: ReaderDefaultFont,
-    selected: &mut Option<ReaderFontChoice>,
-    font_families: &[String],
-    language: AppLanguage,
-) {
-    let current_category = selected
-        .as_ref()
-        .is_some_and(|choice| choice.category == category);
-    let label = RichText::new(label).color(if current_category {
-        palette().accent
-    } else {
-        palette().text
-    });
-    ui.menu_button(label, |ui| {
-        ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
-        egui::ScrollArea::vertical()
-            .max_height(320.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.set_width(SETTINGS_FONT_SELECT_WIDTH);
-                if font_families.is_empty() {
-                    ui.weak(language.text("没有可用字体", "No available fonts"));
-                    return;
-                }
-                for family in font_families {
-                    let value = ReaderFontChoice {
-                        category,
-                        family: family.clone(),
-                    };
-                    let row_width = ui.available_width();
-                    if ui
-                        .add(
-                            egui::Button::selectable(
-                                selected.as_ref() == Some(&value),
-                                crate::fonts::family_label(ui.ctx(), family),
-                            )
-                            .min_size(Vec2::new(row_width, 0.0))
-                            .truncate(),
-                        )
-                        .on_hover_text(family)
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        crate::fonts::request_family(ui.ctx(), family);
-                        *selected = Some(value);
-                        ui.close();
-                    }
-                }
-            });
-    });
-}
-
-fn inherited_cjk_font_selector(
-    ui: &mut egui::Ui,
-    language: AppLanguage,
-    selected: &mut Option<String>,
-    font_families: &[String],
-) {
-    let inherited = language.text("跟随中日韩主要字体", "Follow CJK primary font");
-    egui::ComboBox::from_id_salt("settings-latin-cjk-font")
-        .width(SETTINGS_FONT_SELECT_WIDTH)
-        .truncate()
-        .selected_text(selected.as_ref().map_or_else(
-            || inherited.into(),
-            |family| crate::fonts::family_label(ui.ctx(), family),
-        ))
-        .show_ui(ui, |ui| {
-            if ui.selectable_label(selected.is_none(), inherited).clicked() {
-                *selected = None;
-                ui.close();
-            }
-            ui.separator();
-            for family in font_families {
-                if ui
-                    .selectable_label(
-                        selected.as_ref() == Some(family),
-                        crate::fonts::family_label(ui.ctx(), family),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    crate::fonts::request_family(ui.ctx(), family);
-                    *selected = Some(family.clone());
-                    ui.close();
-                }
-            }
-        });
-}
-
 fn font_family_selector(
     ui: &mut egui::Ui,
     id_salt: &'static str,
@@ -2208,11 +1848,13 @@ fn font_family_selector(
         .show_ui(ui, |ui| {
             for family in font_families {
                 let is_selected = *selected == *family;
-                let response = ui.selectable_value(
-                    selected,
-                    family.clone(),
-                    crate::fonts::family_label(ui.ctx(), &font_family_label(family, language)),
-                );
+                let response = ui
+                    .selectable_value(
+                        selected,
+                        family.clone(),
+                        crate::fonts::family_label(ui.ctx(), &font_family_label(family, language)),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if response.clicked() {
                     crate::fonts::request_family(ui.ctx(), family);
                 }
@@ -2221,7 +1863,10 @@ fn font_family_selector(
                 }
             }
         });
-    let is_open = egui::ComboBox::is_open(ui.ctx(), response.response.id);
+    let combo_response = response
+        .response
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let is_open = egui::ComboBox::is_open(ui.ctx(), combo_response.id);
     ui.ctx()
         .data_mut(|data| data.insert_temp(popup_state_id, is_open));
 }
@@ -2484,8 +2129,8 @@ fn target_language_label(value: &str, language: AppLanguage) -> String {
 fn theme_label(language: AppLanguage, theme: AppTheme) -> &'static str {
     match theme {
         AppTheme::System => language.text("跟随系统", "Follow system"),
-        AppTheme::Light => language.text("浅色模式", "Light"),
-        AppTheme::Dark => language.text("深色模式", "Dark"),
+        AppTheme::Light => language.text("浅色主题", "Light theme"),
+        AppTheme::Dark => language.text("深色主题", "Dark theme"),
     }
 }
 
@@ -2544,16 +2189,6 @@ fn settings_module_label(ui: &mut egui::Ui, text: &str) {
 
 fn settings_module_row_label(ui: &mut egui::Ui, text: &str) {
     settings_row_control(ui, |ui| settings_module_label(ui, text));
-}
-
-fn settings_subgroup_row_label(ui: &mut egui::Ui, text: &str) {
-    settings_row_control(ui, |ui| {
-        ui.label(
-            RichText::new(text)
-                .size(crate::ui::scaled_font_size(14.0))
-                .color(palette().text),
-        );
-    });
 }
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
@@ -2637,7 +2272,7 @@ fn settings_u16_slider_row(
     ui.end_row();
 }
 
-fn smooth_numeric_slider(
+pub(crate) fn smooth_numeric_slider(
     ui: &mut egui::Ui,
     value: f32,
     minimum: f32,
@@ -2793,6 +2428,7 @@ mod tests {
             plugin_settings: crate::plugins::PluginSettings::default(),
             language: AppLanguage::English,
             theme: crate::preferences::AppTheme::Light,
+            reader_theme: preferences.reader_theme,
             selection_granularity: preferences.selection_granularity,
             shortcuts: preferences.shortcuts,
             sync_settings: crate::sync::SyncSettings::new_device(),

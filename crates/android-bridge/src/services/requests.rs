@@ -544,7 +544,7 @@ pub(crate) async fn contents(
         })
     })
     .await?;
-    if !enabled || !settings.translate_toc {
+    if !enabled {
         return work(move || {
             reader.with(|s| {
                 s.toc_labels.clear();

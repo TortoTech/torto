@@ -247,14 +247,14 @@ impl SemanticLayoutSource {
         if !href.path().starts_with("torto-chart/") {
             return None;
         }
-        self.with_derived(|a| match a {
-            Annotation::TableChart { svg, .. } if chart_href(svg) == *href => Some(Resource {
+        self.passage_resource(href).or_else(|| self.with_derived(|a| match a {
+            Annotation::TableChart { svg, .. } | Annotation::ImageChart { svg, .. } if chart_href(svg) == *href => Some(Resource {
                 href: href.clone(),
                 media_type: "image/svg+xml".into(),
                 bytes: Arc::from(svg.as_bytes()),
             }),
             _ => None,
-        })
+        }))
     }
     pub(super) fn chart_raster(
         &self,
@@ -770,8 +770,8 @@ pub(super) async fn recognize(
     if input.to_string().len() > 192 * 1024 {
         return (Vec::new(), false);
     }
-    let Ok((provider, model)) = settings.semantic_layout_endpoint() else {
-        return (Vec::new(), false);
+    let Some((provider, model, effort)) = settings.semantic_layout_image_endpoint() else {
+        return (Vec::new(), true);
     };
     let key = digest(
         &serde_json::to_vec(&json!([
@@ -781,7 +781,7 @@ pub(super) async fn recognize(
             provider.id,
             provider.base_url,
             model,
-            settings.semantic_layout.reasoning_effort,
+            effort,
             input
         ]))
         .unwrap(),
@@ -807,7 +807,7 @@ pub(super) async fn recognize(
             &messages,
             None,
             Some(8192),
-            settings.semantic_layout.reasoning_effort,
+            effort,
             Some(&options),
         ))
         .await;

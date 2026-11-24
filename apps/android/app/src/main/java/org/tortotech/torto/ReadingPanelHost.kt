@@ -51,13 +51,55 @@ private fun flatReadingPanel(panel:String)=readingPanelOwner(panel)=="typography
 @Composable internal fun BoxScope.ReadingPanelHost(book:String?,panel:String?,onClose:()->Unit,content:@Composable (String)->Unit){
     key(book){
         val open=readingBottomPanel(panel)
-        var previous by remember {mutableStateOf("navigation")}
-        if(open)SideEffect {previous=panel!!}
-        val displayed=if(open)panel!! else previous
+        val fullOpen=open&&!flatReadingPanel(panel!!)
+        val smallOpen=open&&flatReadingPanel(panel!!)
+        var previousSmall by remember {mutableStateOf("theme")}
+        var previousFull by remember {mutableStateOf("navigation")}
+        if(smallOpen)SideEffect {previousSmall=panel!!}
+        if(fullOpen)SideEffect {previousFull=panel!!}
         val safe=readerSafePadding()
         val density=LocalDensity.current
         val footer=WindowInsets(bottom=with(density){(safe.calculateBottomPadding()+ReaderBarHeight).roundToPx()})
         val holder=rememberSaveableStateHolder()
+        ReadingPanelLayer(
+            displayed=if(smallOpen)panel!! else previousSmall,
+            open=smallOpen,
+            smallPanel=true,
+            immediateExit=fullOpen,
+            safe=safe,
+            density=density,
+            footer=footer,
+            holder=holder,
+            onClose=onClose,
+            content=content,
+        )
+        ReadingPanelLayer(
+            displayed=if(fullOpen)panel!! else previousFull,
+            open=fullOpen,
+            smallPanel=false,
+            immediateExit=false,
+            safe=safe,
+            density=density,
+            footer=footer,
+            holder=holder,
+            onClose=onClose,
+            content=content,
+        )
+    }
+}
+
+@Composable private fun ReadingPanelLayer(
+    displayed:String,
+    open:Boolean,
+    smallPanel:Boolean,
+    immediateExit:Boolean,
+    safe:PaddingValues,
+    density:androidx.compose.ui.unit.Density,
+    footer:WindowInsets,
+    holder:androidx.compose.runtime.saveable.SaveableStateHolder,
+    onClose:()->Unit,
+    content:@Composable (String)->Unit,
+){
         val opacity=remember(displayed){Animatable(0f)}
         LaunchedEffect(displayed,open){if(open)opacity.animateTo(1f,tween(120))}
         var drag by remember {mutableFloatStateOf(0f)}
@@ -65,16 +107,16 @@ private fun flatReadingPanel(panel:String)=readingPanelOwner(panel)=="typography
         val scope=rememberCoroutineScope()
         val visibility=remember {MutableTransitionState(false)}
         visibility.targetState=open
-        LaunchedEffect(panel){if(open){settle?.cancel();drag=0f}}
+        LaunchedEffect(displayed,open){if(open){settle?.cancel();drag=0f}}
         LaunchedEffect(visibility.isIdle,visibility.currentState){
             if(visibility.isIdle&&!visibility.currentState){settle?.cancel();drag=0f}
         }
-        AnimatedVisibility(visibility,enter=fadeIn(tween(160))+slideInVertically(tween(200)){it/10},exit=fadeOut(tween(140))+slideOutVertically(tween(180)){it/10},modifier=Modifier.fillMaxSize().windowInsetsPadding(footer).clipToBounds()){
+        AnimatedVisibility(visibility,enter=if(smallPanel)fadeIn(tween(160))else slideInVertically(tween(300)){it/2},exit=if(immediateExit)ExitTransition.None else if(smallPanel)fadeOut(tween(140))else slideOutVertically(tween(300)){it},modifier=Modifier.fillMaxSize().windowInsetsPadding(footer).clipToBounds()){
             BoxWithConstraints(Modifier.fillMaxSize()){
                 val full=displayed in setOf("navigation","marks","marks-search","translation-settings")
                 val limit=if(full)maxHeight else maxHeight*.88f
                 val closeLabel=tr("关闭阅读面板","Close reading panel")
-                if(!full)Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha=.12f)).clickable(interactionSource=remember {MutableInteractionSource()},indication=null,onClickLabel=closeLabel,onClick=onClose))
+                if(!full)Box(Modifier.fillMaxSize().background(if(smallPanel)Color.Transparent else Color.Black.copy(alpha=.12f)).clickable(interactionSource=remember {MutableInteractionSource()},indication=null,onClickLabel=closeLabel,onClick=onClose))
                 val paneLabel=when(displayed){"navigation"->tr("目录与搜索","Contents and search");"marks"->tr("批注与高亮面板","Notes and highlights panel");"marks-search"->tr("搜索笔记面板","Search notes panel");"typography"->tr("字体排版面板","Typography panel");"selection"->tr("选择模式面板","Selection mode panel");else->tr("阅读设置面板","Reading settings panel")}
                 fun finishDrag(velocity:Float){
                     settle?.cancel()
@@ -105,19 +147,18 @@ private fun flatReadingPanel(panel:String)=readingPanelOwner(panel)=="typography
                 val bodyDrag=Modifier.nestedScroll(nested).draggable(rememberDraggableState {delta->
                     drag=(drag+delta).coerceAtLeast(0f)
                 },Orientation.Vertical,onDragStarted={settle?.cancel()},onDragStopped={finishDrag(it)})
-                Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().animateContentSize(tween(180),alignment=Alignment.BottomCenter).then(if(full)Modifier.fillMaxHeight()else Modifier.heightIn(max=limit)).offset{IntOffset(0,drag.roundToInt())}.semantics {paneTitle=paneLabel}.then(bodyDrag).pointerInput(Unit){detectTapGestures {}},
+                Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().then(if(smallPanel)Modifier else Modifier.animateContentSize(tween(180),alignment=Alignment.BottomCenter)).then(if(full)Modifier.fillMaxHeight()else Modifier.heightIn(max=limit)).offset{IntOffset(0,drag.roundToInt())}.semantics {paneTitle=paneLabel}.then(bodyDrag).pointerInput(Unit){detectTapGestures {}},
                     shape=if(full||flatReadingPanel(displayed))RectangleShape else RoundedCornerShape(topStart=20.dp,topEnd=20.dp),color=if(flatReadingPanel(displayed))MaterialTheme.colorScheme.surfaceContainerLowest else MaterialTheme.colorScheme.surfaceContainerLow){
                     Column(Modifier.fillMaxWidth().then(if(full)Modifier.fillMaxHeight()else Modifier).imePadding()){
-                        if(full)Spacer(Modifier.height(safe.calculateTopPadding()+24.dp))
+                        if(full)Spacer(Modifier.height(safe.calculateTopPadding()+20.dp))
                         if(!flatReadingPanel(displayed))Box(Modifier.fillMaxWidth().height(28.dp),contentAlignment=Alignment.Center){Box(Modifier.size(32.dp,3.dp).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.22f),RoundedCornerShape(2.dp)))}
-                        Box(Modifier.weight(1f,fill=full).fillMaxWidth().graphicsLayer {alpha=opacity.value}){
+                        Box(Modifier.weight(1f,fill=full).fillMaxWidth().graphicsLayer {alpha=if(smallPanel)opacity.value else 1f}){
                             holder.SaveableStateProvider(displayed){content(displayed)}
                         }
                     }
                 }
             }
         }
-    }
 }
 
 @Composable internal fun ReadingPanelPage(title:String,onBack:()->Unit,fill:Boolean=true,content:@Composable ()->Unit){

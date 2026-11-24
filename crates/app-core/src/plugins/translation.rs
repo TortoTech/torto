@@ -1459,6 +1459,7 @@ fn translation_text(block: &TextBlock) -> String {
 }
 
 fn translatable_text(block: &TextBlock) -> Option<String> {
+    if block.style.floating_label.is_some() { return None; }
     if matches!(block.kind, TextBlockKind::HeadingOrdinal(_)) {
         let plain = block
             .content
@@ -1637,6 +1638,7 @@ fn push_translation_style_markup(output: &mut String, run: &TextRun) {
 }
 
 fn translation_size_scale(style: TextStyle) -> Option<f32> {
+    if style.drop_cap.is_some() { return None; }
     let scale = if style.inline_size_scale.is_some() {
         Some(style.size_scale)
     } else {
@@ -2082,7 +2084,7 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     let mut style = original
         .iter()
         .find_map(|inline| match inline {
-            Inline::Text(run) if run.style.baseline == TextBaseline::Normal => Some(run.style),
+            Inline::Text(run) if run.style.baseline == TextBaseline::Normal && run.style.drop_cap.is_none() => Some(run.style),
             Inline::Ruby(_)
             | Inline::Text(_)
             | Inline::Math(_)
@@ -2105,6 +2107,9 @@ fn neutral_translation_style(fallback: TextStyle, original: &[Inline]) -> TextSt
     // Unmarked output is the model's decision to use paragraph typography.
     // Explicit returned t-size tags are restored separately, including exact
     // authored ratios. Do not silently put an omitted inline variation back.
+    if style.drop_cap.take().is_some() {
+        style.keyword_size_scale = None;
+    }
     style.inline_size_scale = None;
     style.size_scale = style.keyword_size_scale.unwrap_or(1.0);
     let body_bold = original.iter().flat_map(Inline::text_runs).any(|r| r.style.body_bold);

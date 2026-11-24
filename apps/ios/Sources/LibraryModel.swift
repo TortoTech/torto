@@ -133,7 +133,7 @@ final class LibraryModel: ObservableObject {
         return newCore
     }
 
-    nonisolated static let extensions: Set<String> = ["epub", "pdf", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm"]
+    nonisolated static let extensions: Set<String> = ["epub", "pdf", "mobi", "azw", "azw3", "fb2", "fbz", "cbz", "chm", "lit", "txt"]
 
     nonisolated private static func stage(_ url: URL) throws -> URL {
         guard extensions.contains(url.pathExtension.lowercased()) else {

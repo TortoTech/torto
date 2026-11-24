@@ -15,6 +15,7 @@ pub(crate) enum Icon {
     Table,
     AlertCircle,
     BookOpen,
+    BookText,
     Bot,
     BrainCircuit,
     CheckCircle,
@@ -38,6 +39,7 @@ pub(crate) enum Icon {
     Languages,
     Library,
     ListTree,
+    Mail,
     Maximize2,
     Menu,
     MessageCircle,
@@ -54,6 +56,7 @@ pub(crate) enum Icon {
     Pin,
     PinOff,
     Plus,
+    RefreshCw,
     ScanText,
     Search,
     Send,
@@ -61,6 +64,8 @@ pub(crate) enum Icon {
     Settings,
     SquarePen,
     Sun,
+    Target,
+    TextSelect,
     Trash2,
     Type,
     X,
@@ -68,11 +73,12 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 52] = [
+    const ALL: [Self; 57] = [
         Self::Chart,
         Self::Table,
         Self::AlertCircle,
         Self::BookOpen,
+        Self::BookText,
         Self::Bot,
         Self::BrainCircuit,
         Self::CheckCircle,
@@ -96,6 +102,7 @@ impl Icon {
         Self::Languages,
         Self::Library,
         Self::ListTree,
+        Self::Mail,
         Self::Maximize2,
         Self::Menu,
         Self::MessageCircle,
@@ -117,8 +124,11 @@ impl Icon {
         Self::Send,
         Self::Server,
         Self::Settings,
+        Self::RefreshCw,
         Self::SquarePen,
         Self::Sun,
+        Self::Target,
+        Self::TextSelect,
         Self::Trash2,
         Self::Type,
         Self::X,
@@ -134,6 +144,7 @@ impl Icon {
 
             Self::AlertCircle => asset!("alert-circle"),
             Self::BookOpen => asset!("book-open"),
+            Self::BookText => asset!("book-text"),
             Self::Bot => asset!("bot"),
             Self::BrainCircuit => asset!("brain-circuit"),
             Self::CheckCircle => asset!("check-circle"),
@@ -151,6 +162,7 @@ impl Icon {
             Self::Languages => asset!("languages"),
             Self::Library => asset!("library"),
             Self::ListTree => asset!("list-tree"),
+            Self::Mail => asset!("mail"),
             Self::Chart => asset!("chart-column"),
             Self::Table => asset!("table"),
             Self::Maximize2 => asset!("maximize-2"),
@@ -169,6 +181,7 @@ impl Icon {
             Self::Pin => asset!("pin"),
             Self::PinOff => asset!("pin-off"),
             Self::Plus => asset!("plus"),
+            Self::RefreshCw => asset!("refresh-cw"),
             Self::ScanText => asset!("scan-text"),
             Self::Search => asset!("search"),
             Self::Send => asset!("send"),
@@ -176,6 +189,8 @@ impl Icon {
             Self::Settings => asset!("settings"),
             Self::SquarePen => asset!("square-pen"),
             Self::Sun => asset!("sun"),
+            Self::Target => asset!("target"),
+            Self::TextSelect => asset!("text-select"),
             Self::Trash2 => asset!("trash-2"),
             Self::Type => asset!("type"),
             Self::X => asset!("x"),
@@ -233,13 +248,20 @@ impl Widget for IconWidget {
 }
 
 pub(crate) fn paint_icon(ui: &Ui, rect: Rect, glyph: Icon, color: Color32) {
+    paint_icon_rotated(ui, rect, glyph, color, 0.0);
+}
+
+pub(crate) fn paint_icon_rotated(ui: &Ui, rect: Rect, glyph: Icon, color: Color32, angle: f32) {
     let (name, bytes) = glyph.asset();
-    egui::Image::from_bytes(format!("bytes://lucide/{name}.svg"), bytes)
+    let mut image = egui::Image::from_bytes(format!("bytes://lucide/{name}.svg"), bytes)
         .fit_to_exact_size(rect.size())
         .texture_options(egui::TextureOptions::LINEAR)
         .tint(color)
-        .show_loading_spinner(false)
-        .paint_at(ui, rect);
+        .show_loading_spinner(false);
+    if angle != 0.0 {
+        image = image.rotate(angle, egui::Vec2::splat(0.5));
+    }
+    image.paint_at(ui, rect);
 }
 
 #[cfg(test)]

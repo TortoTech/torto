@@ -9,6 +9,9 @@ struct ReadingCanvas: UIViewRepresentable {
     let activate: (CGPoint) -> Void
     let select: (CGPoint, CGPoint) -> Void
     let splitSentences: (Bool) -> Void
+    let focusHighlight: (Bool) -> Void
+    let focusNote: (Bool) -> Void
+    let focusChat: () -> Void
     let moving: (Bool) -> Void
     let turnMotion: ReaderModel.TurnMotion?
     let turnPending: Bool
@@ -55,14 +58,22 @@ struct ReadingCanvas: UIViewRepresentable {
             contentMode = .redraw
             isAccessibilityElement = false
             let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
+            let twoTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTapped(_:)))
+            twoTap.numberOfTouchesRequired = 2
             let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
             let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
-            let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
-            for gesture in [tap, press, pan, pinch] {
+            let twoPan = UIPanGestureRecognizer(target: self, action: #selector(twoFingerPanned(_:)))
+            twoPan.minimumNumberOfTouches = 2
+            twoPan.maximumNumberOfTouches = 2
+            let threePan = UIPanGestureRecognizer(target: self, action: #selector(threeFingerPanned(_:)))
+            threePan.minimumNumberOfTouches = 3
+            threePan.maximumNumberOfTouches = 3
+            for gesture in [tap, twoTap, press, pan, twoPan, threePan] {
                 gesture.delegate = self
                 addGestureRecognizer(gesture)
             }
             tap.require(toFail: press)
+            tap.require(toFail: twoTap)
             pan.maximumNumberOfTouches = 1
         }
         required init?(coder: NSCoder) { fatalError("Use init()") }
@@ -223,8 +234,12 @@ struct ReadingCanvas: UIViewRepresentable {
             ctx.translateBy(x: offset.x, y: offset.y)
             UIImage(cgImage: frame.raster.image).draw(in: CGRect(x: 0, y: CGFloat(info.rasterTop),
                                                                width: width, height: CGFloat(info.rasterHeight)))
-            ctx.setFillColor(Self.color(0x55d8b86a).cgColor)
-            for mark in info.marks { ctx.fill(rectangle(mark)) }
+            if !info.marks.isEmpty {
+                ctx.setFillColor(Self.color(0x55d8b86a).cgColor)
+                ctx.beginPath()
+                for mark in info.marks { ctx.addRect(rectangle(mark)) }
+                ctx.fillPath(using: .winding)
+            }
             if !info.focusBounds.isEmpty {
                 ctx.saveGState()
                 for area in info.focusBounds {
@@ -238,7 +253,9 @@ struct ReadingCanvas: UIViewRepresentable {
             }
             if let selection {
                 ctx.setFillColor(Self.color(0x55448967).cgColor)
-                for area in selection.bounds { ctx.fill(rectangle(area)) }
+                ctx.beginPath()
+                for area in selection.bounds { ctx.addRect(rectangle(area)) }
+                ctx.fillPath(using: .winding)
                 ctx.setFillColor(Self.color(0xff448967).cgColor)
                 for point in handlePoints(selection) {
                     ctx.fillEllipse(in: CGRect(x: point.x - 6, y: point.y - 4, width: 12, height: 12))
@@ -301,9 +318,27 @@ struct ReadingCanvas: UIViewRepresentable {
             default: break
             }
         }
-        @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
-            if gesture.state == .ended, input?.enabled == true,
-               gesture.scale < 0.83 || gesture.scale > 1.2 { input?.splitSentences(gesture.scale > 1) }
+        @objc private func twoFingerTapped(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended, let input, input.enabled, input.frame.info.isScroll else { return }
+            input.focusChat()
+        }
+        @objc private func twoFingerPanned(_ gesture: UIPanGestureRecognizer) {
+            guard gesture.state == .ended, let input, input.enabled, input.frame.info.isScroll else { return }
+            let delta = gesture.translation(in: self)
+            let ax = abs(delta.x), ay = abs(delta.y)
+            if ax >= 36, ax > ay * 1.2 {
+                input.focusHighlight(delta.x > 0)
+            } else if ay >= 36, ay > ax * 1.2 {
+                input.splitSentences(delta.y > 0)
+            }
+        }
+        @objc private func threeFingerPanned(_ gesture: UIPanGestureRecognizer) {
+            guard gesture.state == .ended, let input, input.enabled, input.frame.info.isScroll else { return }
+            let delta = gesture.translation(in: self)
+            let ax = abs(delta.x), ay = abs(delta.y)
+            if ax >= 36, ax > ay * 1.2 {
+                input.focusNote(delta.x > 0)
+            }
         }
         @objc private func panned(_ gesture: UIPanGestureRecognizer) {
             guard let input, bounds.width > 0, bounds.height > 0 else { return }

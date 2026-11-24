@@ -4,7 +4,12 @@ use std::sync::Arc;
 use peniko::Blob;
 pub(crate) use rebook_app_core::fonts::*;
 mod service;
-pub(crate) use service::{FontService, Message, Status, family_label, publish_labels, request_family, take_request};
+pub(crate) use service::{
+    CustomFont, CustomImportMessage, CustomImportTarget, FontService, Message, Status,
+    any_downloading, custom_cjk_families, custom_latin_families, family_label, family_status,
+    is_family_ready, publish_labels, request_custom_import, request_family,
+    request_family_with_apply, take_apply_request, take_custom_import_request, take_requests,
+};
 mod store {
     pub(super) fn directory() -> Result<std::path::PathBuf, String> {
         crate::smoke::project_dirs().map(|dirs| dirs.data_local_dir().join("fonts")).ok_or_else(|| "Font directory unavailable".into())

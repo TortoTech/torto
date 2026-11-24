@@ -788,7 +788,7 @@ async fn advanced_reading(core: &Arc<MobileCore>, book: &str) {
         .unwrap();
     assert_eq!(
         core.clone().reading_options().await.unwrap().font_weight,
-        575
+        400
     );
     let fonts = core.clone().font_families().await.unwrap();
     assert!(fonts.monospace.iter().any(|f| f == "monospace"));

@@ -44,12 +44,10 @@ pub(super) fn group(
     height: f32,
 ) -> Vec<FocusUnit> {
     let refs: Vec<_> = blocks.iter().collect();
-    let mut scopes = rebook_layout::semantic_list_groups(&refs);
-    let list_scopes = scopes.len();
-    scopes.extend(rebook_layout::semantic_paragraph_groups(&refs));
+    let scopes = rebook_layout::focus_group_scopes(&refs);
     let mut membership = HashMap::new();
     for (id, scope) in scopes.iter().enumerate() {
-        for block in &blocks[scope.clone()] {
+        for block in &blocks[scope.range.clone()] {
             if let Some(range) = block_source_range(block) {
                 membership.insert((range.start.spine.clone(), range.start.node.clone()), id);
             }
@@ -99,7 +97,7 @@ pub(super) fn group(
                 parts,
                 paint_ranges,
                 footnotes,
-                share_notes: id < list_scopes,
+                share_notes: scopes[id].share_notes_when_split,
             },
             &mut output,
         );

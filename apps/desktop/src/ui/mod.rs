@@ -210,6 +210,10 @@ fn sync_resolved_theme(ctx: &egui::Context) -> bool {
     DARK_THEME.swap(dark, Ordering::Relaxed) != dark
 }
 
+pub(crate) fn set_active_dark(dark: bool) {
+    DARK_THEME.store(dark, Ordering::Relaxed);
+}
+
 pub(crate) fn theme() -> egui::Theme {
     if DARK_THEME.load(Ordering::Relaxed) {
         egui::Theme::Dark
@@ -545,6 +549,51 @@ pub(crate) fn icon_button(ui: &mut Ui, glyph: Icon) -> Response {
     painted_icon_button(ui, glyph, false)
 }
 
+pub(crate) fn spinning_icon_button(ui: &mut Ui, glyph: Icon, spinning: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    crate::app::window_chrome::exclude(ui.ctx(), rect);
+    let palette = palette();
+    let fill = if spinning {
+        Color32::TRANSPARENT
+    } else if response.is_pointer_button_down_on() {
+        ui.visuals().widgets.active.weak_bg_fill
+    } else if response.hovered() {
+        ui.visuals().widgets.hovered.weak_bg_fill
+    } else {
+        Color32::TRANSPARENT
+    };
+    let foreground = if spinning {
+        palette.accent
+    } else {
+        palette.text
+    };
+    let angle = if spinning {
+        ui.ctx().request_repaint();
+        ((ui.input(|i| i.time) / 0.9) * std::f64::consts::TAU) as f32
+    } else {
+        0.0
+    };
+    if ui.is_rect_visible(rect) {
+        if fill != Color32::TRANSPARENT {
+            paint_compact_rounded_background(ui, rect, 6.0, fill);
+        }
+        icons::paint_icon_rotated(
+            ui,
+            Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
+            glyph,
+            foreground,
+            angle,
+        );
+    }
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled() && !spinning, glyph.name()));
+    if spinning {
+        response
+    } else {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
 /// Side of the compact icon action, for callers that have to reserve room for
 /// one before it is drawn.
 pub(crate) const SMALL_ICON_BUTTON_SIZE: f32 = 28.0;
@@ -686,7 +735,7 @@ pub(crate) fn navigation_button(ui: &mut Ui, glyph: Icon, label: &str, selected:
             .galley(egui::pos2(rect.left() + 38.0, text_y), galley, foreground);
     }
     response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Full-width navigation/menu row with a left-aligned label and no icon slot.
@@ -720,7 +769,7 @@ pub(crate) fn navigation_text_button(ui: &mut Ui, label: &str, selected: bool) -
         );
     }
     response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Text action used in modal footers. Primary and secondary actions share the
@@ -829,8 +878,8 @@ mod tests {
                 );
                 if !fullscreen {
                     let controls = Rect::from_min_size(
-                        egui::pos2(screen.right() - 138.0, 0.0),
-                        egui::vec2(138.0, window_chrome::HEIGHT),
+                        egui::pos2(screen.right() - window_chrome::CONTROLS_WIDTH, 0.0),
+                        egui::vec2(window_chrome::CONTROLS_WIDTH, window_chrome::HEIGHT),
                     );
                     let backdrop_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == screen && rect.fill == Color32::BLACK.gamma_multiply(0.46 * progress))).unwrap();
                     let caption_index = output.shapes.iter().position(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.rect == controls && rect.fill == palette().background)).expect("opaque caption background");

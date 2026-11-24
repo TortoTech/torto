@@ -85,9 +85,10 @@ internal fun readerPaperColor(state:ScreenState)=state.frame?.info?.focusFadeCol
 ){
     val safe=readerSafePadding()
     val bottomPanel=readingBottomPanel(panel)
+    val fullPanel=panel in setOf("navigation","marks","marks-search","translation-settings")
     // Both bars paint the same surface through their system-bar safe areas.
     val toolbarBackground=MaterialTheme.colorScheme.surface
-    AnimatedVisibility(visible=state.chromeVisible&&!bottomPanel,enter=fadeIn(tween(180)),exit=fadeOut(tween(180)),modifier=Modifier.align(Alignment.TopCenter)){
+    AnimatedVisibility(visible=state.chromeVisible&&!bottomPanel,enter=fadeIn(tween(180)),exit=if(fullPanel)ExitTransition.None else fadeOut(tween(180)),modifier=Modifier.align(Alignment.TopCenter)){
         Column(Modifier.fillMaxWidth().background(toolbarBackground).padding(top=safe.calculateTopPadding()).height(ReaderBarHeight)){
             Row(Modifier.fillMaxWidth().weight(1f).padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically){
                 ActionIcon("back",tr("返回","Back"),onClick=onBack)
@@ -123,7 +124,7 @@ internal fun readerPaperColor(state:ScreenState)=state.frame?.info?.focusFadeCol
             }
         }
     }
-    AnimatedVisibility(visible=state.chromeVisible&&panel==null&&state.interaction==null&&state.selected==null,enter=fadeIn(tween(180))+slideInVertically(tween(180)){it/5},exit=fadeOut(tween(180))+slideOutVertically(tween(180)){it/5},modifier=Modifier.align(Alignment.BottomEnd).padding(end=16.dp,bottom=safe.calculateBottomPadding()+ReaderBarHeight+16.dp)){
+    AnimatedVisibility(visible=state.chromeVisible&&panel==null&&state.interaction==null&&state.selected==null,enter=fadeIn(tween(180)),exit=if(fullPanel)ExitTransition.None else fadeOut(tween(180)),modifier=Modifier.align(Alignment.BottomEnd).padding(end=16.dp,bottom=safe.calculateBottomPadding()+ReaderBarHeight+16.dp)){
         val showTranslation=showReadingTranslation(state.bookLanguages,LocalConfiguration.current.locales[0],state.translated)
         Row(horizontalArrangement=Arrangement.spacedBy(10.dp)){
             ReadingFloatingAction("ai",tr("阅读助手","Reading assistant"),!blocked){onPanel("chat")}

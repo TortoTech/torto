@@ -54,6 +54,7 @@ pub enum SyncStage {
     Preparing,
     Checking,
     Uploading,
+    UploadingBooks,
     Discovering,
     PreparingDownload,
     Downloading,
@@ -757,13 +758,19 @@ async fn upload_books(
     progress: &mut impl FnMut(SyncProgress),
 ) -> SyncResult<()> {
     if upload_total > 0 {
+        let books_total = pending_uploads.len() as u64;
+        progress(SyncProgress::Stage {
+            stage: SyncStage::UploadingBooks,
+            completed: 0,
+            total: books_total,
+        });
         progress(SyncProgress::Stage {
             stage: SyncStage::Uploading,
             completed: 0,
             total: upload_total,
         });
         let mut uploaded_bytes = 0_u64;
-        for (content_length, book) in pending_uploads {
+        for (index, (content_length, book)) in pending_uploads.into_iter().enumerate() {
             if upload_new_book(webdav, &book, content_length, |sent| {
                 progress(SyncProgress::Stage {
                     stage: SyncStage::Uploading,
@@ -781,6 +788,11 @@ async fn upload_books(
                 stage: SyncStage::Uploading,
                 completed: uploaded_bytes,
                 total: upload_total,
+            });
+            progress(SyncProgress::Stage {
+                stage: SyncStage::UploadingBooks,
+                completed: index as u64 + 1,
+                total: books_total,
             });
         }
     }
@@ -2427,6 +2439,7 @@ pub mod tests {
         let first_store =
             SyncStore::open_at(first_database.clone(), first_settings.device_id.clone()).unwrap();
         let mut checks = Vec::new();
+        let mut book_uploads = Vec::new();
         let first_report = runtime
             .block_on(run_sync_with_store(
                 first_settings.clone(),
@@ -2444,6 +2457,9 @@ pub mod tests {
                         if stage == SyncStage::Checking {
                             checks.push((completed, total));
                         }
+                        if stage == SyncStage::UploadingBooks {
+                            book_uploads.push((completed, total));
+                        }
                         if stage == SyncStage::Uploading && completed == total {
                             assert!(
                                 server
@@ -2458,6 +2474,7 @@ pub mod tests {
             .unwrap();
         assert_eq!(first_report.uploaded_books, 1);
         assert_eq!(checks, [(0, 1), (1, 1)]);
+        assert_eq!(book_uploads, [(0, 1), (1, 1)]);
         let content_etag = server.etag_for_suffix("/content.epub").unwrap();
 
         let (repeat_report, repeat_stages) = repeat_sync(

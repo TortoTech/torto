@@ -1,0 +1,29 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Touch arc -->
+    <path
+        android:pathData="M8.5,6.5C9.5,4.9 11.2,4 13,4C15.9,4 18.2,6.2 18.5,9"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@android:color/white"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round" />
+    <!-- Arrow tip on arc -->
+    <path
+        android:pathData="M16.4,7.8L18.5,9.2L19.6,7.0"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@android:color/white"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- Pointing hand silhouette -->
+    <path
+        android:pathData="M11.5,8.5V14.5L9.1,13.1C8.3,12.6 7.3,12.8 6.8,13.6C6.4,14.2 6.5,15.1 7.1,15.6L11.2,19.4C12,20.1 13,20.5 14.1,20.5H16.5C18.4,20.5 20,18.9 20,17V13.8C20,12.7 19.1,11.8 18,11.8H14.5V8.5C14.5,7.67 13.83,7 13,7C12.17,7 11.5,7.67 11.5,8.5Z"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@android:color/white"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>
