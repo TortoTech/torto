@@ -882,7 +882,16 @@ async fn translate_block_batch(
                     })
                     .collect());
             }
-            Err(error) => { last_kind = None; last_error = Some(error); },
+            Err(error) => {
+                // Record the response shape, never source text or translations.
+                let returned_keys = llm_json::parse::<Value>(&content).ok().and_then(|value| {
+                    value.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>())
+                });
+                super::semantic_layout::translation_event(provider, model, "translation.response_invalid",
+                    json!({"attempt":attempt,"expected_keys":keys,"returned_keys":returned_keys,"reason":error}));
+                last_kind = None;
+                last_error = Some(error);
+            },
         }
     }
     Err(last_error.unwrap_or_else(|| "翻译结果格式无效".to_owned()))
