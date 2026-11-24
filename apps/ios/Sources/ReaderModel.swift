@@ -1034,6 +1034,14 @@ final class ReaderModel: ObservableObject {
         }
     }
 
+    func dismissRemoteProgress() {
+        guard let reader, let token = resumeToken else { return }
+        run(refreshAI: false) { [self] in
+            try await reader.dismissCloudResumeOffer(token: token)
+            if resumeToken == token { resumeToken = nil }
+        }
+    }
+
     func trimMemory() {
         invalidateNeighbours()
         if let frame { previewedFrame = frame.raster.id }

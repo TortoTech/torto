@@ -191,14 +191,18 @@ class MainActivity : ComponentActivity() {
         val applyFonts=fontNotice&&state.active!=null&&state.fontApplyAvailable
         val applyLabel=tr("应用","Apply")
         val resumeLabel=tr("跳转","Go to")
-        LaunchedEffect(notice,if(fontNotice)state.fontNoticeUntil else 0,if(fontNotice||resumeNotice)state.active?.id else null,applyFonts,resumeNotice) {
+        val resumeRevision=if(resumeNotice)state.cloudResume?.revisionKey else null
+        LaunchedEffect(notice,if(fontNotice)state.fontNoticeUntil else 0,if(fontNotice||resumeNotice)state.active?.id else null,applyFonts,resumeNotice,resumeRevision) {
             if(notice==null){snackbar.currentSnackbarData?.dismiss();return@LaunchedEffect}
             val result=if(fontNotice)withTimeoutOrNull((state.fontNoticeUntil-android.os.SystemClock.uptimeMillis()).coerceAtLeast(0)) {
                 snackbar.showSnackbar(notice,actionLabel=if(applyFonts)applyLabel else null,duration=SnackbarDuration.Indefinite)
             }else snackbar.showSnackbar(notice,actionLabel=if(resumeNotice)resumeLabel else null)
-            if(result==SnackbarResult.ActionPerformed&&resumeNotice)model.resumeCloudProgress()
+            resumeRevision?.let { revision ->
+                if(result==SnackbarResult.ActionPerformed)model.resumeCloudProgress(revision)
+                else model.dismissCloudResume(revision)
+            }
             if(result==SnackbarResult.ActionPerformed&&fontNotice)model.applyDownloadedFonts()
-            model.clearNotice(state.notice,if(fontNotice)state.fontNoticeUntil else null)
+            model.clearNotice(state.notice,if(fontNotice)state.fontNoticeUntil else null,resumeRevision)
         }
         val safe=readerSafePadding()
         val route=routes.lastOrNull()

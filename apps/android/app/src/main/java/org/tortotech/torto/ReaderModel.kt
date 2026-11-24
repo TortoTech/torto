@@ -252,12 +252,17 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             getApplication<Application>().getSharedPreferences("reading",0).edit().putFloat("brightness",state.value.readingBrightness).apply()
         }}}
     }
-    fun clearNotice(expected:String?=null,fontUntil:Long?=null) {mutable.update {
-        if(expected!=null&&it.notice!=expected||fontUntil!=null&&it.fontNoticeUntil!=fontUntil)it else it.copy(notice=null)
+    fun clearNotice(expected:String?=null,fontUntil:Long?=null,resumeRevision:String?=null) {mutable.update {
+        if(expected!=null&&it.notice!=expected||fontUntil!=null&&it.fontNoticeUntil!=fontUntil||resumeRevision!=null&&it.cloudResume?.revisionKey!=resumeRevision)it else it.copy(notice=null)
     }}
     private suspend fun reloadSettings(){
         val providers=core.providers();val kinds=core.providerKinds();val ai=core.aiOptions();val reading=core.readingOptions().copy(translated=state.value.translated);val services=core.serviceSettings();val cloud=core.cloudOptions();val presets=core.cloudPresets()
-        mutable.update {it.copy(providers=providers,providerKinds=kinds,cloud=cloud,cloudPresets=presets,aiOptions=ai,reading=reading,autoLayout=ai.layoutEnabled,services=services)}
+        mutable.update {
+            val clearResume = !cloud.enabled || it.cloud?.account != cloud.account
+            it.copy(providers=providers,providerKinds=kinds,cloud=cloud,cloudPresets=presets,aiOptions=ai,reading=reading,autoLayout=ai.layoutEnabled,services=services,
+                cloudResume=if(clearResume)null else it.cloudResume,
+                notice=if(clearResume&&it.notice=="发现其他设备进度")null else it.notice)
+        }
     }
     fun loadServices() = runOperation {reloadSettings()}
     fun loadFonts(force:Boolean=false) {
@@ -568,17 +573,36 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         operations.withLock {
             if(token!=generation||reader!==session)return@withLock
             runCatching {session.cloudResumeOffer()}.getOrNull()?.let {offer->
-                if(token==generation&&reader===session&&state.value.cloudResume?.token!=offer.token)
-                    mutable.update {it.copy(cloudResume=offer,notice="发现其他设备进度")}
+                if(token==generation&&reader===session) mutable.update {
+                    it.copy(cloudResume=offer,notice=if(it.cloudResume?.revisionKey==offer.revisionKey)it.notice else "发现其他设备进度")
+                }
             }
         }
     }
-    fun resumeCloudProgress(){
+    fun resumeCloudProgress(revisionKey:String?=null){
         val offer=state.value.cloudResume ?: return;val token=generation
+        if(revisionKey!=null&&offer.revisionKey!=revisionKey)return
+        val session=reader ?: return
         runOperation(quietUpdate=true){
-            if(token!=generation)return@runOperation
-            reader?.resumeCloudProgress(offer.token)?.let {publish(it,token)}
-            if(token==generation)mutable.update {it.copy(cloudResume=null,notice=null)}
+            if(token!=generation||reader!==session)return@runOperation
+            try { session.resumeCloudProgress(offer.token)?.let {publish(it,token)} }
+            finally { if(token==generation)clearCloudResumeNotice(offer.revisionKey) }
+        }
+    }
+    fun dismissCloudResume(revisionKey:String){
+        val offer=state.value.cloudResume ?: return
+        if(offer.revisionKey!=revisionKey)return
+        val session=reader ?: return;val token=generation
+        runOperation(quietUpdate=true){
+            if(token!=generation||reader!==session)return@runOperation
+            try { session.dismissCloudResumeOffer(offer.token) }
+            finally { if(token==generation)clearCloudResumeNotice(revisionKey) }
+        }
+    }
+    private fun clearCloudResumeNotice(revisionKey:String){
+        mutable.update {
+            if(it.cloudResume?.revisionKey!=revisionKey)it
+            else it.copy(cloudResume=null,notice=if(it.notice=="发现其他设备进度")null else it.notice)
         }
     }
     fun open(book: BookSummary) {

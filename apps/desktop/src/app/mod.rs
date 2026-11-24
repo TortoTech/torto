@@ -31,9 +31,10 @@ pub(crate) struct DesktopApp {
     applied_settings_revision: u64,
     pending_reader_notice: Option<String>,
     pending_reader_error: Option<String>,
-    cloud_resume:Option<(rebook_app_core::sync::ResumeOffer,std::time::Instant)>,
+    cloud_resume:Option<(String,rebook_app_core::sync::ResumeOffer,std::time::Instant)>,
     cloud_resume_check:bool,
-    cloud_resume_accept:Option<rebook_app_core::sync::ResumeOffer>,
+    cloud_resume_accept:Option<(String,rebook_app_core::sync::ResumeOffer)>,
+    cloud_resume_history: rebook_app_core::sync::ResumeNoticeHistory,
     fullscreen_toggle_requested: bool,
     memory_sample: Option<(std::time::Instant, bool)>,
     memory_peak: usize,
@@ -62,8 +63,10 @@ impl DesktopApp {
     }
     pub(crate) fn complete_cloud_resume(&mut self,account:String,offer:Option<rebook_app_core::sync::ResumeOffer>) {
         if !self.settings.applied().sync_settings.enabled||account!=crate::sync::account_key(&self.settings.applied().sync_settings){return;}
-        if let Some(offer)=offer&&self.reader.as_ref().is_some_and(|reader|reader.cloud_resume_matches(&offer)) {
-            self.cloud_resume=Some((offer,std::time::Instant::now()+std::time::Duration::from_secs(5)));
+        if let Some(offer)=offer
+            && !self.cloud_resume_history.contains(&account, &offer)
+            && self.reader.as_ref().is_some_and(|reader|reader.cloud_resume_matches(&offer)) {
+            self.cloud_resume=Some((account,offer,std::time::Instant::now()+std::time::Duration::from_secs(5)));
         }
     }
     pub(crate) fn accept_cloud_resume(&mut self,account:String,offer:Option<rebook_app_core::sync::ResumeOffer>) {
@@ -94,6 +97,7 @@ impl DesktopApp {
             pending_reader_notice: None,
             pending_reader_error: None,
             cloud_resume:None,cloud_resume_check:false,cloud_resume_accept:None,
+            cloud_resume_history: Default::default(),
             fullscreen_toggle_requested: false,
             memory_sample: None,
             memory_peak: 0,
@@ -289,19 +293,25 @@ impl DesktopApp {
         }
         self.feedback
             .overlay(ui.ctx(), self.settings.applied().language);
-        if let Some((offer,until))=&self.cloud_resume {
-            if *until<=std::time::Instant::now()||!self.reader.as_ref().is_some_and(|r|r.cloud_resume_matches(offer)) {
+        if let Some((account,offer,until))=&self.cloud_resume {
+            if !self.settings.applied().sync_settings.enabled
+                || *account!=crate::sync::account_key(&self.settings.applied().sync_settings)
+                || *until<=std::time::Instant::now()||!self.reader.as_ref().is_some_and(|r|r.cloud_resume_matches(offer)) {
                 self.cloud_resume=None;
             }
         }
-        if let Some((offer,until))=self.cloud_resume.clone() {
+        if let Some((account,offer,until))=self.cloud_resume.clone() {
             ui.ctx().request_repaint_after(until.saturating_duration_since(std::time::Instant::now()));
             if !self.settings.is_open()&&!self.feedback.is_open() {
+                self.cloud_resume_history.mark_shown(
+                    &account,
+                    &offer,
+                );
                 let l=self.settings.applied().language;let mut resume=false;
                 let dismissed=crate::ui::show_toast_with_actions(ui.ctx(),"cloud-resume",
                     l.text("发现其他设备进度","Reading progress found on another device"),crate::ui::ToastKind::Success,
                     egui::vec2(-18.0,62.0),|ui| {resume=crate::ui::dialog_action_button(ui,l.text("跳转","Go to"),true).clicked();});
-                if resume {self.cloud_resume_accept=Some(offer);}
+                if resume {self.cloud_resume_accept=Some((account,offer));}
                 if resume||dismissed {self.cloud_resume=None;}
             }
         }else{self.font_notice(ui.ctx());}
@@ -453,9 +463,11 @@ impl DesktopApp {
         if let Some(target) = self.pending_custom_font_import.take() {
             self.fonts.spawn_custom_import(target, runtime, proxy);
         }
-        if let Some(offer)=self.cloud_resume_accept.take()
+        if let Some((account,offer))=self.cloud_resume_accept.take()
+            && self.settings.applied().sync_settings.enabled
+            && account==crate::sync::account_key(&self.settings.applied().sync_settings)
             && let Some((store,_,baseline))=self.reader.as_ref().and_then(DesktopReader::cloud_resume_check) {
-            let account=crate::sync::account_key(&self.settings.applied().sync_settings);let wake=proxy.clone();
+            let wake=proxy.clone();
             runtime.spawn_blocking(move||{
                 let offer=store.resume_offer_current(&offer,&baseline).ok().filter(|ok|*ok).map(|_|offer);
                 let _=wake.send_event(UserEvent::CloudResumeAccepted {account,offer});
