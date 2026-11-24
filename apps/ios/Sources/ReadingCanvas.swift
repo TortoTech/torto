@@ -68,8 +68,7 @@ struct ReadingCanvas: UIViewRepresentable {
             let threePan = UIPanGestureRecognizer(target: self, action: #selector(threeFingerPanned(_:)))
             threePan.minimumNumberOfTouches = 3
             threePan.maximumNumberOfTouches = 3
-            let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
-            for gesture in [tap, twoTap, press, pan, twoPan, threePan, pinch] {
+            for gesture in [tap, twoTap, press, pan, twoPan, threePan] {
                 gesture.delegate = self
                 addGestureRecognizer(gesture)
             }
@@ -318,10 +317,6 @@ struct ReadingCanvas: UIViewRepresentable {
                 reportMotion()
             default: break
             }
-        }
-        @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
-            if gesture.state == .ended, input?.enabled == true,
-               gesture.scale < 0.83 || gesture.scale > 1.2 { input?.splitSentences(gesture.scale > 1) }
         }
         @objc private func twoFingerTapped(_ gesture: UITapGestureRecognizer) {
             guard gesture.state == .ended, let input, input.enabled, input.frame.info.isScroll else { return }

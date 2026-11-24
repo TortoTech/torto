@@ -57,7 +57,6 @@ class ReaderView(context: Context) : View(context) {
         isFakeBoldText = true
     }
     private var pinchConsuming=false
-    private var pinchEligible=false
     private var focusMultiEligible=false
     private var multiMaxPointers=0
     private var multiStartX=0f
@@ -67,8 +66,6 @@ class ReaderView(context: Context) : View(context) {
     private var multiStartTime=0L
     private var multiMoved=false
     private var pinchSource:String?=null
-    private var pinchStart=0f
-    private var pinchSpan=0f
     var onHandleStart: ((Boolean) -> Unit)? = null
     var onHandleMove: ((Float, Float) -> Unit)? = null
     var onHandleEnd: (() -> Unit)? = null
@@ -670,10 +667,7 @@ class ReaderView(context: Context) : View(context) {
             if(!pinchConsuming){
                 val control=frame?.info?.controls?.find {it.kind=="sentences"}
                 val focusOk=isEnabled&&!navigationPending&&!draggingHandle&&!selecting&&frame?.info?.isScroll==true
-                val eligible=event.pointerCount==2&&focusOk&&control!=null
                 val source=control?.source
-                pinchStart=if(event.pointerCount==2)hypot(event.getX(0)-event.getX(1),event.getY(0)-event.getY(1))else 0f
-                pinchSpan=pinchStart
                 val (cx,cy)=centroid(event)
                 multiMaxPointers=event.pointerCount
                 multiStartX=cx;multiStartY=cy;multiEndX=cx;multiEndY=cy
@@ -686,7 +680,7 @@ class ReaderView(context: Context) : View(context) {
                 queuedFocusRelease=false;queuedFocusTurn=null;queuedUnitTurn=null
                 setPosition(frame?.info?.scrollDistance ?: 0.0)
                 velocity?.recycle();velocity=null
-                pinchConsuming=true;pinchEligible=eligible;focusMultiEligible=focusOk;pinchSource=source
+                pinchConsuming=true;focusMultiEligible=focusOk;pinchSource=source
                 if(focusMultiEligible)onReadingGesture?.invoke()
                 parent?.requestDisallowInterceptTouchEvent(true);reportMotion()
             }
@@ -695,16 +689,12 @@ class ReaderView(context: Context) : View(context) {
                 val (cx,cy)=centroid(event)
                 multiStartX=cx;multiStartY=cy;multiEndX=cx;multiEndY=cy
             }
-            if(event.pointerCount>2)pinchEligible=false
-            if(event.pointerCount==2)pinchSpan=hypot(event.getX(0)-event.getX(1),event.getY(0)-event.getY(1))
             if(event.pointerCount==multiMaxPointers&&event.actionMasked==MotionEvent.ACTION_MOVE){
                 val (cx,cy)=centroid(event)
                 multiEndX=cx;multiEndY=cy
                 if(hypot(cx-multiStartX,cy-multiStartY)>=touchSlop)multiMoved=true
             }
             if(event.actionMasked==MotionEvent.ACTION_UP||event.actionMasked==MotionEvent.ACTION_CANCEL){
-                val ratio=if(pinchStart>0f)pinchSpan/pinchStart else 1f
-                val pinchCommit=event.actionMasked==MotionEvent.ACTION_UP&&pinchEligible&&pinchStart>=touchSlop*4&&abs(pinchSpan-pinchStart)>=touchSlop*2&&(ratio>=1.18f||ratio<=.82f)
                 val dx=multiEndX-multiStartX
                 val dy=multiEndY-multiStartY
                 val dist=hypot(dx,dy)
@@ -712,10 +702,8 @@ class ReaderView(context: Context) : View(context) {
                 val maxP=multiMaxPointers
                 val tapOk=isUp&&maxP==2&&!multiMoved&&(event.eventTime-multiStartTime)<=350L
                 val src=pinchSource
-                pinchConsuming=false;pinchEligible=false;focusMultiEligible=false;pinchSource=null
-                if(pinchCommit){
-                    src?.let {onSentenceGesture?.invoke(ratio>1f,it)}
-                } else if(tapOk){
+                pinchConsuming=false;focusMultiEligible=false;pinchSource=null
+                if(tapOk){
                     onFocusChatGesture?.invoke()
                 } else if(isUp&&maxP==2&&dist>=touchSlop*3){
                     if(abs(dx)>abs(dy)*1.2f)onFocusHighlightGesture?.invoke(dx>0f)
@@ -779,7 +767,7 @@ class ReaderView(context: Context) : View(context) {
         previousPage=null;nextPage=null;turnNeighbour=null;pageIsUnit=false
         pendingFocusTarget=null;deferredFocusGesture=false;queuedFocusRelease=false;queuedFocusTurn=null;queuedFocusVelocity=0f;queuedUnitTurn=null;motionClipped=false;motionVelocity=0f
         if(!preserveGesture){
-            pinchEligible=false;pinchSource=null
+            pinchSource=null
             draggingFocus=false;draggingPage=false;draggingUnit=false;unitDistance=0f;gestureAxis=0
             velocity?.recycle();velocity=null
         }
