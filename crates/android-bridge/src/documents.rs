@@ -69,6 +69,24 @@ pub(crate) fn refresh(s: &mut ReaderState) -> Result<bool> {
         Ok(true)
     } else { Ok(false) }
 }
+fn source_note_marker(s: &ReaderState, target: &PublicationUrl) -> Option<String> {
+    let index = s.session.snapshot().location.section_index;
+    let section = s.source.parse_section(index).ok()?;
+    for block in &section.blocks {
+        for note in rebook_app_core::reading_text::block_focus_footnotes(block) {
+            if let rebook_app_core::reading_text::FocusFootnoteSource::Reference {
+                marker,
+                target: note_target,
+                ..
+            } = note
+                && &note_target == target
+            {
+                return Some(marker);
+            }
+        }
+    }
+    None
+}
 fn live_note(s: &ReaderState, spec: &Note) -> String {
     if let Some((index,owner,number))=inline_target(&spec.target) {
         let markup=s.source.parse_section(index).ok().map(|section|section.blocks.iter()
@@ -77,7 +95,10 @@ fn live_note(s: &ReaderState, spec: &Note) -> String {
         return if markup.is_empty(){spec.markup.clone()}else{markup};
     }
     PublicationUrl::parse(&spec.target).ok().filter(|t| t.fragment().is_some())
-        .map(|target| crate::interactions::rich_note(s, &target, &spec.marker))
+        .map(|target| {
+            let marker = source_note_marker(s, &target).unwrap_or_else(|| spec.marker.clone());
+            crate::interactions::rich_note(s, &target, &marker)
+        })
         .filter(|markup| !markup.is_empty()).unwrap_or_else(|| spec.markup.clone())
 }
 

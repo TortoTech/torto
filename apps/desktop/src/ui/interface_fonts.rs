@@ -266,23 +266,51 @@ mod monospace_tests {
             .clone()
     }
 
+    fn expected_system_monospace_fallback(database: &fontdb::Database) -> String {
+        let mut candidates = vec![
+            rebook_layout::default_monospace_font().to_owned(),
+            "Consolas".into(),
+            "Menlo".into(),
+            "Courier New".into(),
+            "DejaVu Sans Mono".into(),
+            "Liberation Mono".into(),
+        ];
+        candidates.extend(
+            database
+                .faces()
+                .filter(|face| face.monospaced)
+                .filter_map(|face| face.families.first().map(|(name, _)| name.clone())),
+        );
+        let mut files = HashMap::new();
+        let mut unique = HashSet::new();
+        candidates
+            .into_iter()
+            .filter(|family| unique.insert(family.clone()))
+            .find(|family| {
+                Face::query(database, family, fontdb::Weight::NORMAL)
+                    .and_then(|face| face.data(&mut files))
+                    .is_some()
+            })
+            .expect("a system monospace family")
+    }
+
     #[test]
     fn interface_uses_reader_monospace_and_reloads_after_selection_changes() {
         let ctx = egui::Context::default();
         let typography = InterfaceTypography::default();
-        let default = rebook_layout::default_monospace_font();
-        configure(&ctx, &typography, default, AppLanguage::English);
-        wait_for_monospace(&ctx);
-        assert_eq!(selected(&ctx), format!("system-ui-monospace-{default}"));
-
         let mut database = fontdb::Database::new();
         database.load_system_fonts();
+        let first = expected_system_monospace_fallback(&database);
+        configure(&ctx, &typography, &first, AppLanguage::English);
+        wait_for_monospace(&ctx);
+        assert_eq!(selected(&ctx), format!("system-ui-monospace-{first}"));
+
         let other = database
             .faces()
             .filter(|face| face.monospaced)
             .flat_map(|face| &face.families)
             .map(|(name, _)| name)
-            .find(|name| name.as_str() != default)
+            .find(|name| name.as_str() != first.as_str())
             .expect("another system monospace family");
         configure(&ctx, &typography, other, AppLanguage::English);
         wait_for_monospace(&ctx);
@@ -297,7 +325,7 @@ mod monospace_tests {
                 !fonts
                     .definitions()
                     .font_data
-                    .contains_key(&format!("system-ui-monospace-{default}"))
+                    .contains_key(&format!("system-ui-monospace-{first}"))
             );
         });
         output.textures_delta.clear();
@@ -306,6 +334,9 @@ mod monospace_tests {
     #[test]
     fn unavailable_reader_monospace_uses_system_fallback() {
         let ctx = egui::Context::default();
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        let expected = expected_system_monospace_fallback(&database);
         configure(
             &ctx,
             &InterfaceTypography::default(),
@@ -315,10 +346,7 @@ mod monospace_tests {
         wait_for_monospace(&ctx);
         assert_eq!(
             selected(&ctx),
-            format!(
-                "system-ui-monospace-{}",
-                rebook_layout::default_monospace_font()
-            )
+            format!("system-ui-monospace-{expected}")
         );
     }
 }
