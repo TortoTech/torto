@@ -1028,6 +1028,13 @@ impl DesktopReader {
                 PageDirection::Next => 0.0,
             };
             scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
+        } else if let Some(offset) = self.restore_classic_reflow_anchor(&layout, size.y) {
+            // A viewport reflow (left sidebar, window resize) keeps the text
+            // that was at the top of the viewport on screen instead of
+            // rewinding to the paragraph's start.
+            self.scroll_target_position = None;
+            self.scroll_target_source = None;
+            scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
         } else if let Some(target) = self.scroll_target_source.take()
             && let Some(top) = layout.source_top(&target)
         {

@@ -2019,8 +2019,72 @@ impl DesktopReader {
             // Keep the presented text position while drawing the old layout
             // into the larger viewport and later adopting the new layout.
             self.semantic_layout.viewport_anchor =
-                self.capture_focus_reflow_anchor(FocusReflowKind::DocumentLayout);
+                self.capture_reflow_anchor(FocusReflowKind::DocumentLayout);
         }
+    }
+
+    fn capture_reflow_anchor(&self, kind: FocusReflowKind) -> Option<FocusReflowAnchor> {
+        if self.is_focus_mode() {
+            self.capture_focus_reflow_anchor(kind)
+        } else if self.is_scroll_mode() {
+            // Classic scroll reflows must also keep the visible text stationary:
+            // restoring the paragraph's top would visibly slide the text down
+            // whenever the viewport width changes (left sidebar, window resize).
+            self.capture_classic_reflow_anchor()
+        } else {
+            None
+        }
+    }
+
+    /// Anchors the exact text cluster at the top of the classic scroll
+    /// viewport, mirroring the focus-mode document anchor.
+    fn capture_classic_reflow_anchor(&self) -> Option<FocusReflowAnchor> {
+        let viewport = self.scroll_viewport?;
+        let layout = self.scroll_section.as_ref()?;
+        let padding = self.scroll_content_padding(viewport.size.y);
+        let visible_top = viewport.offset_y - padding;
+        let (page_index, page_y) = layout.page_at_content_y(visible_top.max(0.0))?;
+        let page = &layout.pages[page_index].page;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "display-list coordinates are viewport-bounded f32 values stored in kurbo f64"
+        )]
+        let page_width = page.width() as f32;
+        let left = rebook_layout::reading_content_left(page_width, &self.reader.style());
+        let hit = page.hit_test_text(left, page_y, false)?;
+        let bytes = if hit.cluster_start < hit.cluster_end {
+            hit.cluster_start..hit.cluster_end
+        } else {
+            // Inexact hit testing returns a cursor, not a selected cluster.
+            // Resolve a real UTF-8 character so an empty selection cannot
+            // discard the visible anchor inside a long paragraph.
+            let text = page.text_region_text(hit.region_index)?;
+            let visible = page.text_region_visible_range(hit.region_index)?;
+            let start = hit.byte_index.clamp(visible.start, visible.end);
+            if let Some(character) = text.get(start..visible.end)?.chars().next() {
+                start..start + character.len_utf8()
+            } else {
+                let (index, _) = text.get(visible.clone())?.char_indices().next_back()?;
+                visible.start + index..visible.end
+            }
+        };
+        let fragment = page.selection_fragment(hit.region_index, bytes)?;
+        let baseline = layout.source_baseline(&fragment.range);
+        let anchor_y = baseline.or_else(|| layout.source_top(&fragment.range))?;
+        Some(FocusReflowAnchor {
+            viewport,
+            section_index: layout.section_index,
+            reading_unit_index: layout.reading_unit_index,
+            range: fragment.range,
+            screen_y: anchor_y + padding - viewport.offset_y,
+            uses_baseline: baseline.is_some(),
+            stationary_viewport: None,
+            #[cfg(debug_assertions)]
+            previous_lines: Vec::new(),
+            #[cfg(debug_assertions)]
+            previous_offset: viewport.offset_y,
+            image_progress: None,
+        })
     }
 
     fn viewport_preview_offset(&self, height: f32, content_height: f32) -> Option<f32> {
@@ -2281,6 +2345,34 @@ impl DesktopReader {
             }
         }
         Some(offset)
+    }
+
+    /// Rebuilds the classic scroll offset after a viewport reflow so the
+    /// anchored cluster stays at the same screen position instead of the view
+    /// rewinding to the paragraph's start.
+    fn restore_classic_reflow_anchor(
+        &mut self,
+        layout: &ScrollSectionLayout,
+        viewport_height: f32,
+    ) -> Option<f32> {
+        let anchor = self.focus_reflow_anchor.take()?;
+        if self.is_focus_mode()
+            || !self.is_scroll_mode()
+            || anchor.section_index != layout.section_index
+            || anchor.reading_unit_index != layout.reading_unit_index
+        {
+            return None;
+        }
+        let top = if anchor.uses_baseline {
+            layout.source_baseline(&anchor.range)?
+        } else {
+            layout.source_top(&anchor.range)?
+        };
+        let padding = self.scroll_content_padding(viewport_height);
+        Some((top + padding - anchor.screen_y).clamp(
+            0.0,
+            (layout.content_height + padding * 2.0 - viewport_height).max(0.0),
+        ))
     }
 
     fn focus_mode_allowed(&self) -> bool {
