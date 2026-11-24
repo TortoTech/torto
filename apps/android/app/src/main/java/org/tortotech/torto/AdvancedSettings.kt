@@ -63,7 +63,7 @@ import org.tortotech.torto.core.*
             }
             }
             SettingsGroup { Column(Modifier.padding(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
-            Row(verticalAlignment=Alignment.CenterVertically){Text(tr("模型","Models"),Modifier.weight(1f),style=MaterialTheme.typography.titleMedium);ActionIcon("sync",tr("刷新模型列表","Refresh model list"),!state.busy&&draft.baseUrl.isNotBlank()){model.fetchModels(draft,key)}}
+            Row(verticalAlignment=Alignment.CenterVertically){Text(tr("模型","Models"),Modifier.weight(1f),style=MaterialTheme.typography.titleMedium);ActionIcon("sync",if(state.fetchingModels)tr("正在刷新模型列表…","Refreshing model list…")else tr("刷新模型列表","Refresh model list"),enabled=draft.baseUrl.isNotBlank(),spinning=state.fetchingModels){model.fetchModels(draft,key)}}
             state.modelFetchError?.let {Text(it,color=MaterialTheme.colorScheme.error)}
             OutlinedTextField(query,{query=it},label={Text(tr("搜索模型","Search models"))},modifier=Modifier.fillMaxWidth(),singleLine=true)
             LazyColumn(Modifier.heightIn(min=80.dp,max=260.dp)){

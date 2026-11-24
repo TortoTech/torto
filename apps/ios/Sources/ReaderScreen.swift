@@ -12,7 +12,7 @@ struct ReaderScreen: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("reader.fontSize") private var fontSize = 20
-    @AppStorage("reader.focus") private var preferFocus = false
+    @AppStorage("reader.focus") private var preferFocus = true
     @AppStorage("reader.unified") private var unified = false
     @AppStorage("interface.theme") private var interfaceTheme = "system"
     @AppStorage("reader.theme") private var theme = "system"

@@ -23,6 +23,8 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -45,12 +47,27 @@ import org.tortotech.torto.core.Provider
 
 class MainActivity : ComponentActivity() {
     private val readerModel: ReaderModel by viewModels()
+    private fun handlePreviewIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra("preview_onboarding", false) == true) {
+            intent.removeExtra("preview_onboarding")
+            getSharedPreferences("reading", 0).edit()
+                .putBoolean("gestureOnboardingShown", false)
+                .putBoolean("focus", true)
+                .commit()
+            readerModel.requestGestureOnboardingPreview()
+        }
+    }
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) readerModel.trimMemory()
     }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handlePreviewIntent(intent)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState); enableEdgeToEdge()
+        handlePreviewIntent(intent)
         setContent { TortoApp(readerModel) }
     }
 }
@@ -174,15 +191,14 @@ class MainActivity : ComponentActivity() {
         val applyFonts=fontNotice&&state.active!=null&&state.fontApplyAvailable
         val applyLabel=tr("应用","Apply")
         val resumeLabel=tr("跳转","Go to")
-        LaunchedEffect(notice,if(fontNotice)state.fontNoticeUntil else 0,if(fontNotice)state.active?.id else null,applyFonts) {
-            notice?.let {
-                val result=if(fontNotice)withTimeoutOrNull((state.fontNoticeUntil-android.os.SystemClock.uptimeMillis()).coerceAtLeast(0)) {
-                    snackbar.showSnackbar(it,actionLabel=if(applyFonts)applyLabel else null,duration=SnackbarDuration.Indefinite)
-                }else snackbar.showSnackbar(it,actionLabel=if(resumeNotice)resumeLabel else null)
-                if(result==SnackbarResult.ActionPerformed&&resumeNotice)model.resumeCloudProgress()
-                if(result==SnackbarResult.ActionPerformed&&fontNotice)model.applyDownloadedFonts()
-                model.clearNotice(state.notice,if(fontNotice)state.fontNoticeUntil else null)
-            }
+        LaunchedEffect(notice,if(fontNotice)state.fontNoticeUntil else 0,if(fontNotice||resumeNotice)state.active?.id else null,applyFonts,resumeNotice) {
+            if(notice==null){snackbar.currentSnackbarData?.dismiss();return@LaunchedEffect}
+            val result=if(fontNotice)withTimeoutOrNull((state.fontNoticeUntil-android.os.SystemClock.uptimeMillis()).coerceAtLeast(0)) {
+                snackbar.showSnackbar(notice,actionLabel=if(applyFonts)applyLabel else null,duration=SnackbarDuration.Indefinite)
+            }else snackbar.showSnackbar(notice,actionLabel=if(resumeNotice)resumeLabel else null)
+            if(result==SnackbarResult.ActionPerformed&&resumeNotice)model.resumeCloudProgress()
+            if(result==SnackbarResult.ActionPerformed&&fontNotice)model.applyDownloadedFonts()
+            model.clearNotice(state.notice,if(fontNotice)state.fontNoticeUntil else null)
         }
         val safe=readerSafePadding()
         val route=routes.lastOrNull()
@@ -217,8 +233,123 @@ class MainActivity : ComponentActivity() {
                     Box(Modifier.fillMaxSize().background(readerPaperColor(state))) {
                         if (state.active != null) {
                             Box(Modifier.fillMaxSize().padding(readerContentPadding(state.focus))) {
-                                Box(Modifier.fillMaxSize()){
-                                    AndroidView(factory={ReaderView(it).apply {animateOpening=true;onSize=model::measure;onMotion=model::readerMotion;onContentLoading=model::readerContentLoading;onReadingGesture=model::hideChrome;onTap=model::tap;onTurn=model::turn;onUnitTurn=model::turnUnit;onScroll=model::scroll;onSentenceGesture=model::sentenceGesture;onFocusHighlightGesture=model::focusHighlightGesture;onFocusNoteGesture={add->model.focusNoteGesture(add){panel="note"}};onFocusChatGesture={model.loadChat();panel="chat"};onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking&&model.state.value.annotationPreviewId==null)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking&&!feedbackState.visible&&panel==null&&!choicePages.isOpen&&!state.completionPage;it.importantForAccessibility=if(panel!=null||choicePages.isOpen||feedbackState.visible||state.completionPage)android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;if(state.error!=null)it.cancelPendingNavigation();it.present(state.frame,state.selected,state.previousPage,state.nextPage,state.turnCompletion);it.presentReference(state.interaction?.indicator,org.tortotech.torto.core.referenceColor(state.dark))},modifier=Modifier.fillMaxSize())
+                                var inlineGapPx by remember(state.focusChatKey) { mutableFloatStateOf(0f) }
+                                var inlineUnconstrainedHeightPx by remember(state.focusChatKey) { mutableFloatStateOf(0f) }
+                                val inlineDragOffsetPx = remember { mutableFloatStateOf(0f) }
+                                LaunchedEffect(state.focusChatKey, state.frame?.rasterId) { inlineDragOffsetPx.floatValue = 0f }
+                                var readerViewRef by remember { mutableStateOf<ReaderView?>(null) }
+                                var readerHeightPx by remember { mutableIntStateOf(0) }
+                                val imeBottomPx = WindowInsets.ime.getBottom(LocalDensity.current)
+                                val localDensity = LocalDensity.current
+                                val effectiveFocusBadges = remember(state.frame, state.focusChatWorking, state.focusChatWorkingKey) {
+                                    val info = state.frame?.info
+                                    val existing = info?.focusChatBadges.orEmpty()
+                                    val workingKey = state.focusChatWorkingKey
+                                    if (state.focusChatWorking && workingKey != null && existing.none { it.key == workingKey } && info?.focusChatKey == workingKey) {
+                                        val maxBottom = info.focusBounds.maxOfOrNull { it.y + it.height }
+                                        if (maxBottom != null) existing + org.tortotech.torto.core.FocusChatBadge(workingKey, org.tortotech.torto.core.Rect(0f, maxBottom, 0f, 0f), 1u)
+                                        else existing
+                                    } else existing
+                                }
+                                val currentFocusBadge = remember(state.frame, effectiveFocusBadges) {
+                                    val key = state.frame?.info?.focusChatKey
+                                    if (key != null) effectiveFocusBadges.firstOrNull { it.key == key } else null
+                                }
+                                val inlineActive = state.focusChatKey != null || (currentFocusBadge != null && panel == null && !state.completionPage)
+                                val inlineSplitYDp = remember(state.focusChatKey, currentFocusBadge, state.frame, effectiveFocusBadges) {
+                                    if (!inlineActive) -1f
+                                    else {
+                                        val info = state.frame?.info
+                                        val targetKey = state.focusChatKey ?: currentFocusBadge?.key
+                                        val badgeRect = effectiveFocusBadges.firstOrNull { it.key == targetKey }?.rect
+                                        val boundsBottom = info?.focusBounds?.maxOfOrNull { it.y + it.height }
+                                        (badgeRect?.let { it.y + it.height } ?: boundsBottom ?: -1f).let { if (it >= 0f) it + 2f else -1f }
+                                    }
+                                }
+                                val collapsedBadgeHeightPx = with(localDensity) { 66.dp.toPx() }
+                                val safeTopPx = with(localDensity) { safe.calculateTopPadding().toPx() }
+                                val inlineAvailableBottomPx = remember(readerHeightPx, imeBottomPx) {
+                                    readerHeightPx - imeBottomPx - with(localDensity) { 8.dp.toPx() }
+                                }
+                                val maxInlineCardHeightPx = remember(inlineAvailableBottomPx, safeTopPx) {
+                                    (inlineAvailableBottomPx - safeTopPx).coerceAtLeast(with(localDensity) { 280.dp.toPx() })
+                                }
+                                val effectiveExpandedGapPx = remember(inlineGapPx, inlineUnconstrainedHeightPx, maxInlineCardHeightPx) {
+                                    val desired = if (inlineUnconstrainedHeightPx > 0f) maxOf(inlineGapPx, inlineUnconstrainedHeightPx) else inlineGapPx
+                                    desired.coerceAtMost(maxInlineCardHeightPx)
+                                }
+                                val inlineGaps = remember(state.focusChatKey, inlineSplitYDp, effectiveExpandedGapPx, effectiveFocusBadges, panel, state.completionPage, collapsedBadgeHeightPx) {
+                                    if (panel != null || state.completionPage) emptyList()
+                                    else {
+                                        val list = mutableListOf<Pair<Float, Float>>()
+                                        val expandedKey = state.focusChatKey
+                                        if (expandedKey != null && inlineSplitYDp >= 0f && effectiveExpandedGapPx > 0f) {
+                                            list.add(inlineSplitYDp to effectiveExpandedGapPx)
+                                        }
+                                        effectiveFocusBadges.forEach { badge ->
+                                            if (badge.key != expandedKey) {
+                                                list.add((badge.rect.y + badge.rect.height + 2f) to collapsedBadgeHeightPx)
+                                            }
+                                        }
+                                        list.sortedBy { it.first }
+                                    }
+                                }
+                                fun cumulativeGapBefore(yDp: Float): Float =
+                                    inlineGaps.filter { it.first < yDp - 0.5f }.sumOf { it.second.toDouble() }.toFloat()
+                                val inlineShiftPx = remember(state.focusChatKey, inlineSplitYDp, effectiveExpandedGapPx, inlineGaps, inlineAvailableBottomPx, readerHeightPx, safeTopPx) {
+                                    if (state.focusChatKey == null || inlineSplitYDp < 0f || effectiveExpandedGapPx <= 0f || readerHeightPx <= 0) 0f
+                                    else {
+                                        val splitPx = with(localDensity) { inlineSplitYDp.dp.toPx() } + cumulativeGapBefore(inlineSplitYDp)
+                                        val maxShift = (splitPx - safeTopPx).coerceAtLeast(0f)
+                                        (splitPx + effectiveExpandedGapPx - inlineAvailableBottomPx).coerceIn(0f, maxShift)
+                                    }
+                                }
+                                Box(Modifier.fillMaxSize().onSizeChanged { readerHeightPx = it.height }){
+                                    AndroidView(factory={ReaderView(it).apply {readerViewRef=this;animateOpening=true;onSize=model::measure;onMotion=model::readerMotion;onContentLoading=model::readerContentLoading;onReadingGesture=model::hideChrome;onTap={x,y->if(model.state.value.focusChatKey!=null)model.closeFocusChat()else model.tap(x,y)};onTurn=model::turn;onUnitTurn=model::turnUnit;onScroll=model::scroll;onSentenceGesture=model::sentenceGesture;onFocusHighlightGesture=model::focusHighlightGesture;onFocusNoteGesture={add->model.focusNoteGesture(add){panel="note"}};onFocusChatGesture={model.openFocusChat()};onFocusBadgeTap={key->model.openFocusChat(key)};onInlineOffsetChange={offset->inlineDragOffsetPx.floatValue=offset};onHandleStart=model::beginHandle;onHandleMove=model::dragHandle;onHandleEnd=model::endHandle;onSelect={x,y,ex,ey->if(!model.state.value.chatWorking&&model.state.value.annotationPreviewId==null&&model.state.value.focusChatKey==null)model.select(x,y,ex,ey)}}},update={it.isEnabled=!state.chatWorking&&!feedbackState.visible&&panel==null&&!choicePages.isOpen&&!state.completionPage;it.importantForAccessibility=if(panel!=null||choicePages.isOpen||feedbackState.visible||state.completionPage)android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS else android.view.View.IMPORTANT_FOR_ACCESSIBILITY_AUTO;if(state.error!=null)it.cancelPendingNavigation();it.present(state.frame,state.selected,state.previousPage,state.nextPage,state.turnCompletion);it.presentReference(state.interaction?.indicator,org.tortotech.torto.core.referenceColor(state.dark));it.presentInlineGaps(inlineGaps,inlineShiftPx)},modifier=Modifier.fillMaxSize())
+                                    if (state.focusChatKey != null && inlineSplitYDp >= 0f && panel == null && !state.completionPage) {
+                                        FocusChatInline(
+                                            state = state,
+                                            splitYDp = inlineSplitYDp,
+                                            dragOffsetPx = { inlineDragOffsetPx.floatValue },
+                                            cumulativeBeforePx = cumulativeGapBefore(inlineSplitYDp),
+                                            safeTopPx = safeTopPx,
+                                            availableBottomPx = inlineAvailableBottomPx,
+                                            maxCardHeightPx = maxInlineCardHeightPx,
+                                            onHeightChanged = { gap, unconstrained ->
+                                                inlineGapPx = gap
+                                                inlineUnconstrainedHeightPx = unconstrained
+                                            },
+                                            onOverscrollDrag = { deltaDp -> readerViewRef?.dragFocusExternal(deltaDp) },
+                                            onOverscrollEnd = { velocityDp -> readerViewRef?.finishFocusExternal(velocityDp) },
+                                            onCollapse = model::closeFocusChat,
+                                            onDraftChange = model::editFocusChatDraft,
+                                            onSend = model::sendFocusChat,
+                                            onCancel = model::cancelFocusChat,
+                                            onLink = { url ->
+                                                if (url.startsWith("link://j/")) {
+                                                    model.closeFocusChat()
+                                                    model.followChatCitation(url)
+                                                }
+                                            },
+                                        )
+                                    }
+                                    if (panel == null && !state.completionPage) {
+                                        val focusedKey = state.frame?.info?.focusChatKey
+                                        effectiveFocusBadges
+                                            .filter { it.key != state.focusChatKey }
+                                            .forEach { badge ->
+                                                val badgeYDp = badge.rect.y + badge.rect.height + 2f
+                                                val extraPx = cumulativeGapBefore(badgeYDp) - inlineShiftPx
+                                                FocusChatCollapsedBadge(
+                                                    splitYDp = badgeYDp,
+                                                    dragOffsetPx = { inlineDragOffsetPx.floatValue },
+                                                    extraOffsetPx = extraPx,
+                                                    alpha = if (badge.key == focusedKey) 1f else 0.25f,
+                                                    onHeightChanged = null,
+                                                    onClick = { model.openFocusChat(badge.key) },
+                                                )
+                                            }
+                                    }
                                     ReaderOpeningIndicator(state)
                                 }
                                 state.frame?.info?.controls?.filter {it.kind!="sentences"&&state.annotationPreviewId==null&&!state.completionPage}?.takeIf {it.isNotEmpty()}?.let {controls->
@@ -260,6 +391,7 @@ class MainActivity : ComponentActivity() {
                                 onFeedback=::reportIssue)
                             if(!state.completionPage&&state.interaction?.kind !in listOf("note","reference"))ReaderAiNotice(state,Modifier.align(Alignment.TopCenter).padding(top=safe.calculateTopPadding()+12.dp))
                             if(state.completionPage)ReadingCompletionPage(state,model::closeCompletionPage,::exitReading,model::loadCompletion,model::markCompletionFinished)
+                            if(state.gestureOnboardingPending&&state.frame!=null&&!state.openingBook&&state.focus&&!state.completionPage)GestureOnboardingDialog(model::dismissGestureOnboarding)
                         }
                     }
                 } else {
@@ -267,6 +399,7 @@ class MainActivity : ComponentActivity() {
                     val pageTab = if (target == "root:1") 1 else 0
                     val pageTitle = when (target) {
                         "settings" -> tr("设置", "Settings")
+                        "gestures" -> tr("快捷手势", "Gesture shortcuts")
                         "dark-mode" -> tr("深色模式", "Dark mode"); "language" -> tr("界面语言", "Interface language")
                         "layout" -> tr("AI 排版", "AI layout"); "ai" -> tr("AI 提供商", "AI providers"); "translation" -> tr("翻译", "Translation"); "assistant" -> tr("阅读助手", "Reading assistant")
                         "provider" -> if (editingProvider?.id.isNullOrEmpty()) tr("添加 AI 提供商", "Add AI provider") else tr("编辑 AI 提供商", "Edit AI provider")
@@ -298,6 +431,7 @@ class MainActivity : ComponentActivity() {
                         Box(Modifier.fillMaxSize().padding(padding)) {
                             when (target) {
                                 "settings" -> SettingsScreen(state, ::open)
+                                "gestures" -> GestureGuideScreen()
                                 "dark-mode" -> DarkModeScreen(state, model)
                                 "language" -> InterfaceLanguageScreen(state, model)
                                 "ai" -> ProviderManager(state, model, ::editProvider)

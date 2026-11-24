@@ -45,6 +45,17 @@ class ReaderView(context: Context) : View(context) {
     var onFocusHighlightGesture: ((Boolean) -> Unit)? = null
     var onFocusNoteGesture: ((Boolean) -> Unit)? = null
     var onFocusChatGesture: (() -> Unit)? = null
+    var onFocusBadgeTap: ((String) -> Unit)? = null
+    var onInlineOffsetChange: ((Float) -> Unit)? = null
+    private var inlineGaps: List<Pair<Float, Float>> = emptyList()
+    private var inlineShiftY = 0f
+    private var lastReportedInlineOffset = Float.NaN
+    private val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xE0448967.toInt() }
+    private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFFFFF.toInt()
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+    }
     private var pinchConsuming=false
     private var pinchEligible=false
     private var focusMultiEligible=false
@@ -226,6 +237,11 @@ class ReaderView(context: Context) : View(context) {
         previousFrame?.let {old->val (a,b)=range(old);low=minOf(low,a);high=maxOf(high,b)}
         displayPosition=value.coerceIn(low,high)
         if(motion!=null&&abs(value-displayPosition)>.25)motionClipped=true
+        val offset = pendingOffset
+        if (offset != lastReportedInlineOffset) {
+            lastReportedInlineOffset = offset
+            onInlineOffsetChange?.invoke(offset)
+        }
         invalidate()
     }
     private fun animateTo(target:Double,velocity:Float=0f) {
@@ -342,7 +358,28 @@ class ReaderView(context: Context) : View(context) {
     private val gestures=GestureDetector(context,object:GestureDetector.SimpleOnGestureListener(){
         override fun onDown(e:MotionEvent)=true
         override fun onSingleTapUp(e:MotionEvent):Boolean {
-            performClick();onTap?.invoke(e.x/density,(e.y+pendingOffset)/density);return true
+            performClick()
+            val current = frame
+            if (current != null && inlineGaps.isEmpty()) {
+                val badges = current.info.focusChatBadges
+                if (badges.isNotEmpty()) {
+                    val tapX = e.x
+                    val tapY = e.y + pendingOffset
+                    val pad = 10f * density
+                    val hit = badges.firstOrNull { b ->
+                        val left = b.rect.x * density
+                        val top = (b.rect.y + b.rect.height + 4f) * density
+                        val right = left + 42f * density
+                        val bottom = top + 24f * density
+                        tapX in (left - pad)..(right + pad) && tapY in (top - pad)..(bottom + pad)
+                    }
+                    if (hit != null) {
+                        onFocusBadgeTap?.invoke(hit.key)
+                        return true
+                    }
+                }
+            }
+            onTap?.invoke(e.x/density,(e.y+pendingOffset)/density);return true
         }
         override fun onScroll(a:MotionEvent?,b:MotionEvent,dx:Float,dy:Float):Boolean {
             val current=frame ?: return false
@@ -454,6 +491,81 @@ class ReaderView(context: Context) : View(context) {
             referenceIndicator=bounds;referencePaint.color=color.toInt();invalidate()
         }
     }
+    fun presentInlineGaps(gaps: List<Pair<Float, Float>>, shiftYPx: Float) {
+        val sorted = gaps.filter { it.first >= 0f && it.second > 0f }.sortedBy { it.first }
+        if (sorted.isEmpty()) lastReportedInlineOffset = Float.NaN
+        if (inlineGaps != sorted || inlineShiftY != shiftYPx) {
+            inlineGaps = sorted
+            inlineShiftY = shiftYPx
+            invalidate()
+        }
+    }
+    fun dragFocusExternal(deltaYDp: Float) {
+        val current = frame ?: return
+        if (!current.info.isScroll || !isEnabled || navigationPending) return
+        if (!draggingFocus) {
+            cancelAnimation()
+            draggingFocus = true
+            dragStart = displayPosition
+            dragDistance = 0f
+            deferredFocusGesture = false
+            onReadingGesture?.invoke()
+        }
+        dragDistance += deltaYDp
+        val low = minOf(dragStart, current.info.scrollDistance + (current.info.previousFocus?.delta ?: 0f))
+        val high = maxOf(dragStart, current.info.scrollDistance + (current.info.nextFocus?.delta ?: 0f))
+        setPosition(focusDragPosition(dragStart + dragDistance, low, high, height / density, dragStart))
+        reportMotion()
+    }
+    fun finishFocusExternal(velocityYDp: Float = 0f) {
+        if (!draggingFocus) return
+        finishDrag(velocityYDp, false)
+        reportMotion()
+    }
+    private fun drawFocusBadges(canvas: Canvas, current: ReaderFrame) {
+        // Rendered inline in the Split-Draw slot below the focused paragraph by Compose.
+    }
+    private fun drawStaticLayer(canvas: Canvas, current: ReaderFrame) {
+        if (current.info.isScroll) {
+            canvas.drawColor((current.info.focusFadeColor.toInt() and 0xFFFFFF) or 0xFF000000.toInt())
+            previousFrame?.let { drawRaster(canvas, it) }
+            drawRaster(canvas, current)
+        } else {
+            canvas.drawBitmap(current.bitmap, null, Rect(0, 0, width, height), paint)
+        }
+        canvas.save(); canvas.translate(0f, -pendingOffset)
+        drawMergedRects(canvas, current.info.marks, savedHighlight)
+        val focusShift = focusPreview?.let { (it.first - current.info.scrollDistance).toFloat() } ?: 0f
+        (focusPreview?.second ?: current.info.focusBounds).takeIf { it.isNotEmpty() }?.let { bounds ->
+            if (current.info.focusHighlight) {
+                drawMergedRects(canvas, bounds, highlight, padX = 4f, padY = 2f, shiftY = focusShift)
+            } else {
+                focusShade.color = current.info.focusFadeColor.toInt(); canvas.save()
+                bounds.forEach { r ->
+                    canvas.clipOutRect(
+                        ((r.x - 8) * density).coerceAtLeast(0f),
+                        (r.y + focusShift - 2) * density,
+                        ((r.x + r.width + 8) * density).coerceAtMost(width.toFloat()),
+                        (r.y + focusShift + r.height + 2) * density,
+                    )
+                }
+                val totalGap = inlineGaps.sumOf { it.second.toDouble() }.toFloat()
+                canvas.drawRect(0f, pendingOffset - inlineShiftY, width.toFloat(), height + pendingOffset + inlineShiftY + totalGap, focusShade)
+                canvas.restore()
+            }
+        }
+        if (!selectionPath.isEmpty) {
+            val layer = canvas.save()
+            canvas.scale(density, density)
+            canvas.drawPath(selectionPath, highlight)
+            canvas.restoreToCount(layer)
+        }
+        referenceIndicator?.let { r ->
+            canvas.drawRoundRect(r.x * density, r.y * density, (r.x + r.width) * density, (r.y + r.height) * density, density, density, referencePaint)
+        }
+        drawFocusBadges(canvas, current)
+        canvas.restore()
+    }
     private fun handlePoints():List<Pair<Float,Float>> {
         val bounds=selected?.bounds.orEmpty();if(bounds.isEmpty())return emptyList()
         return listOf(bounds.first().let {it.x*density to (it.y+it.height)*density-pendingOffset},bounds.last().let {(it.x+it.width)*density to (it.y+it.height)*density-pendingOffset})
@@ -507,26 +619,43 @@ class ReaderView(context: Context) : View(context) {
             canvas.translate(0f,boundaryOffset*density)
             canvas.clipRect(0,0,width,height)
         }
-        if(current.info.isScroll){canvas.drawColor((current.info.focusFadeColor.toInt() and 0xFFFFFF) or 0xFF000000.toInt());previousFrame?.let {drawRaster(canvas,it)};drawRaster(canvas,current)}
-        else canvas.drawBitmap(current.bitmap,null,Rect(0,0,width,height),paint)
-        canvas.save();canvas.translate(0f,-pendingOffset)
-        drawMergedRects(canvas, current.info.marks, savedHighlight)
-        val focusShift=focusPreview?.let {(it.first-current.info.scrollDistance).toFloat()} ?: 0f
-        (focusPreview?.second ?: current.info.focusBounds).takeIf {it.isNotEmpty()}?.let {bounds->
-            if(current.info.focusHighlight){drawMergedRects(canvas, bounds, highlight, padX = 4f, padY = 2f, shiftY = focusShift)}
-            else{focusShade.color=current.info.focusFadeColor.toInt();canvas.save()
-                bounds.forEach {r->canvas.clipOutRect(((r.x-8)*density).coerceAtLeast(0f),(r.y+focusShift-2)*density,((r.x+r.width+8)*density).coerceAtMost(width.toFloat()),(r.y+focusShift+r.height+2)*density)}
-                canvas.drawRect(0f,pendingOffset,width.toFloat(),height+pendingOffset,focusShade);canvas.restore()}
+        if (inlineGaps.isNotEmpty()) {
+            val currentOffset = pendingOffset
+            if (currentOffset != lastReportedInlineOffset) {
+                lastReportedInlineOffset = currentOffset
+                onInlineOffsetChange?.invoke(currentOffset)
+            }
+            val paperColor = (current.info.focusFadeColor.toInt() and 0xFFFFFF) or 0xFF000000.toInt()
+            canvas.drawColor(paperColor)
+            val shifted = canvas.save()
+            if (inlineShiftY != 0f) canvas.translate(0f, -inlineShiftY)
+            var accGap = 0f
+            var prevClipTop = -inlineShiftY - 4f
+            for ((splitYDp, gapPx) in inlineGaps) {
+                val splitPx = (splitYDp * density - currentOffset).roundToInt().toFloat()
+                val bandBottom = splitPx + accGap
+                if (bandBottom > prevClipTop) {
+                    val band = canvas.save()
+                    canvas.clipRect(0f, prevClipTop, width.toFloat(), bandBottom)
+                    if (accGap != 0f) canvas.translate(0f, accGap)
+                    drawStaticLayer(canvas, current)
+                    canvas.restoreToCount(band)
+                }
+                accGap += gapPx
+                prevClipTop = splitPx + accGap
+            }
+            val finalBottom = height.toFloat() + inlineShiftY + 4f
+            if (finalBottom > prevClipTop) {
+                val band = canvas.save()
+                canvas.clipRect(0f, prevClipTop, width.toFloat(), finalBottom)
+                if (accGap != 0f) canvas.translate(0f, accGap)
+                drawStaticLayer(canvas, current)
+                canvas.restoreToCount(band)
+            }
+            canvas.restoreToCount(shifted)
+        } else {
+            drawStaticLayer(canvas, current)
         }
-        if (!selectionPath.isEmpty) {
-            // Fill overlapping line boxes together so the selection alpha is applied once.
-            val layer = canvas.save()
-            canvas.scale(density, density)
-            canvas.drawPath(selectionPath, highlight)
-            canvas.restoreToCount(layer)
-        }
-        referenceIndicator?.let {r->canvas.drawRoundRect(r.x*density,r.y*density,(r.x+r.width)*density,(r.y+r.height)*density,density,density,referencePaint)}
-        canvas.restore()
         handlePoints().forEach {(x,y)->if(y>=0&&y<=height)canvas.drawCircle(x,y+6*density,7*density,handlePaint)}
         canvas.restoreToCount(clipped)
     }

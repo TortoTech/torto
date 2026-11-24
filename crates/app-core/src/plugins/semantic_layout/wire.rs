@@ -87,6 +87,15 @@ const KEYS: &[(&str, &str)] = &[
     ("total", "tt"),
     ("items", "it"),
     ("number", "nu"),
+    ("subtitle", "sb"),
+    ("nodes", "nd"),
+    ("relations", "rl"),
+    ("label", "lb"),
+    ("detail", "dt"),
+    ("tag", "ta"),
+    ("value", "vl"),
+    ("emphasis", "em"),
+    ("from", "fr"),
 ];
 
 const ENUMS: &[(&str, &str)] = &[
@@ -114,6 +123,16 @@ const ENUMS: &[(&str, &str)] = &[
     ("recognized", "ok"),
     ("not_formula", "no"),
     ("unreadable", "u"),
+    ("flow", "fl"),
+    ("timeline", "tm"),
+    ("compare", "cp"),
+    ("hierarchy", "hr"),
+    ("metric", "mt"),
+    ("summary", "sm"),
+    ("cause", "cs"),
+    ("sequence", "sq"),
+    ("contrast", "ct"),
+    ("part", "pt"),
 ];
 
 fn enum_key(name: &str, decode: bool) -> &str {

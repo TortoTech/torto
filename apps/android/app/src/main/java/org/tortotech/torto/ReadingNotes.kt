@@ -38,7 +38,6 @@ import org.tortotech.torto.core.Annotation
     val book=state.active
     val cover by produceState(book?.let {model.cachedCover(it.id)},book?.id){value=book?.let {model.cover(it.id)}}
     Column(Modifier.fillMaxSize()){
-        Text(tr("笔记","Notes"),Modifier.fillMaxWidth().padding(vertical=12.dp),fontSize=16.sp,textAlign=TextAlign.Center)
         LazyColumn(Modifier.weight(1f),contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(12.dp)){
             item("summary"){
                 SettingsGroup {

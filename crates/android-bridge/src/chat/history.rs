@@ -99,8 +99,8 @@ impl StreamState {
         }
     }
 }
-pub(super) fn append_turn(
-    s: &mut ReaderState,
+pub(super) fn append_turn_into(
+    target: &mut Vec<ChatMessage>,
     id: &str,
     question: String,
     images: Vec<crate::chat_media::ChatAttachment>,
@@ -108,7 +108,7 @@ pub(super) fn append_turn(
     stream: &StreamState,
     stopped: bool,
 ) -> Result<()> {
-    let mut messages = s.messages.clone();
+    let mut messages = target.clone();
     messages.push(ChatMessage {
         id: format!("{id}-question"),
         user: true,
@@ -141,8 +141,19 @@ pub(super) fn append_turn(
     {
         return Err(error("对话内容较多，请删除部分记录后重试"));
     }
-    s.messages = messages;
+    *target = messages;
     Ok(())
+}
+pub(super) fn append_turn(
+    s: &mut ReaderState,
+    id: &str,
+    question: String,
+    images: Vec<crate::chat_media::ChatAttachment>,
+    content: String,
+    stream: &StreamState,
+    stopped: bool,
+) -> Result<()> {
+    append_turn_into(&mut s.messages, id, question, images, content, stream, stopped)
 }
 
 #[uniffi::export]

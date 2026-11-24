@@ -69,6 +69,7 @@ import org.tortotech.torto.core.*
         item { SettingsGroup {
             InterfaceSettingsRows(state,open)
             SettingsRow("type",tr("AI 排版","AI layout")){open("layout")}
+            SettingsRow("gesture",tr("快捷手势","Gesture shortcuts")){open("gestures")}
         } }
         item { SettingsGroup {
             SettingsRow("ai",tr("AI 提供商","AI providers")){open("ai")}

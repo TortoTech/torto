@@ -53,6 +53,11 @@ impl DesktopReader {
             self.semantic_layout.passage_chart_translated = self.translation.enabled;
             self.semantic_source.clear_passage_charts();
         }
+        let dark = crate::ui::theme() == egui::Theme::Dark;
+        if self.semantic_source.set_passage_chart_dark(dark) {
+            self.refresh_semantic_layout();
+            let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
+        }
         let Some(job) = self.semantic_layout.passage_chart.as_mut() else {
             return;
         };
@@ -72,17 +77,41 @@ impl DesktopReader {
             };
             let source = job.source.clone();
             self.semantic_layout.passage_chart = None;
-            if let Ok(Some(chart)) = outcome
-                && self.semantic_source.install_passage_chart(chart)
-            {
-                if self
-                    .focus_units
-                    .get(self.focus_unit_index)
-                    .is_some_and(|unit| unit.range.start == source.start)
-                {
-                    self.semantic_layout.presentation_anchor = Some(source);
+            match outcome {
+                Ok(Some(chart)) => {
+                    if self.semantic_source.install_passage_chart(chart) {
+                        if self
+                            .focus_units
+                            .get(self.focus_unit_index)
+                            .is_some_and(|unit| unit.range.start == source.start)
+                        {
+                            self.semantic_layout.presentation_anchor = Some(source);
+                        }
+                        self.refresh_semantic_layout();
+                    }
                 }
-                self.refresh_semantic_layout();
+                Ok(None) => {
+                    self.error_timer.show(
+                        &mut self.error,
+                        self.language
+                            .text(
+                                "该段落暂无适合可视化的结构关系",
+                                "No visualizable structure found in this passage",
+                            )
+                            .into(),
+                        Instant::now(),
+                    );
+                }
+                Err(error) => {
+                    self.error_timer.show(
+                        &mut self.error,
+                        format!(
+                            "{}: {error}",
+                            self.language.text("可视化生成失败", "Visualization failed")
+                        ),
+                        Instant::now(),
+                    );
+                }
             }
             let _ = proxy.send_event(UserEvent::RepaintAfter(Duration::ZERO));
             return;

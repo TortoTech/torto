@@ -248,13 +248,20 @@ impl Widget for IconWidget {
 }
 
 pub(crate) fn paint_icon(ui: &Ui, rect: Rect, glyph: Icon, color: Color32) {
+    paint_icon_rotated(ui, rect, glyph, color, 0.0);
+}
+
+pub(crate) fn paint_icon_rotated(ui: &Ui, rect: Rect, glyph: Icon, color: Color32, angle: f32) {
     let (name, bytes) = glyph.asset();
-    egui::Image::from_bytes(format!("bytes://lucide/{name}.svg"), bytes)
+    let mut image = egui::Image::from_bytes(format!("bytes://lucide/{name}.svg"), bytes)
         .fit_to_exact_size(rect.size())
         .texture_options(egui::TextureOptions::LINEAR)
         .tint(color)
-        .show_loading_spinner(false)
-        .paint_at(ui, rect);
+        .show_loading_spinner(false);
+    if angle != 0.0 {
+        image = image.rotate(angle, egui::Vec2::splat(0.5));
+    }
+    image.paint_at(ui, rect);
 }
 
 #[cfg(test)]

@@ -3693,7 +3693,7 @@ impl DesktopReader {
             .fixed_pos(Pos2::new(x, y))
             .show(ctx, |ui| {
                 if pending && !self.ui.focus_actions_visible {
-                    ui.add(crate::ui::LoadingSpinner::new());
+                    ui.add(crate::ui::LoadingSpinner::new().color(palette().accent));
                 } else if let Some(draft) = self.annotation_note_draft.as_mut() {
                     focus_assistant_frame(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
                         ui.set_width((width - 20.0).max(100.0));
@@ -3729,7 +3729,7 @@ impl DesktopReader {
                                 ui, self.language, *active, Some(&self.shortcuts.focus_table_chart),
                             ).clicked();
                         } else if pending {
-                            ui.add(crate::ui::LoadingSpinner::new());
+                            ui.add(crate::ui::LoadingSpinner::new().color(palette().accent));
                         }
                     });
                 }

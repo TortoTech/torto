@@ -549,6 +549,51 @@ pub(crate) fn icon_button(ui: &mut Ui, glyph: Icon) -> Response {
     painted_icon_button(ui, glyph, false)
 }
 
+pub(crate) fn spinning_icon_button(ui: &mut Ui, glyph: Icon, spinning: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    crate::app::window_chrome::exclude(ui.ctx(), rect);
+    let palette = palette();
+    let fill = if spinning {
+        Color32::TRANSPARENT
+    } else if response.is_pointer_button_down_on() {
+        ui.visuals().widgets.active.weak_bg_fill
+    } else if response.hovered() {
+        ui.visuals().widgets.hovered.weak_bg_fill
+    } else {
+        Color32::TRANSPARENT
+    };
+    let foreground = if spinning {
+        palette.accent
+    } else {
+        palette.text
+    };
+    let angle = if spinning {
+        ui.ctx().request_repaint();
+        ((ui.input(|i| i.time) / 0.9) * std::f64::consts::TAU) as f32
+    } else {
+        0.0
+    };
+    if ui.is_rect_visible(rect) {
+        if fill != Color32::TRANSPARENT {
+            paint_compact_rounded_background(ui, rect, 6.0, fill);
+        }
+        icons::paint_icon_rotated(
+            ui,
+            Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
+            glyph,
+            foreground,
+            angle,
+        );
+    }
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled() && !spinning, glyph.name()));
+    if spinning {
+        response
+    } else {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
 /// Side of the compact icon action, for callers that have to reserve room for
 /// one before it is drawn.
 pub(crate) const SMALL_ICON_BUTTON_SIZE: f32 = 28.0;

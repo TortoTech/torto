@@ -1310,12 +1310,17 @@ fn provider_models_selector(
                 }
             }
         });
-    let refresh_requested = icon_button(ui, Icon::RefreshCw)
-        .on_hover_text(language.text("刷新模型列表", "Refresh model list"))
-        .clicked();
-    if loading {
-        ui.add(crate::ui::LoadingSpinner::new());
-    } else if let Some(error) = error {
+    let refresh_requested = crate::ui::spinning_icon_button(ui, Icon::RefreshCw, loading)
+        .on_hover_text(if loading {
+            language.text("正在刷新模型列表…", "Refreshing model list…")
+        } else {
+            language.text("刷新模型列表", "Refresh model list")
+        })
+        .clicked()
+        && !loading;
+    if !loading
+        && let Some(error) = error
+    {
         ui.add(icon(Icon::AlertCircle).size(16.0).color(palette().error))
             .on_hover_text(error);
     }

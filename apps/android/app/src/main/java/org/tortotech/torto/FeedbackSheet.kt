@@ -40,7 +40,8 @@ import org.json.JSONObject
     val descriptionLabel=tr("反馈内容","Feedback description")
     androidx.activity.compose.BackHandler(onBack=model::close)
     val inputFocus=rememberInputFocus(!state.loading&&!state.locked&&state.status!="submitted")
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).semantics {paneTitle=title}.statusBarsPadding().windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))){
+    val safeTop = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding()
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).semantics {paneTitle=title}.padding(top=safeTop+20.dp).windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))){
         Box(Modifier.fillMaxWidth().height(64.dp)){
             Text(title,Modifier.align(Alignment.Center),fontSize=16.sp,textAlign=TextAlign.Center)
             ActionIcon("back",tr("返回","Back"),modifier=Modifier.align(Alignment.CenterStart).padding(start=4.dp),onClick=model::close)

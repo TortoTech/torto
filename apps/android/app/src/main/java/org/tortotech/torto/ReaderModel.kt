@@ -50,17 +50,21 @@ data class ScreenState(
     val fontsDownloading:Boolean=false,val fontsReady:Boolean=false,val fontsError:String?=null,val fontApplyAvailable:Boolean=false,
     val fontNoticeUntil:Long=0,
     val providers:List<Provider> = emptyList(),val providerKinds:List<ProviderKind> = emptyList(),
-    val modelChoices:Map<String,List<String>> = emptyMap(),val modelFetchError:String?=null,
+    val modelChoices:Map<String,List<String>> = emptyMap(),val modelFetchError:String?=null,val fetchingModels:Boolean=false,
     val settingsRevision:Long=0, val aiStage:String="",val aiCompleted:UInt=0u,val aiTotal:UInt=0u,val aiError:String?=null,val aiErrorEvent:ULong=0u,val aiNoticeUntil:Long=0,val aiErrorKind:String="",
     val annotations: List<Annotation> = emptyList(), val annotationPreviewId:String?=null, val statistics: ReadingStatistics? = null,
     val messages: List<ChatMessage> = emptyList(), val chatWorking: Boolean = false,
     val chatStreamId:String="",val chatSources:Map<String,List<ChatSource>> = emptyMap(),val chatLoadingSources:Set<String> = emptySet(),val chatSourceErrors:Set<String> = emptySet(),
     val chatDraft:String="",val draftImages:List<ChatAttachment> = emptyList(),val sendingImages:List<ChatAttachment> = emptyList(),
     val chatContent: String = "", val chatReasoning: String = "", val chatActivity: String = "", val chatQuestion: String = "",
+    val focusChatKey: String? = null, val focusChatMessages: List<ChatMessage> = emptyList(),
+    val focusChatDraft: String = "", val focusChatWorking: Boolean = false, val focusChatWorkingKey: String? = null,
+    val focusChatQuestion: String = "", val focusChatContent: String = "",
+    val focusChatReasoning: String = "", val focusChatActivity: String = "",
     val changes: List<ChatChange> = emptyList(), val translated: Boolean = false,
     val selectionMode: String = "free",
     val wordSelectionAvailable:Boolean=true,
-    val interaction:ReaderInteraction?=null,val focus:Boolean=false,val focusAvailable:Boolean=false,val chromeVisible:Boolean=true,val readerMoving:Boolean=false,val quietUpdate:Boolean=false,
+    val interaction:ReaderInteraction?=null,val focus:Boolean=true,val focusAvailable:Boolean=false,val gestureOnboardingPending:Boolean=false,val chromeVisible:Boolean=true,val readerMoving:Boolean=false,val quietUpdate:Boolean=false,
     val processing:Boolean=false,val enhancing:Boolean=false,val autoLayout:Boolean=false,
     val appTheme: String = "system", val language: String = "system",
     val fontSize: Float = 20f, val unified: Boolean = false, val dark: Boolean = false,
@@ -87,7 +91,8 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private var reader: MobileReader? = null
     private var readerBook: String? = null
     // A book that cannot focus (for example a native PDF) must not replace the preference.
-    private var preferredFocus=false
+    private var preferredFocus=true
+    @Volatile private var previewOnboardingRequested=false
     private var classicSelection="free"
     private var focusedSelection="paragraph"
     private fun selectionFor(focus:Boolean,words:Boolean=state.value.wordSelectionAvailable)=
@@ -102,6 +107,8 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     private var turnPreviewGeneration=0L
     private var chatRequest: ChatRequest? = null
     private var chatJob: Job? = null
+    private var focusChatRequest: ChatRequest? = null
+    private var focusChatJob: Job? = null
     private var documentMoving=false
     private var documentSelected=false
     private var aiUiEpoch=0uL
@@ -173,9 +180,9 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(appTheme=system.first,language=system.second) }
         val brightness=withContext(Dispatchers.IO){application.getSharedPreferences("reading",0).getFloat("brightness",-1f)}
         mutable.update {it.copy(readingBrightness=if(brightness.isFinite()&&brightness>=0f)brightness.coerceIn(.01f,1f)else -1f)}
-        val automatic=withContext(Dispatchers.IO){application.getSharedPreferences("reading",0).let {it.getBoolean("autoLayout",false) to it.getBoolean("focus",false)}}
+        val automatic=withContext(Dispatchers.IO){application.getSharedPreferences("reading",0).let {Triple(it.getBoolean("autoLayout",false), it.getBoolean("focus",true), !it.getBoolean("gestureOnboardingShown",false))}}
         preferredFocus=automatic.second
-        mutable.update {it.copy(autoLayout=automatic.first,focus=automatic.second)}
+        mutable.update {it.copy(autoLayout=automatic.first,focus=automatic.second,gestureOnboardingPending=automatic.third)}
         val version=withContext(Dispatchers.IO){
             application.getSharedPreferences("interface",0).edit().remove("updateSource").apply()
             application.packageManager.getPackageInfo(application.packageName,0).versionName.orEmpty()
@@ -191,6 +198,14 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         updateMonospace(reading.monospaceFont)
         mutable.update {it.copy(reading=reading,aiOptions=ai,autoLayout=ai.layoutEnabled,translated=reading.translated,selectionMode=selectionFor(it.focus))}
         val books = core.books(); val services = runCatching { core.serviceSettings() }.getOrNull(); mutable.update { it.copy(books = books,services=services,loaded=true,fontSize=preferences.first,unified=preferences.second,dark=preferences.third) }
+        if (previewOnboardingRequested) {
+            previewOnboardingRequested = false
+            preferredFocus = true
+            mutable.update { it.copy(gestureOnboardingPending = true, focus = true) }
+            if (state.value.active == null && books.isNotEmpty()) {
+                withContext(Dispatchers.Main) { open(books.first()) }
+            }
+        }
     } }
 
     private fun runOperation(quietUpdate:Boolean=false,block: suspend () -> Unit) {
@@ -208,6 +223,27 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun clearError() { mutable.update { it.copy(error = null) } }
+    fun dismissGestureOnboarding() {
+        if (!state.value.gestureOnboardingPending) return
+        mutable.update { it.copy(gestureOnboardingPending = false) }
+        viewModelScope.launch(Dispatchers.IO) {
+            getApplication<Application>().getSharedPreferences("reading", 0).edit().putBoolean("gestureOnboardingShown", true).apply()
+        }
+    }
+    fun requestGestureOnboardingPreview() {
+        preferredFocus = true
+        mutable.update { it.copy(gestureOnboardingPending = true) }
+        val current = state.value
+        if (!current.loaded) {
+            previewOnboardingRequested = true
+            return
+        }
+        if (current.active == null && current.books.isNotEmpty()) {
+            open(current.books.first())
+        } else if (current.active != null && !current.focus && current.focusAvailable) {
+            focus(true)
+        }
+    }
     fun setReadingBrightness(value:Float,persist:Boolean=true){
         if(!value.isFinite())return
         mutable.update {it.copy(readingBrightness=if(value<0f)-1f else value.coerceIn(.01f,1f))}
@@ -314,11 +350,22 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    fun fetchModels(provider:Provider,key:String,clearKey:Boolean=false)=runOperation {
-        val cacheKey=provider.kind+":"+provider.baseUrl
-        mutable.update {it.copy(modelFetchError=null)}
-        try{val models=core.fetchModels(provider,if(clearKey)"" else key.takeIf {it.isNotBlank()});mutable.update {it.copy(modelChoices=it.modelChoices+(cacheKey to models))}}
-        catch(e:Exception){mutable.update {it.copy(modelFetchError=e.message)}}
+    fun fetchModels(provider:Provider,key:String,clearKey:Boolean=false) {
+        if(state.value.fetchingModels)return
+        viewModelScope.launch {
+            val cacheKey=provider.kind+":"+provider.baseUrl
+            mutable.update {it.copy(fetchingModels=true,modelFetchError=null)}
+            try {
+                val models=core.fetchModels(provider,if(clearKey)"" else key.takeIf {it.isNotBlank()})
+                mutable.update {it.copy(modelChoices=it.modelChoices+(cacheKey to models))}
+            } catch(e:CancellationException) {
+                throw e
+            } catch(e:Exception) {
+                mutable.update {it.copy(modelFetchError=e.message)}
+            } finally {
+                mutable.update {it.copy(fetchingModels=false)}
+            }
+        }
     }
     private suspend fun persistAiOptions(options:AiOptions,token:Long){
         val saved=core.saveAiOptions(options);mutable.update {it.copy(aiOptions=saved,autoLayout=saved.layoutEnabled,aiError=null)}
@@ -539,7 +586,10 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         clearTurnPreviews()
         cancelChat();cancelAi();aiVersion=0uL;manualLayout=false;scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
-        mutable.update { it.copy(active = book, cloudResume=null, bookLanguages=emptyList(), frame = null, openingBook=true, readerContentLoading=false, error=null, fontApplyAvailable=false, focusAvailable=false, focus=preferredFocus, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=false,processing=false, hits = emptyList(), selected = null, messages=emptyList(),chatSources=emptyMap(),chatLoadingSources=emptySet(),chatSourceErrors=emptySet(),changes=emptyList(),annotations=emptyList(),translated=false,reading=it.reading?.copy(translated=false),aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatReasoning="",chatActivity="",chatStreamId="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList()) }
+        mutable.update {
+            val clearReaderNotice=it.notice=="默认字体下载完成"||it.notice=="发现其他设备进度"
+            it.copy(active = book, cloudResume=null, notice=if(clearReaderNotice)null else it.notice, fontNoticeUntil=if(it.notice=="默认字体下载完成")0 else it.fontNoticeUntil, bookLanguages=emptyList(), frame = null, openingBook=true, readerContentLoading=false, error=null, fontApplyAvailable=false, focusAvailable=false, focus=preferredFocus, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=false,processing=false, hits = emptyList(), selected = null, messages=emptyList(),chatSources=emptyMap(),chatLoadingSources=emptySet(),chatSourceErrors=emptySet(),changes=emptyList(),annotations=emptyList(),translated=false,reading=it.reading?.copy(translated=false),aiError=null,chatWorking=false,chatQuestion="",chatContent="",chatReasoning="",chatActivity="",chatStreamId="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList())
+        }
         viewport = null
     }
     fun measure(width: Int, height: Int, density: Float) {
@@ -830,11 +880,13 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(readerMoving=active) }
     }
     fun turn(forward:Boolean){
+        if(state.value.focusChatKey!=null)closeFocusChat()
         if(state.value.completionPage){if(!forward)closeCompletionPage();return}
         if(state.value.focus)readerOperation(hideControls=true,quietUpdate=true,completeTurn=true){it.turn(forward)}
         else turnBook(forward,false)
     }
     fun turnUnit(forward:Boolean){
+        if(state.value.focusChatKey!=null)closeFocusChat()
         if(state.value.completionPage){if(!forward)closeCompletionPage();return}
         turnBook(forward,true)
     }
@@ -881,7 +933,18 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
             while(scrollPending!=0f&&token==generation){
                 val amount=scrollPending;scrollPending=0f
                 operations.withLock {withContext(NonCancellable){reader?.let {session->
-                    try {val frame=nativeFrame(session.scrollBy(amount));val selected=session.selection();if(token==generation)mutable.update {it.copy(frame=frame,selected=selected)}}
+                    try {
+                        val frame=nativeFrame(session.scrollBy(amount))
+                        val selected=session.selection()
+                        if(token==generation){
+                            val movedAway=state.value.focusChatKey!=null&&frame.info.focusChatKey!=state.value.focusChatKey
+                            if(movedAway)focusChatRequest?.cancel()
+                            mutable.update {
+                                if(movedAway) it.copy(frame=frame,selected=selected,focusChatKey=null,focusChatMessages=emptyList(),focusChatDraft="",focusChatWorking=false,focusChatQuestion="",focusChatContent="",focusChatReasoning="",focusChatActivity="")
+                                else it.copy(frame=frame,selected=selected)
+                            }
+                        }
+                    }
                     catch(e:Exception){
                         if(e.message.orEmpty().contains("database is locked",ignoreCase=true))DiagnosticLog.record(getApplication(),"database_locked operation=scroll")
                         if(token==generation)mutable.update {it.copy(error=e.message)}
@@ -948,12 +1011,12 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
     fun back() {
         completionJob?.cancel();completionJob=null
         clearTurnPreviews()
-        cancelChat();cancelAi();aiVersion=0uL;manualLayout=false;scrollPending=0f;selectionPending=null;selectionHandle=false
+        cancelChat();cancelFocusChat();cancelAi();aiVersion=0uL;manualLayout=false;scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
         resizeJob?.cancel(); viewport = null
         mutable.update {
-            val clearFontNotice=it.notice=="默认字体下载完成"
-            it.copy(active = null, focus=preferredFocus, focusAvailable=false, cloudResume=null, bookLanguages=emptyList(),messages=emptyList(),chatSources=emptyMap(),chatLoadingSources=emptySet(),chatSourceErrors=emptySet(), frame = null, openingBook=false, readerContentLoading=false, fontApplyAvailable=false, notice=if(clearFontNotice)null else it.notice, fontNoticeUntil=if(clearFontNotice)0 else it.fontNoticeUntil, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=true,processing=false, selected = null, toc = emptyList(),chatWorking=false,chatQuestion="",chatContent="",chatReasoning="",chatActivity="",chatStreamId="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList())
+            val clearReaderNotice=it.notice=="默认字体下载完成"||it.notice=="发现其他设备进度"
+            it.copy(active = null, focus=preferredFocus, focusAvailable=false, cloudResume=null, bookLanguages=emptyList(),messages=emptyList(),chatSources=emptyMap(),chatLoadingSources=emptySet(),chatSourceErrors=emptySet(), frame = null, openingBook=false, readerContentLoading=false, fontApplyAvailable=false, notice=if(clearReaderNotice)null else it.notice, fontNoticeUntil=if(it.notice=="默认字体下载完成")0 else it.fontNoticeUntil, completionPage=false,completion=null,completionLoading=false,completionError=null,annotationPreviewId=null, interaction=null,chromeVisible=true,processing=false, selected = null, toc = emptyList(),chatWorking=false,chatQuestion="",chatContent="",chatReasoning="",chatActivity="",chatStreamId="",chatDraft="",draftImages=emptyList(),sendingImages=emptyList(),focusChatKey=null,focusChatMessages=emptyList(),focusChatDraft="",focusChatWorking=false,focusChatQuestion="",focusChatContent="",focusChatReasoning="",focusChatActivity="")
         }
         runOperation { reader?.shutdown(); reader?.close(); reader = null; readerBook = null; val books=core.books(); mutable.update { it.copy(books=books) } }
     }
@@ -1103,11 +1166,136 @@ class ReaderModel(application: Application) : AndroidViewModel(application) {
         val token=generation
         runOperation { if(token==generation) { reader?.clearChat();if(token==generation)mutable.update { it.copy(messages=emptyList(),changes=emptyList(),draftImages=emptyList(),sendingImages=emptyList(),chatSources=emptyMap(),chatLoadingSources=emptySet(),chatSourceErrors=emptySet()) } } }
     }
+    fun openFocusChat(key: String? = null) {
+        val target = key ?: state.value.frame?.info?.focusChatKey ?: return
+        cancelAi()
+        val token = generation
+        mutable.update {
+            it.copy(
+                focusChatKey = target,
+                focusChatDraft = "",
+                focusChatMessages = if (it.focusChatKey == target) it.focusChatMessages else emptyList(),
+                chromeVisible = false,
+                selected = null,
+                interaction = null,
+            )
+        }
+        viewModelScope.launch {
+            if (token != generation) return@launch
+            val history = runCatching { reader?.focusChatHistory(target).orEmpty() }.getOrDefault(emptyList())
+            if (token == generation && state.value.focusChatKey == target) {
+                mutable.update { it.copy(focusChatMessages = history) }
+            }
+        }
+    }
+    fun closeFocusChat() {
+        mutable.update {
+            it.copy(
+                focusChatKey = null,
+                focusChatDraft = "",
+            )
+        }
+    }
+    fun editFocusChatDraft(text: String) {
+        mutable.update { it.copy(focusChatDraft = text) }
+    }
+    fun cancelFocusChat() {
+        focusChatRequest?.cancel()
+    }
+    fun clearFocusChat() {
+        val key = state.value.focusChatKey ?: return
+        if (state.value.focusChatWorking) return
+        val token = generation
+        runOperation(quietUpdate = true) {
+            if (token == generation) {
+                reader?.let { session ->
+                    session.clearFocusChat(key)
+                    publish(session.page(), token)
+                    if (token == generation) {
+                        mutable.update { it.copy(focusChatMessages = emptyList()) }
+                    }
+                }
+            }
+        }
+    }
+    fun sendFocusChat(question: String) {
+        val key = state.value.focusChatKey ?: return
+        val trimmed = question.trim()
+        if (state.value.focusChatWorking || trimmed.isEmpty()) return
+        cancelAi()
+        val token = generation
+        val request = ChatRequest()
+        focusChatRequest = request
+        mutable.update {
+            it.copy(
+                focusChatWorking = true,
+                focusChatWorkingKey = key,
+                focusChatQuestion = trimmed,
+                focusChatContent = "",
+                focusChatReasoning = "",
+                focusChatActivity = "",
+                focusChatDraft = "",
+            )
+        }
+        focusChatJob = viewModelScope.launch {
+            try {
+                withContext(NonCancellable) {
+                    if (token != generation) return@withContext
+                    val session = reader ?: return@withContext
+                    val messages = session.focusChat(key, trimmed, request, object : ChatListener {
+                        override fun update(content: String, reasoning: String, activity: String) {
+                            if (token == generation) {
+                                mutable.update {
+                                    it.copy(
+                                        focusChatContent = content,
+                                        focusChatReasoning = reasoning,
+                                        focusChatActivity = activity,
+                                    )
+                                }
+                            }
+                        }
+                    })
+                    operations.withLock {
+                        if (token == generation && reader === session) {
+                            publish(session.page(), token)
+                        }
+                    }
+                    if (token == generation && state.value.focusChatKey == key) {
+                        mutable.update { it.copy(focusChatMessages = messages) }
+                    }
+                }
+            } catch (e: Exception) {
+                if (token == generation) {
+                    mutable.update {
+                        it.copy(
+                            focusChatDraft = it.focusChatDraft.ifBlank { trimmed },
+                            error = if (e.message.orEmpty().contains("已停止")) it.error else e.message,
+                        )
+                    }
+                }
+            } finally {
+                request.close()
+                if (focusChatRequest === request) focusChatRequest = null
+                if (token == generation) {
+                    mutable.update {
+                        it.copy(
+                            focusChatWorking = false,
+                            focusChatWorkingKey = null,
+                            focusChatQuestion = "",
+                            focusChatContent = "",
+                            focusChatReasoning = "",
+                            focusChatActivity = "",
+                        )
+                    }
+                }
+            }
+        }
+    }
     override fun onCleared() {
         clearTurnPreviews()
         // ViewModel survives rotation; closing the owning activity releases the
         // native session on a worker, not in the UI lifecycle callback.
-        cancelChat();cancelAi();cancelUpdate();scrollPending=0f;selectionPending=null;selectionHandle=false
+        cancelChat();cancelFocusChat();cancelAi();cancelUpdate();scrollPending=0f;selectionPending=null;selectionHandle=false
         generation++
         CoroutineScope(Dispatchers.IO).launch {
             operations.withLock { reader?.shutdown(); reader?.close(); reader = null }

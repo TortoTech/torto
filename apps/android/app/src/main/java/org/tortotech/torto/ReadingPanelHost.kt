@@ -150,7 +150,7 @@ private fun flatReadingPanel(panel:String)=readingPanelOwner(panel)=="typography
                 Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth().then(if(smallPanel)Modifier else Modifier.animateContentSize(tween(180),alignment=Alignment.BottomCenter)).then(if(full)Modifier.fillMaxHeight()else Modifier.heightIn(max=limit)).offset{IntOffset(0,drag.roundToInt())}.semantics {paneTitle=paneLabel}.then(bodyDrag).pointerInput(Unit){detectTapGestures {}},
                     shape=if(full||flatReadingPanel(displayed))RectangleShape else RoundedCornerShape(topStart=20.dp,topEnd=20.dp),color=if(flatReadingPanel(displayed))MaterialTheme.colorScheme.surfaceContainerLowest else MaterialTheme.colorScheme.surfaceContainerLow){
                     Column(Modifier.fillMaxWidth().then(if(full)Modifier.fillMaxHeight()else Modifier).imePadding()){
-                        if(full)Spacer(Modifier.height(safe.calculateTopPadding()+24.dp))
+                        if(full)Spacer(Modifier.height(safe.calculateTopPadding()+20.dp))
                         if(!flatReadingPanel(displayed))Box(Modifier.fillMaxWidth().height(28.dp),contentAlignment=Alignment.Center){Box(Modifier.size(32.dp,3.dp).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha=.22f),RoundedCornerShape(2.dp)))}
                         Box(Modifier.weight(1f,fill=full).fillMaxWidth().graphicsLayer {alpha=if(smallPanel)opacity.value else 1f}){
                             holder.SaveableStateProvider(displayed){content(displayed)}

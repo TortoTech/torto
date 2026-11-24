@@ -99,7 +99,9 @@ struct ProviderEditor: View {
                     HStack {
                         Text(mobileText("模型", "Models")).font(.system(size: 16, weight: .semibold))
                         Spacer()
-                        MobileIconButton(icon: "sync", label: mobileText("刷新模型列表", "Refresh model list"), action: fetch)
+                        MobileIconButton(icon: "sync", label: busy ? mobileText("正在刷新模型列表…", "Refreshing model list…") : mobileText("刷新模型列表", "Refresh model list"), action: fetch)
+                            .rotationEffect(.degrees(busy ? -360 : 0))
+                            .animation(busy ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default, value: busy)
                             .disabled(draft.baseUrl.isEmpty)
                     }.padding(.leading, 16).padding(.trailing, 4)
                     MobileFormField(title: mobileText("搜索模型", "Search models"), text: $query)

@@ -134,6 +134,12 @@ pub fn page_turn_commit(distance: f32, width: f32, velocity: f32) -> bool {
 pub fn page_turn_resisted_offset(distance: f32, width: f32) -> f32 {
     rebook_app_core::page_navigation::resisted_offset(distance, width)
 }
+#[derive(Clone, uniffi::Record)]
+pub struct FocusChatBadge {
+    pub key: String,
+    pub rect: Rect,
+    pub count: u32,
+}
 #[derive(Clone, Default, uniffi::Record)]
 pub struct PageInfo {
     pub section: u32,
@@ -158,6 +164,8 @@ pub struct PageInfo {
     pub active_toc_path: Vec<String>,
     pub focus_index: u32,
     pub focus_count: u32,
+    pub focus_chat_key: Option<String>,
+    pub focus_chat_badges: Vec<FocusChatBadge>,
     pub can_go_back: bool,
 }
 #[derive(Clone, uniffi::Record)]
@@ -429,6 +437,9 @@ impl MobileCore {
                     format: publication.format(),
                     chat_path,
                     messages,
+                    focus_chats: Default::default(),
+                    focus_chat_prompts: Default::default(),
+                    active_focus_chats: Default::default(),
                     pending: None,
                     translation_config: None,
                     enhancements: Default::default(),
@@ -472,6 +483,9 @@ struct ReaderState {
     format: rebook_formats::BookFormat,
     chat_path: PathBuf,
     messages: Vec<chat::ChatMessage>,
+    focus_chats: std::collections::HashMap<String, Vec<chat::ChatMessage>>,
+    focus_chat_prompts: std::collections::HashMap<String, String>,
+    active_focus_chats: std::collections::HashSet<String>,
     pending: Option<chat::PendingChanges>,
     translation_config: Option<String>,
     enhancements: services::enhancements::State,
@@ -889,6 +903,11 @@ fn sync_locator(s:&ReaderState,index:usize,is_scroll:bool)->rebook_publication::
     }
     locator
 }
+pub(crate) fn focus_unit_key(unit: &interactions::FocusUnit) -> Option<String> {
+    unit.ranges
+        .first()
+        .map(|r| format!("focus:{}:{}", r.start.spine.as_str(), r.start.node))
+}
 fn finish_page_info(
     s: &mut ReaderState,
     regions: Vec<TextRegion>,
@@ -901,6 +920,25 @@ fn finish_page_info(
         .focus_units
         .get(index)
         .map_or_else(Vec::new, |u| u.paint_bounds());
+    let focus_chat_key = s.focus_units.get(index).and_then(focus_unit_key);
+    let focus_chat_badges = s
+        .focus_units
+        .iter()
+        .filter_map(|u| {
+            let key = focus_unit_key(u)?;
+            let count = s.focus_chats.get(&key).map_or(0, |msgs| msgs.len());
+            let active = s.active_focus_chats.contains(&key);
+            if count == 0 && !active {
+                return None;
+            }
+            let rect = u.navigation_bounds()?;
+            Some(FocusChatBadge {
+                key,
+                rect,
+                count: (count / 2).max(1) as u32,
+            })
+        })
+        .collect();
     let state = s.session.snapshot();
     let locator=sync_locator(s,index,is_scroll);
     if persist {
@@ -937,6 +975,8 @@ fn finish_page_info(
         },
         focus_index: index as u32,
         focus_count: s.focus_units.len() as u32,
+        focus_chat_key,
+        focus_chat_badges,
         can_go_back: !s.history.is_empty(),
     })
 }
