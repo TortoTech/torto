@@ -155,6 +155,11 @@ mod tests {
         let attempts = Mutex::new(Vec::new());
         let events = Mutex::new(Vec::new());
         let preload = crate::fonts::catalog::preload_indices();
+        let expected_attempts: Vec<usize> = preload.iter().copied().filter(|&i| i != 1).collect();
+        let expected_events: Vec<(usize, bool)> = expected_attempts
+            .iter()
+            .map(|&i| (i, i != 2))
+            .collect();
         let report = runtime.block_on(download_missing(
             fonts,
             &preload,
@@ -175,9 +180,9 @@ mod tests {
                 }
             },
         ));
-        assert_eq!(*attempts.lock().unwrap(), vec![2, 0]);
-        assert_eq!(*events.lock().unwrap(), vec![(2, false), (0, true)]);
-        assert_eq!(report.downloaded, 1);
+        assert_eq!(*attempts.lock().unwrap(), expected_attempts);
+        assert_eq!(*events.lock().unwrap(), expected_events);
+        assert_eq!(report.downloaded, (expected_attempts.len() - 1) as u32);
         assert!(report.fonts.faces[0].is_some());
         assert!(report.fonts.faces[1].is_some());
         assert!(report.fonts.faces[2].is_none());

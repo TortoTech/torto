@@ -23,7 +23,7 @@ class FocusBoundaryNavigationTest {
         regions=emptyList(),marks=emptyList(),focusBounds=emptyList(),focusFadeColor=0u,focusHighlight=false,isScroll=true,
         scrollDistance=0.0,scrollContext=333uL,rasterTop=-160f,rasterHeight=height+320f,
         previousFocus=FocusTarget(-32f,emptyList()),nextFocus=if(boundary)null else FocusTarget(32f,emptyList()),
-        controls=emptyList(),activeTocId="one",activeTocPath=emptyList(),focusIndex=0u,focusCount=3u,canGoBack=false)
+        controls=emptyList(),activeTocId="one",activeTocPath=emptyList(),focusIndex=0u,focusCount=3u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList())
     private fun event(view:ReaderView,start:Long,action:Int,y:Float,elapsed:Long){
         MotionEvent.obtain(start,start+elapsed,action,view.width/2f,y,0).also {view.onTouchEvent(it);it.recycle()}
     }

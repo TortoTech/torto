@@ -21,7 +21,7 @@ fn fixture(index: usize) -> Vec<u8> {
 #[test]
 fn pinned_assets_register_both_reader_families_and_true_italic() {
     let mut set = FontSet::default();
-    for index in catalog::preload_indices() {
+    for index in [0, 1, 2] {
         let asset = &catalog::catalog().fonts[index];
         set.faces[index] = Some(store::validate(asset, fixture(index), true).unwrap());
     }

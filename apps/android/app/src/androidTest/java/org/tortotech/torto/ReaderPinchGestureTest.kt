@@ -29,7 +29,7 @@ class ReaderPinchGestureTest {
                 val info=PageInfo(section=0u,sectionCount=2u,page=0u,pageCount=1u,progress=0.0,regions=emptyList(),marks=emptyList(),
                     focusBounds=emptyList(),focusFadeColor=0u,focusHighlight=false,isScroll=true,scrollDistance=0.0,scrollContext=1uL,
                     rasterTop=0f,rasterHeight=height,previousFocus=null,nextFocus=null,
-                    controls=listOf(ReadingControl("sentences","focused-source",false)),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=1u,canGoBack=false)
+                    controls=listOf(ReadingControl("sentences","focused-source",false)),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=1u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList())
                 view.present(ReaderFrame(bitmap!!,info,1uL),null)
                 val splits=mutableListOf<Boolean>();var navigation=0;var taps=0;var selects=0;var moving=false
                 view.onSentenceGesture={split,source->assertEquals("focused-source",source);splits.add(split)}

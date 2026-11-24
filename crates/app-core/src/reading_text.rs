@@ -269,7 +269,7 @@ fn looks_like_note_marker(text: &str) -> bool {
 
 fn after_note_marker(text: &str) -> &str {
     text.trim_start_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '.' | '．' | '，' | '、' | ')' | '）' | ']' | '】')
+        c.is_whitespace() || matches!(c, '.' | '．' | '，' | '、' | ':' | '：' | ')' | '）' | ']' | '】')
     })
 }
 
@@ -290,8 +290,14 @@ fn strip_note_marker<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
     let symbol_marker = value
         .chars()
         .all(|c| !c.is_ascii_alphanumeric());
-    (rest.is_empty() || symbol_marker || after_note_marker(rest).len() < rest.len())
-        .then(|| after_note_marker(rest))
+    let boundary = rest.is_empty()
+        || symbol_marker
+        || after_note_marker(rest).len() < rest.len()
+        || rest
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_ascii_alphanumeric());
+    boundary.then(|| after_note_marker(rest))
 }
 
 pub fn text_block_focus_text(block: &TextBlock) -> String {
@@ -644,6 +650,9 @@ mod popup_tests {
         assert!(!unified.contains("chapter.xhtml"));
         assert_eq!(normalize_resolved_footnote_text("11", "11"), None);
         assert_eq!(normalize_resolved_footnote_text("110 is the total", "11").as_deref(), Some("110 is the total"));
+        assert_eq!(normalize_resolved_footnote_text("11：译文内容", "[11]").as_deref(), Some("译文内容"));
+        assert_eq!(normalize_resolved_footnote_text("11: 译文内容", "11").as_deref(), Some("译文内容"));
+        assert_eq!(normalize_resolved_footnote_text("11译文内容", "11").as_deref(), Some("译文内容"));
     }
 }
 

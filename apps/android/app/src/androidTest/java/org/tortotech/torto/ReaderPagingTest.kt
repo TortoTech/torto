@@ -38,7 +38,7 @@ class ReaderPagingTest {
                 val info=PageInfo(section=0u,sectionCount=2u,page=0u,pageCount=1u,progress=0.0,
                     regions=emptyList(),marks=emptyList(),focusBounds=emptyList(),focusFadeColor=0x8CFFFFFFu,focusHighlight=false,
                     isScroll=focus,scrollDistance=0.0,scrollContext=1uL,rasterTop=0f,rasterHeight=view.height/view.resources.displayMetrics.density,
-                    previousFocus=null,nextFocus=null,controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=if(focus)1u else 0u,canGoBack=false)
+                    previousFocus=null,nextFocus=null,controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=if(focus)1u else 0u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList())
                 fun frame(color:Int,section:UInt)=ReaderFrame(Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888).apply {eraseColor(color);bitmaps.add(this)},info.copy(section=section,scrollContext=section.toULong()+1uL,progress=section.toDouble()),section.toULong()+1uL)
                 val previous=frame(Color.RED,0u);val last=frame(Color.BLUE,1u)
                 view.present(last,null,previous,null)
@@ -99,7 +99,7 @@ class ReaderPagingTest {
                     regions=emptyList(),marks=emptyList(),focusBounds=if(focus)listOf(org.tortotech.torto.core.Rect(0f,0f,view.width/view.resources.displayMetrics.density,view.height/view.resources.displayMetrics.density))else emptyList(),focusFadeColor=0x8CFFFFFFu,
                     focusHighlight=false,isScroll=focus,scrollDistance=0.0,scrollContext=1uL,rasterTop=0f,
                     rasterHeight=view.height/view.resources.displayMetrics.density,previousFocus=null,nextFocus=null,
-                    controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=if(focus)1u else 0u,canGoBack=false)
+                    controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=if(focus)1u else 0u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList())
                 fun frame(color:Int,index:UInt)=ReaderFrame(Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888).apply {eraseColor(color);bitmaps.add(this)},info.copy(page=index,scrollContext=index.toULong()+1uL),index.toULong()+1uL)
                 first=frame(Color.RED,0u);second=frame(Color.BLUE,1u)
                 view.present(first,null,null,second)

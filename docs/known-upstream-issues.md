@@ -1,6 +1,6 @@
 # 核心依赖已知问题
 
-- 最近更新：2026-11-02
+- 最近更新：2026-11-24
 - 范围：当前工作区仍需跟踪的依赖问题、兼容措施和待验证事项；版本以 `Cargo.lock` 为准。
 - 维护方式：直接更新各条目的当前结论，不追加按日期排列的排查日志、旧版本快照和已完成的升级过程。已解决且无需兼容措施的问题删除。
 
@@ -68,6 +68,13 @@ Fontique 已统一为 0.12.0；系统字体提供器的本地改动仅调整依�
 - 现象：跨行选择两端对齐正文时，中间完整行的高亮短于实际文字。
 - 当前处理：`crates/renderer/src/lib.rs::ShapedTextRegion::selection_rects` 对完整行按换行原因修正宽度，部分选择仍使用上游几何。
 - 撤销条件：移除修正后通过 `selection_covers_the_visual_width_of_justified_middle_lines`、`wrapped_mixed_text_uses_line_width_while_the_last_line_stays_content_sized`，并验证真实 EPUB 的跨行选择。
+
+## Parley：缺少断行后局部重塑（Reshaping）API
+
+- 当前状态：Parley / Engine 0.12.0 尚未发布断行后重塑能力。上游 `parley_engine` 已合入 `is_safe_to_concat_before` 基础标志（[#876](https://github.com/linebender/parley/pull/876)），断行后重塑（[#908](https://github.com/linebender/parley/pull/908)、[#930](https://github.com/linebender/parley/pull/930)）与软连字符断行渲染（[#827](https://github.com/linebender/parley/pull/827)）仍处于 Open PR 阶段。
+- 现象：Knuth-Plass 在连字符候选点断行时，若断点切开连字（ligature）或字距（kerning），无法像 Typst/TeX 那样在 DP 阶段按需局部重塑词级 `pre`/`post` 切片，只能通过外层 `shaping_breaks` 重塑循环逼近收敛；在长段落与特定字号/边距组合下，外层迭代可能出现 2-cycle 震荡并回退到无连字符断行（对应 [Torto #152](https://github.com/TortoTech/torto/issues/152)）。
+- 当前处理：`crates/layout/src/lib.rs::shape_text_with_sources` 将 shaping-fence 迭代上限放宽至 8 轮，并记录 `seen_breaks`；检测到重复断行集合时对 shaping fences 取单调并集以打破震荡，且新选断行点已被现有 fences 覆盖时直接收敛。
+- 撤销条件：上游正式发布 `parley` / `parley_engine` 断行后重塑 API 后，评估迁移为一次性 DP + 断点局部重塑并移除外层不动点迭代，同时确保 `rebook-layout` 连字符回归（含 `converged_hyphen_plan_reuse_matches_full_replanning_geometry`、`sentence_hyphens_survive_ligature_reshaping_and_replanning`）及长段落多宽度实测全部通过。
 
 ## egui/epaint：紧凑圆角控件的羽化角线
 

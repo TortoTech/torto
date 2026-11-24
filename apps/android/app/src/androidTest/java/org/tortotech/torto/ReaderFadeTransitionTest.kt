@@ -46,7 +46,7 @@ class ReaderFadeTransitionTest {
         return ReaderFrame(bitmap,PageInfo(section=context.toUInt(),sectionCount=10u,page=0u,pageCount=1u,progress=0.0,
             regions=emptyList(),marks=emptyList(),focusBounds=emptyList(),focusFadeColor=0u,focusHighlight=false,
             isScroll=true,scrollDistance=0.0,scrollContext=context,rasterTop=0f,rasterHeight=height,
-            previousFocus=null,nextFocus=null,controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=1u,canGoBack=false),context)
+            previousFocus=null,nextFocus=null,controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=0u,focusCount=1u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList()),context)
     }
     @Test fun immediateReplyWaitsForFadeAndRefreshDoesNotReplayIt()=attached {view,images->
         val first=frame(view,images,Color.BLUE,1uL);val next=frame(view,images,Color.GREEN,2uL)

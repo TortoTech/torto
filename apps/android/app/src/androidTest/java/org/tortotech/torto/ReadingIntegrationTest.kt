@@ -204,7 +204,7 @@ class ReadingIntegrationTest {
             val view=ReaderView(context);view.layout(0,0,width,height)
             var info=PageInfo(section=0u,sectionCount=1u,page=0u,pageCount=1u,progress=0.0,regions=emptyList(),marks=emptyList(),focusBounds=emptyList(),
                 focusFadeColor=0u,focusHighlight=false,isScroll=true,scrollDistance=0.0,scrollContext=9200uL,rasterTop=-pad,rasterHeight=960f,
-                previousFocus=FocusTarget(-32f,emptyList()),nextFocus=FocusTarget(32f,emptyList()),controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=1u,focusCount=3u,canGoBack=false)
+                previousFocus=FocusTarget(-32f,emptyList()),nextFocus=FocusTarget(32f,emptyList()),controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),focusIndex=1u,focusCount=3u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList())
             var turns=0
             try {
                 bitmap.eraseColor(android.graphics.Color.WHITE)
@@ -269,7 +269,7 @@ class ReadingIntegrationTest {
                     focusFadeColor=0x8CFFFFFFu,focusHighlight=false,isScroll=true,scrollDistance=0.0,
                     scrollContext=9001uL,controls=emptyList(),activeTocId=null,activeTocPath=emptyList(),rasterTop=-pad,rasterHeight=height+2*pad,
                     previousFocus=FocusTarget(-120f,listOf(Rect(20f,80f,200f,60f))),
-                    nextFocus=FocusTarget(120f,listOf(Rect(20f,320f,200f,60f))),focusIndex=1u,focusCount=3u,canGoBack=false)
+                    nextFocus=FocusTarget(120f,listOf(Rect(20f,320f,200f,60f))),focusIndex=1u,focusCount=3u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList())
                 view.present(ReaderFrame(bitmap!!,info,77uL),null)
                 view.onMotion={active->moving.set(active);if(!active)idle.countDown()}
                 view.onScroll={nativeScrolls.incrementAndGet()}

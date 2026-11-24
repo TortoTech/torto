@@ -36,7 +36,7 @@ class WhitespaceSelectionTest {
                 bitmap=Bitmap.createBitmap(view.width,view.height,Bitmap.Config.ARGB_8888)
                 val density=view.resources.displayMetrics.density
                 val info=PageInfo(section=0u,sectionCount=2u,page=0u,pageCount=1u,progress=0.0,regions=emptyList(),marks=emptyList(),focusBounds=emptyList(),focusFadeColor=0u,focusHighlight=false,isScroll=true,
-                    scrollDistance=0.0,scrollContext=123uL,rasterTop=0f,rasterHeight=view.height/density,previousFocus=null,nextFocus=FocusTarget(48f,emptyList()),controls=emptyList(),activeTocId="one",activeTocPath=emptyList(),focusIndex=0u,focusCount=2u,canGoBack=false)
+                    scrollDistance=0.0,scrollContext=123uL,rasterTop=0f,rasterHeight=view.height/density,previousFocus=null,nextFocus=FocusTarget(48f,emptyList()),controls=emptyList(),activeTocId="one",activeTocPath=emptyList(),focusIndex=0u,focusCount=2u,canGoBack=false,focusChatKey="",focusChatBadges=emptyList())
                 view.present(ReaderFrame(bitmap!!,info),null)
                 view.onSelect={x,_,_,_->assertEquals(32f,x,.1f);selects.incrementAndGet()}
                 view.onTurn={turns.incrementAndGet()};view.onMotion={moving.set(it)}

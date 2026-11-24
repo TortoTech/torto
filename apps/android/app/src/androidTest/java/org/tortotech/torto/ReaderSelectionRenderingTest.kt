@@ -35,7 +35,7 @@ class ReaderSelectionRenderingTest {
                     scrollDistance = 0.0, scrollContext = 0uL, rasterTop = 0f, rasterHeight = 110f,
                     previousFocus = null, nextFocus = null, controls = emptyList(),
                     activeTocId = null, activeTocPath = emptyList(), focusIndex = 0u,
-                    focusCount = 0u, canGoBack = false,
+                    focusCount = 0u, canGoBack = false, focusChatKey = "", focusChatBadges = emptyList(),
                 ))
                 val selection = SelectedText(
                     "A wrapped paragraph",

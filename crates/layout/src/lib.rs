@@ -3695,12 +3695,13 @@ impl LayoutEngine {
         let continuation_indent = marker_width;
         let mut optimized = false;
         let mut shaping_breaks = Vec::new();
+        let mut seen_breaks: Vec<Vec<usize>> = Vec::new();
         // Reshape at chosen discretionary breaks and remeasure before accepting
         // the paragraph. This preserves ligatures within each resulting line.
         if should_optimize {
             let analysis = linebreak::parley::ParagraphAnalysis::new(&text)
                 .with_protected_prefix(source_text_start);
-            for _ in 0..4 {
+            for _ in 0..8 {
                 let prepared = if text.contains('\n') {
                     linebreak::parley::plan_sentences(
                         &mut layout, &text, available_width, first_line_indent,
@@ -3724,8 +3725,16 @@ impl LayoutEngine {
                 };
                 let plan = &prepared.plan;
                 let next_breaks: Vec<_> = plan.hyphen_offsets.iter().flatten().copied().collect();
-                if next_breaks != shaping_breaks {
-                    shaping_breaks = next_breaks;
+                let covered = next_breaks.iter().all(|offset| shaping_breaks.binary_search(offset).is_ok());
+                if next_breaks != shaping_breaks && !covered {
+                    if seen_breaks.contains(&next_breaks) {
+                        shaping_breaks.extend(next_breaks);
+                        shaping_breaks.sort_unstable();
+                        shaping_breaks.dedup();
+                    } else {
+                        seen_breaks.push(shaping_breaks);
+                        shaping_breaks = next_breaks;
+                    }
                     layout = self.build_text_layout_with_boundaries(
                         &text,
                         &spans,
