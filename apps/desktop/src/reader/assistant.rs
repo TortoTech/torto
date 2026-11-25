@@ -265,6 +265,9 @@ impl DesktopReader {
             !existing.id.starts_with("focus:") && !existing.id.starts_with("selection:")
         });
         self.chat.references.push(reference);
+        if !self.is_focus_mode() {
+            self.mark_chat_selection(&selection.ranges);
+        }
         self.cancel_text_selection();
         if self.is_focus_mode() {
             self.open_focus_assistant();
@@ -1675,6 +1678,7 @@ impl DesktopReader {
 
     pub(super) fn close_assistant_panel(&mut self) {
         self.log_diagnostic_snapshot("assistant.close.before", None);
+        self.clear_chat_selection();
         self.ui.assistant_keyboard_focus = false;
         if self.ui.assistant_motion.animate_to(0.0) {
             self.ui.last_motion_tick = Some(std::time::Instant::now());
@@ -1943,7 +1947,11 @@ impl DesktopReader {
         } else {
             format!("解释：“{}”", clip_chat_reference_text(selected_text, 72))
         });
-        self.focused_mark = Some(FocusedMark::assistant(selection.ranges.clone()));
+        if self.is_focus_mode() {
+            self.focused_mark = Some(FocusedMark::assistant(selection.ranges));
+        } else {
+            self.mark_chat_selection(&selection.ranges);
+        }
         self.cancel_text_selection();
         if self.is_focus_mode() {
             self.open_focus_assistant();

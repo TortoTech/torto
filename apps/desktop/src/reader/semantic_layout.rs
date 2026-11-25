@@ -1,4 +1,7 @@
-use super::{DesktopReader, SnapshotEffects, TranslationTask};
+use super::{
+    DesktopReader, FocusedMark, FocusedMarkKind, ScrollSectionLayout, SnapshotEffects,
+    TranslationTask,
+};
 use crate::platform::UserEvent;
 use crate::plugins::BlockTranslation;
 use crate::plugins::semantic_layout::{
@@ -59,12 +62,20 @@ struct Group {
     hash: String,
     result: Option<Recognition>,
 }
+
+pub(super) struct ChatSelectionReflow {
+    screen_top: Option<f32>,
+    pub(super) installed: bool,
+}
+
 #[derive(Default)]
 pub(super) struct SemanticLayoutState {
     pub(super) scheduler: rebook_app_core::reading_ai::Scheduler,
     pub(super) pending_viewport: Option<rebook_layout::LayoutViewport>,
     pub(super) viewport_reflow_at: Option<Instant>,
     pub(super) viewport_anchor: Option<super::FocusReflowAnchor>,
+    pub(super) paginated_anchor: Option<rebook_layout::PageTextStart>,
+    pub(super) chat_selection_reflow: Option<ChatSelectionReflow>,
     pub(super) presentation_anchor: Option<SourceRange>,
     expert_translation: bool,
     semantic_config: Option<(
@@ -1114,6 +1125,11 @@ impl DesktopReader {
     }
 
     pub(super) fn request_viewport_reflow(&mut self, viewport: rebook_layout::LayoutViewport) {
+        if !self.is_focus_mode() && !self.is_scroll_mode()
+            && self.semantic_layout.paginated_anchor.is_none()
+        {
+            self.semantic_layout.paginated_anchor = self.reader.paginated_text_start();
+        }
         let previous = self
             .semantic_layout
             .pending_viewport
@@ -1128,12 +1144,134 @@ impl DesktopReader {
         self.refresh_semantic_layout();
     }
 
+    fn reflow_source_range(&self) -> Option<SourceRange> {
+        self.semantic_layout.presentation_anchor.clone()
+            .or_else(|| {
+                if !self.is_focus_mode() && self.is_scroll_mode() {
+                    self.semantic_layout.viewport_anchor.as_ref().map(|anchor| anchor.range.clone())
+                } else {
+                    self.semantic_layout.paginated_anchor.as_ref().map(|start| start.anchor.clone())
+                        .or_else(|| {
+                            (self.semantic_layout.pending_viewport.is_some() && !self.is_focus_mode())
+                                .then(|| self.reader.current_page().source_range_nearest_y(0.0)).flatten()
+                        })
+                }
+            })
+            .or_else(|| self.progress_source_range())
+    }
+
+    pub(super) fn rebase_classic_scroll_reflow(&mut self) {
+        self.cancel_chat_selection_reflow();
+        self.semantic_layout.viewport_anchor = self.capture_classic_reflow_anchor();
+        // Let active scrolling finish before replacing its layout/scroll state.
+        self.semantic_layout.viewport_reflow_at = Some(Instant::now() + VIEWPORT_SETTLE);
+    }
+
+    pub(super) fn mark_chat_selection(&mut self, ranges: &[SourceRange]) {
+        let opening = self.ui.assistant_panel.is_none()
+            || self.semantic_layout.chat_selection_reflow.is_some();
+        self.focused_mark = Some(FocusedMark {
+            ranges: ranges.to_vec(),
+            kind: FocusedMarkKind::ChatSelection,
+        });
+        if opening && !ranges.is_empty() {
+            let screen_top = (|| {
+                let viewport = self.scroll_viewport?;
+                let (top, _) = self.scroll_section.as_ref()?.selected_text_bounds(ranges)?;
+                Some(top - viewport.offset_y)
+            })();
+            self.semantic_layout.chat_selection_reflow = Some(ChatSelectionReflow {
+                screen_top,
+                installed: false,
+            });
+            if self.semantic_layout.pending_viewport.is_some() {
+                self.refresh_semantic_layout();
+            }
+        }
+    }
+
+    fn chat_selection_ranges(&self) -> Option<&[SourceRange]> {
+        self.focused_mark.as_ref()
+            .filter(|mark| mark.kind == FocusedMarkKind::ChatSelection)
+            .map(|mark| mark.ranges.as_slice())
+    }
+
+    fn pending_chat_selection_ranges(&self) -> Option<&[SourceRange]> {
+        self.semantic_layout.pending_viewport?;
+        self.semantic_layout.chat_selection_reflow.as_ref()?;
+        if self.semantic_layout.presentation_anchor.is_some() {
+            return None;
+        }
+        self.chat_selection_ranges()
+    }
+
+    pub(super) fn clear_chat_selection(&mut self) {
+        self.cancel_chat_selection_reflow();
+        if self.chat_selection_ranges().is_some() {
+            self.focused_mark = None;
+            self.bump_scene_revision();
+        }
+    }
+
+    pub(super) fn cancel_chat_selection_reflow(&mut self) {
+        if self.semantic_layout.chat_selection_reflow.take().is_some()
+            && self.semantic_layout.pending_viewport.is_some()
+        {
+            self.refresh_semantic_layout();
+        }
+    }
+
+    pub(super) fn chat_selection_scroll_offset(
+        &self,
+        layout: &ScrollSectionLayout,
+        height: f32,
+    ) -> Option<f32> {
+        let anchor = self.semantic_layout.chat_selection_reflow.as_ref()?;
+        if !anchor.installed || self.semantic_layout.pending_viewport.is_some() {
+            return None;
+        }
+        let (top, bottom) = layout.selected_text_bounds(self.chat_selection_ranges()?)?;
+        let preferred = top - anchor.screen_top.unwrap_or_default();
+        let offset = if bottom - top <= height {
+            preferred.clamp(bottom - height, top)
+        } else {
+            top
+        };
+        Some(offset.clamp(0.0, (layout.content_height - height).max(0.0)))
+    }
+
+    fn prepare_reflow(
+        &self,
+    ) -> impl FnOnce() -> Result<rebook_reader::ReaderSession, rebook_reader::ReaderError> + use<> {
+        let mut request = self.reader.prepare_resize_request(
+            self.semantic_layout.pending_viewport.unwrap_or(self.reader.viewport()),
+            self.reflow_source_range(),
+        );
+        let selection = self.pending_chat_selection_ranges()
+            .filter(|_| !self.is_scroll_mode())
+            .map(<[SourceRange]>::to_vec);
+        if selection.is_none() && self.semantic_layout.presentation_anchor.is_none()
+            && let Some(start) = &self.semantic_layout.paginated_anchor
+        {
+            request = request.with_page_text_start(start.clone());
+        }
+        move || {
+            let mut prepared = request.prepare()?;
+            if let Some(ranges) = selection {
+                prepared.reveal_selected_text(&ranges)?;
+            }
+            Ok(prepared)
+        }
+    }
+
     fn poll_semantic_reflow(
         &mut self,
         runtime: &tokio::runtime::Runtime,
         proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     ) {
-        if self.content_interacting() {
+        if self.content_interacting() || self.semantic_layout.viewport_reflow_at
+            .is_some_and(|at| at > Instant::now())
+        {
             return;
         }
         if let Some((version, unit, style, result)) = self
@@ -1149,32 +1287,17 @@ impl DesktopReader {
             }
         }
         if self.semantic_layout.reflow_dirty && self.semantic_layout.reflow_worker.is_none() {
-            if self
-                .semantic_layout
-                .viewport_reflow_at
-                .is_some_and(|at| at > Instant::now())
-            {
-                return;
-            }
             self.semantic_layout.viewport_reflow_at = None;
             self.semantic_layout.reflow_dirty = false;
             let version = self.semantic_layout.reflow_version;
             let unit = self.reader.reading_unit_location().index;
             let style = self.reader.style();
-            let request = self.reader.prepare_resize_request(
-                self.semantic_layout
-                    .pending_viewport
-                    .unwrap_or(self.reader.viewport()),
-                self.semantic_layout
-                    .presentation_anchor
-                    .clone()
-                    .or_else(|| self.progress_source_range()),
-            );
+            let prepare = self.prepare_reflow();
             let proxy = proxy.clone();
             let (tx, rx) = mpsc::channel();
             self.semantic_layout.reflow_receiver = Some(rx);
             self.semantic_layout.reflow_worker = Some(runtime.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || request.prepare())
+                let result = tokio::task::spawn_blocking(prepare)
                     .await
                     .unwrap_or_else(|error| {
                         Err(rebook_reader::ReaderError::Publication(
@@ -1208,13 +1331,11 @@ impl DesktopReader {
                             .pending_viewport
                             .unwrap_or(self.reader.viewport()) =>
             {
-                let scroll_source = self
-                    .semantic_layout
-                    .presentation_anchor
-                    .clone()
-                    .or_else(|| self.progress_source_range())
+                let scroll_source = self.reflow_source_range()
                     .or_else(|| self.reader.current_locator().source);
-                if scroll_source
+                let chat_selection = self.pending_chat_selection_ranges().is_some();
+                let chat_spread_prepared = chat_selection && !self.is_scroll_mode();
+                if !chat_spread_prepared && scroll_source
                     .as_ref()
                     .is_some_and(|range| !prepared.restore_cached_anchor(&range.start))
                 {
@@ -1223,6 +1344,11 @@ impl DesktopReader {
                 } else {
                     let presentation_anchor = self.semantic_layout.presentation_anchor.take();
                     let viewport_changed = self.semantic_layout.pending_viewport.take().is_some();
+                    if chat_selection
+                        && let Some(anchor) = &mut self.semantic_layout.chat_selection_reflow
+                    {
+                        anchor.installed = true;
+                    }
                     self.semantic_layout.viewport_reflow_at = None;
                     let anchor = self.semantic_layout.viewport_anchor.take().or_else(|| {
                         self.capture_reflow_anchor(super::FocusReflowKind::DocumentLayout)

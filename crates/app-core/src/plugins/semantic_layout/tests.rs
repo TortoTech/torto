@@ -634,6 +634,19 @@ fn recognition_tasks_fit_the_windows_ui_thread_stack() {
 }
 
 #[test]
+fn visible_recognition_future_fits_native_ui_task_stacks() {
+    let section = section(vec![image("cover")]);
+    let source = original_source(section.clone());
+    let settings = PluginSettings::default();
+    let future = recognize_visible(&section, 0..1, "cover-book", &settings, source.as_ref());
+    let bytes = std::mem::size_of_val(&future);
+    // The desktop scheduler and task-local context also wrap this future.
+    // A large request future must not multiply through those layers onto the
+    // native event callback stack before any asynchronous work can start.
+    assert!(bytes <= 64 * 1024, "visible recognition future occupies {bytes} bytes");
+}
+
+#[test]
 fn translation_indices_survive_semantic_toggle_and_changed_content_is_rejected() {
     let section = section(vec![
         text("a", "Quotation"),

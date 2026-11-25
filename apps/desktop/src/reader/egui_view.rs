@@ -837,6 +837,8 @@ impl DesktopReader {
                     self.ui.toolbar_motion.value
                 };
                 paint_reader_header(ui.painter(), header_rect, background_ui, visibility);
+                #[cfg(target_os = "windows")]
+                crate::app::window_chrome::set_controls_visibility(&ctx, visibility);
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 crate::app::window_chrome::bounded_ui(ui, toolbar_rect, |ui| self.toolbar(ui));
                 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -951,7 +953,14 @@ impl DesktopReader {
     ) -> Rect {
         let pdf_scale=if self.pdf_zoom_enabled() {self.pdf_zoom.transform.scale} else {1.0};
         let source_height=size.y/pdf_scale;
-        self.retain_viewport_reflow_anchor(size);
+        if self.semantic_layout.chat_selection_reflow.is_some() {
+            let wheel_over_page = ui.rect_contains_pointer(ui.max_rect())
+                && ui.input(|input| input.smooth_scroll_delta.y.abs() > f32::EPSILON);
+            if self.pending_keyboard_scroll_delta.abs() > f32::EPSILON || wheel_over_page {
+                self.cancel_chat_selection_reflow();
+            }
+        }
+        self.retain_viewport_reflow_anchor(size, ui.ctx().pixels_per_point());
         let layout = match self.current_scroll_layout() {
             Ok(layout) => layout,
             Err(error) => {
@@ -1028,13 +1037,20 @@ impl DesktopReader {
                 PageDirection::Next => 0.0,
             };
             scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
-        } else if let Some(offset) = self.restore_classic_reflow_anchor(&layout, size.y) {
-            // A viewport reflow (left sidebar, window resize) keeps the text
-            // that was at the top of the viewport on screen instead of
-            // rewinding to the paragraph's start.
+        } else if let Some(offset) = self.chat_selection_scroll_offset(&layout, source_height)
+            .or_else(|| self.restore_classic_reflow_anchor(&layout, size.y))
+        {
+            // The reflow restores an exact reading or selection position.
             self.scroll_target_position = None;
             self.scroll_target_source = None;
+            self.focus_reflow_anchor = None;
             scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
+            if let Some(anchor) = &mut self.semantic_layout.viewport_anchor {
+                anchor.viewport = super::ScrollViewportState {
+                    offset_y: offset,
+                    size: Vec2::new(size.x, source_height),
+                };
+            }
         } else if let Some(target) = self.scroll_target_source.take()
             && let Some(top) = layout.source_top(&target)
         {
@@ -1048,8 +1064,16 @@ impl DesktopReader {
             scroll_area = scroll_area.vertical_scroll_offset(target_offset * pdf_scale);
         }
 
-        if let Some(offset) = self.viewport_preview_offset(source_height, layout.content_height) {
-            scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
+        let preview_offset = self.viewport_preview_offset(source_height, layout.content_height);
+        if let Some(offset) = preview_offset {
+            // Setting an unchanged offset also cancels egui's kinetic/keyboard
+            // scroll target. Classic mode must keep accepting input while a
+            // background resize is pending.
+            if self.is_focus_mode() || self.scroll_viewport
+                .is_none_or(|viewport| (viewport.offset_y - offset).abs() > 0.1)
+            {
+                scroll_area = scroll_area.vertical_scroll_offset(offset * pdf_scale);
+            }
             self.focus_target_offset = None;
             self.ui.focus_scroll_motion = None;
         }
@@ -1112,6 +1136,13 @@ impl DesktopReader {
                     size: Vec2::new(viewport_size.x,viewport_size.y/pdf_scale),
                 },
             );
+            if !self.is_focus_mode()
+                && preview_offset.is_some_and(|expected| {
+                    (viewport.min.y / pdf_scale - expected).abs() > 0.1
+                })
+            {
+                self.rebase_classic_scroll_reflow();
+            }
             #[cfg(debug_assertions)]
             {
                 let remaining = ui.ctx().data_mut(|data| {
@@ -9019,6 +9050,7 @@ mod reference_suggestion_label_tests {
                 },
                 |root| {
                     window_chrome::begin_frame(&ctx);
+                    reader.ui.last_motion_tick = Some(Instant::now() - Duration::from_millis(100));
                     let plan = reader.ui(root, None, false);
                     assert!(
                         plan.rect.left() > 200.0,
@@ -9071,6 +9103,49 @@ mod reference_suggestion_label_tests {
         );
     }
     use rebook_layout::ReaderStyle;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn window_controls_follow_reader_header_visibility_without_moving_the_canvas() {
+        use crate::app::window_chrome;
+        for mode in [crate::preferences::ReadingMode::Classic, crate::preferences::ReadingMode::Focus] {
+            let (mut reader, _, _) = crate::reader::semantic_layout::tests::fixture();
+            reader.reading_mode = mode;
+            let ctx = egui::Context::default();
+            let mut canvas = None;
+            for visibility in [1.0, 0.5, 0.0, 0.5, 1.0] {
+                for pass in 0..2 {
+                    reader.ui.toolbar_motion = super::super::Motion::settled(visibility);
+                    reader.ui.toolbar_hide_at = None;
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                        ..Default::default()
+                    }, |root| {
+                        window_chrome::begin_frame(&ctx);
+                        let plan = reader.ui(root, None, false);
+                        if let Some(before) = canvas { assert_eq!(plan.rect, before); }
+                        canvas = Some(plan.rect);
+                        window_chrome::paint_controls(&ctx);
+                    });
+                    output.textures_delta.clear();
+                    if pass == 0 { continue; } // egui measures a new Area before painting it.
+                    let geometry = window_chrome::geometry(&ctx);
+                    if visibility == 0.0 {
+                        assert!(geometry.buttons.iter().all(Option::is_none), "hidden controls must not retain native click targets");
+                    } else {
+                        assert!(geometry.buttons.iter().all(Option::is_some));
+                        let rect = Rect::from_min_size(Pos2::new(1200.0 - window_chrome::CONTROLS_WIDTH, 0.0), Vec2::new(window_chrome::CONTROLS_WIDTH, TOOLBAR_HEIGHT));
+                        let fill = output.shapes.iter().find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
+                            _ => None,
+                        }).expect("visible caption background");
+                        if visibility == 1.0 { assert_eq!(fill.a(), 255); }
+                        else { assert!(fill.a() > 0 && fill.a() < 255, "caption controls must fade with the header"); }
+                    }
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

@@ -1231,6 +1231,34 @@ pub struct TextSourceSpan {
     pub source: SourceRange,
 }
 
+/// A character on the first line of a reflowable page. The display byte
+/// identifies its shaped line even across collapsed citations and list markers.
+#[derive(Clone, Debug)]
+pub struct PageTextStart {
+    pub source: SourceRange,
+    pub text: Arc<str>,
+    pub byte: usize,
+    pub anchor: SourceRange,
+}
+
+impl PageTextStart {
+    fn line_in(&self, prepared: &PreparedText, block: &TextBlock) -> Option<usize> {
+        let matches = if prepared.source_spans.is_empty() {
+            block.source.as_ref() == Some(&self.source)
+        } else {
+            prepared.source_spans.iter().any(|span| {
+                span.source == self.source && span.range.contains(&self.byte)
+            })
+        };
+        if !matches || self.text != prepared.text {
+            return None;
+        }
+        prepared.lines.clone().find(|&i| {
+            prepared.layout.get(i).is_some_and(|line| line.text_range().contains(&self.byte))
+        })
+    }
+}
+
 impl TextPlacement {
     pub fn sources(&self) -> impl Iterator<Item = &SourceRange> {
         self.source_spans.iter().map(|span| &span.source).chain(
@@ -1351,6 +1379,7 @@ pub struct SeparatorPlacement {
 
 /// Stateful layout engine. Font discovery and shaping caches live for the reader session.
 pub struct LayoutEngine {
+    page_text_start: Option<PageTextStart>,
     font_context: FontContext,
     layout_context: LayoutContext<TextBrush>,
     hyphen_glyphs: hyphen_cache::HyphenGlyphCache,
@@ -1625,6 +1654,7 @@ impl LayoutEngine {
         };
         Self {
             font_context,
+            page_text_start: None,
             layout_context: LayoutContext::new(),
             hyphen_glyphs: hyphen_cache::HyphenGlyphCache::default(),
             svg_options,
@@ -1674,6 +1704,14 @@ impl LayoutEngine {
 
     pub fn set_deferred_images(&mut self, enabled: bool) {
         self.deferred_images = enabled;
+    }
+
+    pub fn page_text_start(&self) -> Option<&PageTextStart> {
+        self.page_text_start.as_ref()
+    }
+
+    pub fn set_page_text_start(&mut self, start: Option<PageTextStart>) {
+        self.page_text_start = start;
     }
     /// Lightweight worker-local counters for table layout performance audits.
     pub fn table_width_stats(&self) -> TableWidthStats {
@@ -2004,6 +2042,11 @@ impl LayoutEngine {
             reader_style.minimum_paragraph_gap,
         );
         paginator.media_start_offset = media_start_offset;
+        if reader_style.spread != SpreadMode::Scroll
+            && source.book().metadata.layout == RenditionLayout::Reflowable
+        {
+            paginator.page_text_start = self.page_text_start.clone();
+        }
         paginator.filled_quotes = reader_style.typesetting.quote_style == QuoteStyle::Filled;
         if paginator.filled_quotes { paginator.quote_padding = 8.0; }
 
@@ -6416,6 +6459,7 @@ fn list_marker_prefix(kind: TextBlockKind) -> String {
 }
 
 struct Paginator {
+    page_text_start: Option<PageTextStart>,
     viewport: LayoutViewport,
     background: Rgba,
     left: f32,
@@ -6471,6 +6515,7 @@ impl Paginator {
             viewport,
             background,
             left: geometry.left,
+            page_text_start: None,
             top: geometry.top,
             width: geometry.width,
             bottom: geometry.bottom,
@@ -6613,6 +6658,14 @@ impl Paginator {
         {
             self.advance_column();
         }
+        let page_start_line = self.page_text_start.as_ref()
+            .and_then(|start| start.line_in(prepared, block));
+        if page_start_line.is_some() {
+            self.page_text_start = None;
+        }
+        if page_start_line == Some(prepared.lines.start) && self.column_has_content {
+            self.advance_column();
+        }
         let mut line_start = prepared.lines.start;
         while line_start < prepared.lines.end {
             let first = prepared
@@ -6623,6 +6676,9 @@ impl Paginator {
             let mut line_end = line_start;
             let mut slice_height = 0.0;
             while line_end < prepared.lines.end {
+                if line_end > line_start && page_start_line == Some(line_end) {
+                    break;
+                }
                 let line = prepared
                     .layout
                     .get(line_end)

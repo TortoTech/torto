@@ -18,7 +18,7 @@ use parley::layout::{Affinity, BreakReason, ClusterSide};
 use peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 use rebook_layout::text_layout::{Cluster, Cursor, Layout, PositionedLayoutItem, Selection};
 use rebook_layout::{
-    ImagePlacement, PageItem, PageLayout, QuotePlacement, TablePlacement, TextBrush, TextPlacement,
+    ImagePlacement, PageItem, PageLayout, PageTextStart, QuotePlacement, TablePlacement, TextBrush, TextPlacement,
 };
 use rebook_publication::{Rgba, SourceAnchor, SourceRange, TextBaseline};
 
@@ -712,6 +712,38 @@ impl PageDisplayList {
         self.text_regions
             .iter()
             .find_map(TextRegion::visible_source_range)
+    }
+
+    /// Keep the same character through repeated resizes while it is still on
+    /// the first line. Recapturing the new line's first word each time drifts.
+    pub fn leading_text_start(&self, previous: Option<&PageTextStart>) -> Option<PageTextStart> {
+        let TextRegion::Shaped(region) = self.text_regions.first()? else { return None };
+        let visible = region.visible_byte_range()?;
+        let line = region.lines.clone().filter_map(|i| region.layout.get(i))
+            .find(|line| line.text_range().contains(&visible.start))?;
+        let top = f64::from(region.origin_y + line.metrics().block_min_coord);
+        if self.table_regions.iter().any(|table| table.bounds.y0 < top && table.bounds.y1 <= top)
+            || self.commands.iter().any(|command| matches!(command,
+                DisplayCommand::Image(image) if image.bounds.y0 < top && image.bounds.y1 <= top))
+        {
+            return None;
+        }
+        if let Some(previous) = previous
+            && line.text_range().contains(&previous.byte)
+            && previous.text == region.text
+            && self.text_regions.iter().any(|item| matches!(item, TextRegion::Shaped(part)
+                if Arc::ptr_eq(&part.layout, &region.layout) && part.source == previous.source))
+        {
+            return Some(previous.clone());
+        }
+        let byte = visible.start;
+        let end = byte + region.text[byte..].chars().next()?.len_utf8();
+        Some(PageTextStart {
+            source: region.source.clone(),
+            text: region.text.clone(),
+            byte,
+            anchor: region.source_range_for_bytes(byte..end)?,
+        })
     }
 
     /// Returns the source-backed block nearest a vertical page coordinate.

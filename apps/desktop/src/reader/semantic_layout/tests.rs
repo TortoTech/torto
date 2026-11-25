@@ -4,27 +4,34 @@ use crate::reader::*;
 mod open_perf_tests;
 
 pub(in crate::reader) fn finish_test_viewport_reflow(reader: &mut DesktopReader) {
-    let Some(viewport) = reader.semantic_layout.pending_viewport else {
+    if reader.semantic_layout.pending_viewport.is_none() {
         return;
-    };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
-    let prepared = reader
-        .reader
-        .prepare_resize_request(viewport, reader.progress_source_range())
-        .prepare()
-        .unwrap();
-    let unit = reader.reader.reading_unit_location().index;
-    assert!(reader.adopt_semantic_reflow(
-        &runtime,
-        reader.semantic_layout.reflow_version,
-        unit,
-        reader.reader.style(),
-        Ok(prepared)
-    ));
+    }
+    assert!(TestViewportReflow::prepare(reader).adopt(reader));
+}
+
+pub(in crate::reader) struct TestViewportReflow {
+    version: u64,
+    unit: usize,
+    style: rebook_layout::ReaderStyle,
+    prepared: rebook_reader::ReaderSession,
+}
+
+impl TestViewportReflow {
+    pub(in crate::reader) fn prepare(reader: &mut DesktopReader) -> Self {
+        Self {
+            version: reader.semantic_layout.reflow_version,
+            unit: reader.reader.reading_unit_location().index,
+            style: reader.reader.style(),
+            prepared: reader.prepare_reflow()().unwrap(),
+        }
+    }
+
+    pub(in crate::reader) fn adopt(self, reader: &mut DesktopReader) -> bool {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1).enable_all().build().unwrap();
+        reader.adopt_semantic_reflow(&runtime, self.version, self.unit, self.style, Ok(self.prepared))
+    }
 }
 
 #[test]

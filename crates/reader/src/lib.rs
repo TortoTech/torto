@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 
 use rebook_layout::{
-    LayoutEngine, LayoutError, LayoutViewport, PageItem, ReaderFontBlob, ReaderStyle,
+    LayoutEngine, LayoutError, LayoutViewport, PageItem, PageTextStart, ReaderFontBlob, ReaderStyle,
     TypesettingMode,
 };
 use rebook_publication::{
@@ -305,6 +305,20 @@ pub struct ReaderSpread {
     pub secondary_offset_x: f32,
 }
 
+impl ReaderSpread {
+    fn contains_selected_text(&self, ranges: &[SourceRange]) -> bool {
+        let contains = |anchor: &SourceAnchor| {
+            self.primary.contains_source_anchor(anchor)
+                || self.secondary.as_ref().is_some_and(|page| page.contains_source_anchor(anchor))
+        };
+        ranges.iter().all(|range| {
+            let mut last = range.end.clone();
+            last.text_offset = last.text_offset.saturating_sub(1);
+            contains(&range.start) && contains(&last)
+        })
+    }
+}
+
 /// One compiled logical page in the active authored section.
 #[derive(Clone)]
 pub struct ReaderSectionPage {
@@ -572,6 +586,7 @@ struct SegmentKey {
 
 struct PrefetchRequest {
     key: SegmentKey,
+    page_text_start: Option<PageTextStart>,
     viewport: LayoutViewport,
     style: ReaderStyle,
     generation: u64,
@@ -635,6 +650,7 @@ impl PrefetchWorker {
                     if let Ok(mut active) = worker_active_request.lock() {
                         *active = Some(request_key);
                     }
+                    layout_engine.set_page_text_start(request.page_text_start);
                     let segment = repository
                         .load(request.key.section_index)
                         .and_then(|section| {
@@ -814,6 +830,7 @@ pub struct ReaderCacheStats {
 }
 
 pub struct ReaderRefreshRequest {
+    page_text_start: Option<PageTextStart>,
     source: Arc<dyn BookSource>,
     fonts: Arc<[ReaderFontBlob]>,
     viewport: LayoutViewport,
@@ -825,6 +842,11 @@ pub struct ReaderRefreshRequest {
 }
 
 impl ReaderRefreshRequest {
+    pub fn with_page_text_start(mut self, start: PageTextStart) -> Self {
+        self.page_text_start = Some(start);
+        self
+    }
+
     pub fn prepare(self) -> Result<ReaderSession, ReaderError> {
         let mut reader = ReaderSession::new_unpositioned(
             self.source,
@@ -835,6 +857,7 @@ impl ReaderRefreshRequest {
             self.deferred_images,
         )?;
         reader.set_cache_policy(self.cache_policy);
+        reader.layout_engine.set_page_text_start(self.page_text_start);
         reader.restore_locator(&self.locator)?;
         reader.cache_capacity = usize::MAX;
         // Scroll/focus mode must not compile additional pages on the UI thread
@@ -873,6 +896,7 @@ impl ReaderSession {
             locator.source = Some(source);
         }
         ReaderRefreshRequest {
+            page_text_start: None,
             source: self.source.clone(),
             fonts: self.fonts.clone(),
             viewport: self.viewport,
@@ -891,8 +915,18 @@ impl ReaderSession {
         source: Option<SourceRange>,
     ) -> ReaderRefreshRequest {
         let mut request = self.prepare_refresh_request(source);
+        if viewport == self.viewport {
+            request.page_text_start = self.layout_engine.page_text_start().cloned();
+        }
         request.viewport = viewport;
         request
+    }
+
+    pub fn paginated_text_start(&self) -> Option<PageTextStart> {
+        if self.book().metadata.layout == RenditionLayout::PrePaginated {
+            return None;
+        }
+        self.current_page().leading_text_start(self.layout_engine.page_text_start())
     }
 
     /// Restore only within already-compiled pages; never start foreground work.
@@ -1348,6 +1382,38 @@ impl ReaderSession {
             primary_offset_x,
             secondary_offset_x,
         })
+    }
+
+    /// Positions a prepared paginated view to keep the selected source visible.
+    /// This can compile adjacent segments and should run on the layout worker.
+    pub fn reveal_selected_text(&mut self, ranges: &[SourceRange]) -> Result<(), ReaderError> {
+        let Some(first) = ranges.first() else {
+            return Ok(());
+        };
+        if self.current_spread()?.contains_selected_text(ranges) {
+            return Ok(());
+        }
+        let original = self.current_position();
+        let Ok(target) = self.position_for_source_anchor(&first.start) else {
+            return Ok(());
+        };
+        // If the selection is ahead, first try showing its start on the right
+        // page. Otherwise start with the selected text to leave room for its end.
+        if self.style.spread == rebook_layout::SpreadMode::Double
+            && target > original
+            && let Some(previous) = self.previous_position(target)?
+            && previous > original
+        {
+            self.install_position(previous);
+            if self.current_spread()?.contains_selected_text(ranges) {
+                self.sync_reading_unit_to_position();
+                return Ok(());
+            }
+        }
+        self.install_position(target);
+        self.sync_reading_unit_to_position();
+        self.current_spread()?;
+        Ok(())
     }
 
     /// Compiles and returns every logical page in the active authored section.
@@ -3785,6 +3851,7 @@ impl ReaderSession {
     }
 
     fn invalidate_layout(&mut self, fraction: f32) -> Result<(), ReaderError> {
+        self.layout_engine.set_page_text_start(None);
         self.prefetch_worker.invalidate();
         self.prefetch_inflight.clear();
         self.prefetch_failures.clear();
@@ -3823,6 +3890,7 @@ impl ReaderSession {
         }
         self.prefetch_worker.send(PrefetchRequest {
             key: segment,
+            page_text_start: self.layout_engine.page_text_start().cloned(),
             viewport: self.viewport,
             style: self.style.clone(),
             generation: key.generation,
@@ -9669,6 +9737,7 @@ mod tests {
         .unwrap();
         worker
             .send(PrefetchRequest {
+                page_text_start: None,
                 key: SegmentKey {
                     section_index: 0,
                     segment_index: 0,

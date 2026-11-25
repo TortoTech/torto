@@ -4,6 +4,27 @@ use std::net::TcpListener;
 use std::thread;
 
 #[test]
+fn request_futures_fit_native_ui_task_stacks() {
+    let provider = AiProvider::default();
+    let messages = [json!({"role":"user","content":"inspect"})];
+    let mut callback = |_| {};
+    let complete = complete(
+        &provider, "test", &messages, None, None, ReasoningEffort::Default, None,
+    );
+    let stream = stream(
+        &provider, "test", &messages, None, ReasoningEffort::Default, &mut callback,
+    );
+    // These futures are embedded in several recognition/scheduler layers.
+    // Keep each request well below the native Windows UI thread's stack size.
+    for (name, bytes) in [
+        ("complete", std::mem::size_of_val(&complete)),
+        ("stream", std::mem::size_of_val(&stream)),
+    ] {
+        assert!(bytes <= 32 * 1024, "{name} future occupies {bytes} bytes");
+    }
+}
+
+#[test]
 fn hosted_search_preserves_book_functions_on_compatible_endpoints() {
     for kind in [AiProviderKind::OpenRouter, AiProviderKind::Zai] {
         let (url, handle) = server(vec![(200, text_response("answer"))]);

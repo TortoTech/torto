@@ -31,6 +31,7 @@ pub(crate) struct Geometry {
     pub buttons: [Option<Rect>; 3],
     pub drag_enabled: bool,
     pub background: Option<Color32>,
+    pub controls_visibility: Option<f32>,
     pub overlay_dim: f32,
     pub header_masks: Vec<(Rect, f32)>,
 }
@@ -127,6 +128,14 @@ pub(crate) fn set_background(ctx: &egui::Context, color: Color32) {
     });
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn set_controls_visibility(ctx: &egui::Context, visibility: f32) {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Geometry>(geometry_id())
+            .controls_visibility = Some(visibility.clamp(0.0, 1.0));
+    });
+}
+
 /// Match the app backdrop over caption buttons, which must remain above modal layers.
 pub(crate) fn dim_controls(ctx: &egui::Context, opacity: f32) {
     ctx.data_mut(|data| {
@@ -190,7 +199,8 @@ pub(crate) fn fallback_header(ui: &mut egui::Ui) {
 #[cfg(target_os = "windows")]
 pub(crate) fn paint_controls(ctx: &egui::Context) {
     let state = state(ctx);
-    if state.fullscreen {
+    let visibility = geometry(ctx).controls_visibility.unwrap_or(1.0);
+    if state.fullscreen || visibility <= 0.02 {
         paint_header_masks(ctx);
         return;
     }
@@ -209,6 +219,7 @@ pub(crate) fn paint_controls(ctx: &egui::Context) {
         .constrain(false)
         .default_size(Vec2::new(CONTROLS_WIDTH, rect.height()))
         .show(ctx, |ui| {
+            ui.set_opacity(visibility);
             ui.painter().rect_filled(
                 Rect::from_min_size(origin, Vec2::new(CONTROLS_WIDTH, rect.height())),
                 0.0,

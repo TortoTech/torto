@@ -313,6 +313,12 @@ impl DesktopReader {
         };
         match updated {
             Ok(snapshot) => {
+                if mode_changed || self.reader.style().spread != previous_style.spread {
+                    self.clear_chat_selection();
+                    self.semantic_layout.paginated_anchor = None;
+                    self.semantic_layout.viewport_anchor = None;
+                    self.focus_reflow_anchor = None;
+                }
                 let content_changed = mode_changed
                     || self.reader.style() != previous_style
                     || citation_mode_changed

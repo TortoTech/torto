@@ -1910,6 +1910,17 @@ impl ScrollSectionLayout {
         })
     }
 
+    fn selected_text_bounds(&self, ranges: &[SourceRange]) -> Option<(f32, f32)> {
+        self.geometry_pages(ranges)
+            .into_iter()
+            .flat_map(|index| {
+                self.pages[index].page.source_rects(ranges).into_iter().map(move |rect| {
+                    (self.content_y(index, rect.y0 as f32), self.content_y(index, rect.y1 as f32))
+                })
+            })
+            .reduce(|(top, bottom), (y0, y1)| (top.min(y0), bottom.max(y1)))
+    }
+
     #[cfg(any(debug_assertions, test))]
     fn source_line_rects(&self, range: &SourceRange) -> Vec<egui::Rect> {
         self.pages
@@ -2009,17 +2020,22 @@ fn reflow_anchor_offset(
 }
 
 impl DesktopReader {
-    fn retain_viewport_reflow_anchor(&mut self, size: egui::Vec2) {
+    fn retain_viewport_reflow_anchor(&mut self, size: egui::Vec2, raster_scale: f32) {
         let viewport = self.reader.viewport();
         if self.semantic_layout.pending_viewport.is_none()
             && self.semantic_layout.viewport_anchor.is_none()
             && (logical_dimension(f64::from(size.x)) != viewport.width
-                || logical_dimension(f64::from(size.y)) != viewport.height)
+                || logical_dimension(f64::from(size.y)) != viewport.height
+                || raster_scale != viewport.raster_scale)
         {
             // Keep the presented text position while drawing the old layout
             // into the larger viewport and later adopting the new layout.
-            self.semantic_layout.viewport_anchor =
-                self.capture_reflow_anchor(FocusReflowKind::DocumentLayout);
+            // A completed background layout may not have been presented yet.
+            // Carry its pending restore through another resize instead of
+            // hit-testing an invalidated scroll layout or a different line.
+            let pending = if self.is_focus_mode() { None } else { self.focus_reflow_anchor.clone() };
+            self.semantic_layout.viewport_anchor = pending
+                .or_else(|| self.capture_reflow_anchor(FocusReflowKind::DocumentLayout));
         }
     }
 
@@ -2090,12 +2106,18 @@ impl DesktopReader {
     fn viewport_preview_offset(&self, height: f32, content_height: f32) -> Option<f32> {
         let anchor = self.semantic_layout.viewport_anchor.as_ref()?;
         let viewport = anchor.viewport;
+        let maximum = if self.is_focus_mode() {
+            // Focus has virtual trailing space for short reading units.
+            focus_scroll_content_height(content_height, height) - height
+        } else {
+            content_height - height
+        }.max(0.0);
         Some(
             (viewport.offset_y + self.scroll_content_padding(height)
                 - self.scroll_content_padding(viewport.size.y))
             .clamp(
                 0.0,
-                (focus_scroll_content_height(content_height, height) - height).max(0.0),
+                maximum,
             ),
         )
     }
@@ -3603,6 +3625,7 @@ pub(crate) type SearchTaskMessage = TaskResult<Vec<BookSearchResult>>;
 enum FocusedMarkKind {
     Search,
     Assistant,
+    ChatSelection,
 }
 
 #[derive(Clone, Debug)]
@@ -3629,7 +3652,7 @@ impl FocusedMark {
     fn color(&self) -> Color {
         match self.kind {
             FocusedMarkKind::Search => SEARCH_MARK_COLOR,
-            FocusedMarkKind::Assistant => ASSISTANT_MARK_COLOR,
+            FocusedMarkKind::Assistant | FocusedMarkKind::ChatSelection => ASSISTANT_MARK_COLOR,
         }
     }
 }

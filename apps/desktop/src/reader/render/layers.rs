@@ -112,7 +112,7 @@ mod tests {
         let before = old_audit.pixels();
 
         let new_size = egui::vec2(800.0, 620.0);
-        reader.retain_viewport_reflow_anchor(new_size);
+        reader.retain_viewport_reflow_anchor(new_size, reader.reader.viewport().raster_scale);
         reader.request_viewport_reflow(LayoutViewport::new(800, 620).unwrap());
         reader.scroll_viewport = Some(ScrollViewportState {
             size: new_size,
@@ -163,7 +163,7 @@ mod tests {
             size: egui::vec2(1600.0, 240.0),
             offset_y: reader.scroll_content_padding(240.0),
         });
-        reader.retain_viewport_reflow_anchor(egui::vec2(1200.0, 620.0));
+        reader.retain_viewport_reflow_anchor(egui::vec2(1200.0, 620.0), reader.reader.viewport().raster_scale);
         let offset_y = reader
             .viewport_preview_offset(620.0, layout.content_height)
             .unwrap();

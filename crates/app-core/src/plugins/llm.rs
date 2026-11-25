@@ -894,25 +894,28 @@ async fn dispatch(
             if strict {
                 engine.wire = engine.wire.with_strict_tools();
             }
-            execute(engine, request, callback, streaming).await
+            // Provider futures contain large HTTP/decoder state. Keep them on
+            // the heap so nested recognition futures stay small when created
+            // and spawned from a native UI thread with a limited stack.
+            Box::pin(execute(engine, request, callback, streaming)).await
         }
         AiProviderKind::Gemini => {
             let client = providers::gemini::GeminiConfig::new(key)
                 .with_base_url(base)
                 .connect(http);
-            execute(client.completion(model), request, callback, streaming).await
+            Box::pin(execute(client.completion(model), request, callback, streaming)).await
         }
         AiProviderKind::Ollama => {
             let client = providers::ollama::OllamaConfig::new()
                 .with_base_url(base)
                 .with_api_key(key)
                 .connect(http);
-            execute(
+            Box::pin(execute(
                 client.native_completion(model),
                 request,
                 callback,
                 streaming,
-            )
+            ))
             .await
         }
         _ => {
@@ -947,7 +950,7 @@ async fn dispatch(
             if strict && provider.kind == AiProviderKind::OpenAi {
                 engine.wire = engine.wire.with_strict_tools();
             }
-            execute(engine, request, callback, streaming).await
+            Box::pin(execute(engine, request, callback, streaming)).await
         }
     }?;
     if !response.raw.is_object() {

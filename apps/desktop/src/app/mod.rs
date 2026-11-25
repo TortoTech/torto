@@ -263,6 +263,8 @@ impl DesktopApp {
             }
             if self.settings.is_open() || self.feedback.is_open() {
                 window_chrome::block_drag(ui.ctx());
+                #[cfg(target_os = "windows")]
+                window_chrome::set_controls_visibility(ui.ctx(), 1.0);
             }
         }
         crate::fonts::publish_labels(

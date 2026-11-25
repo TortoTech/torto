@@ -281,6 +281,7 @@ impl DesktopReader {
     }
 
     pub(in crate::reader) fn begin_text_selection(&mut self, x: f32, y: f32) {
+        self.clear_chat_selection();
         self.focus_selection_anchor = None;
         self.selection_toolbar_visible = false;
         self.annotation_note_draft = None;
@@ -478,6 +479,7 @@ impl DesktopReader {
         if self.pending_page_turn.is_some() {
             return;
         }
+        self.clear_chat_selection();
         self.pending_page_turn = Some(direction);
         self.retry_pending_page_turn();
     }

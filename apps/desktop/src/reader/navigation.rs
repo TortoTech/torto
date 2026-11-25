@@ -13,6 +13,7 @@ pub(super) const fn snapshot_reanchors_focus(effects: SnapshotEffects) -> bool {
 
 impl DesktopReader {
     pub(in crate::reader) fn go_to_toc(&mut self, id: &str, target: &PublicationUrl) {
+        self.clear_chat_selection();
         self.completion = None;
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
@@ -116,6 +117,7 @@ impl DesktopReader {
         if self.pending_reading_unit_turn.is_some() {
             return;
         }
+        self.clear_chat_selection();
         self.ui.focus_footnotes_visible = false;
         self.ui.focus_footnote_scroll_delta = 0.0;
         self.focus_toc_override = None;
@@ -191,12 +193,15 @@ impl DesktopReader {
             return;
         };
         let viewport = viewport.with_raster_scale(raster_scale);
-        if self
-            .semantic_layout
-            .pending_viewport
-            .unwrap_or(self.reader.viewport())
-            == viewport
-        {
+        let pending = self.semantic_layout.pending_viewport;
+        if pending.unwrap_or(self.reader.viewport()) == viewport {
+            if pending.is_none() {
+                // This frame can display the new pagination at the actual viewport size.
+                self.semantic_layout.paginated_anchor = None;
+                if self.semantic_layout.chat_selection_reflow.as_ref().is_some_and(|anchor| anchor.installed) {
+                    self.semantic_layout.chat_selection_reflow = None;
+                }
+            }
             return;
         }
         self.canvas_size = Some((width, height));
@@ -250,8 +255,10 @@ impl DesktopReader {
     ) {
         self.focus_toc_override = None;
         if snapshot_reanchors_focus(effects) {
+            self.clear_chat_selection();
             self.focus_reflow_anchor = None;
             self.semantic_layout.viewport_anchor = None;
+            self.semantic_layout.paginated_anchor = None;
         }
         let previous_section = self.snapshot.location.section_index;
         let target_position = rebook_reader::ReaderPosition {

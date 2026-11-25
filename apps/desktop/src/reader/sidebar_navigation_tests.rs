@@ -1084,6 +1084,496 @@ fn closing_the_left_sidebar_keeps_classic_scroll_text_stationary() {
     );
 }
 
+fn classic_geometry_frame(
+    ctx: &egui::Context,
+    reader: &mut DesktopReader,
+    size: egui::Vec2,
+    time: &mut f64,
+) {
+    *time += 0.05;
+    reader.ui.last_motion_tick = Some(Instant::now() - Duration::from_millis(50));
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            time: Some(*time),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |root| {
+            reader.ui(root, None, false);
+        },
+    );
+    output.textures_delta.clear();
+    drop(reader.page_scene());
+}
+
+fn settle_classic_geometry(
+    ctx: &egui::Context,
+    reader: &mut DesktopReader,
+    size: egui::Vec2,
+    time: &mut f64,
+) {
+    for _ in 0..32 {
+        classic_geometry_frame(ctx, reader, size, time);
+        if reader.ui.sidebar_motion.is_animating() || reader.ui.assistant_motion.is_animating() {
+            continue;
+        }
+        if reader.semantic_layout.pending_viewport.is_some() {
+            super::semantic_layout::tests::finish_test_viewport_reflow(reader);
+            continue;
+        }
+        classic_geometry_frame(ctx, reader, size, time);
+        return;
+    }
+    panic!("classic viewport did not settle: {}", state_line(reader));
+}
+
+fn classic_geometry_fixture(spread: SpreadMode) -> (DesktopReader, Section) {
+    classic_geometry_fixture_with_typesetting(spread, rebook_layout::TypesettingMode::Unified)
+}
+
+fn classic_geometry_fixture_with_typesetting(
+    spread: SpreadMode,
+    typesetting: rebook_layout::TypesettingMode,
+) -> (DesktopReader, Section) {
+    let (mut reader, mut section) = chapter_book(ReadingMode::Classic);
+    if spread != SpreadMode::Scroll {
+        // A paragraph spanning several pages exposes source-offset drift that
+        // fixtures made solely of short, unbroken paragraphs cannot detect.
+        if let Block::Text(block) = &mut section.blocks[0] {
+            if let Inline::Text(run) = &mut block.content[0] {
+                run.text = run.text.repeat(100);
+                block.source.as_mut().unwrap().end.text_offset = run.text.chars().count() as u64;
+            }
+        }
+        let source = Arc::new(SingleSpineBook {
+            book: reader.source.book().clone(),
+            section: section.clone(),
+        });
+        reader = source_reader(source, ReadingMode::Classic, None, None);
+    }
+    let mut style = reader.reader.style();
+    style.spread = spread;
+    style.typesetting.mode = typesetting;
+    let snapshot = reader.reader.set_style(style).unwrap();
+    reader.apply_snapshot(snapshot, SnapshotEffects::static_content_change());
+    reader.ui.sidebar_open = false;
+    reader.ui.sidebar_motion = Motion::settled(0.0);
+    (reader, section)
+}
+
+fn settle_paginated_geometry(
+    ctx: &egui::Context,
+    reader: &mut DesktopReader,
+    size: egui::Vec2,
+    time: &mut f64,
+) {
+    let before = reader.reader.paginated_text_start().unwrap().anchor;
+    let old_baseline = reader.reader.current_page().source_text_baseline(&before).unwrap();
+    settle_classic_geometry(ctx, reader, size, time);
+    let page = reader.reader.current_page();
+    let baseline = page.source_text_baseline(&before).expect("old first line must remain visible");
+    let leading = page.source_text_baseline(&page.leading_source_range().unwrap()).unwrap();
+    assert!(
+        (baseline - leading).abs() < 1.0 && (baseline - old_baseline).abs() < 1.0,
+        "{size:?} moved {before:?} from {old_baseline} to {baseline}, first line at {leading}"
+    );
+}
+
+#[test]
+fn classic_reflow_paginated_sidebar_and_resize_keep_the_visible_page_anchor() {
+    for spread in [SpreadMode::Single, SpreadMode::Double] {
+        let ctx = egui::Context::default();
+        let (mut reader, _) = classic_geometry_fixture(spread);
+        let mut time = 0.0;
+        settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+        let pages = reader.reader.current_reading_unit_pages().unwrap();
+        let position = pages
+            .iter()
+            .skip(2)
+            .find(|entry| {
+                entry
+                    .page
+                    .leading_source_range()
+                    .is_some_and(|range| range.start.text_offset > 0)
+            })
+            .expect("fixture must begin inside a paragraph")
+            .position;
+        let snapshot = reader.reader.set_visible_position(position).unwrap();
+        reader.apply_snapshot(snapshot, SnapshotEffects::navigation());
+        for _ in 0..3 {
+            reader.set_sidebar_open(true);
+            settle_paginated_geometry(&ctx, &mut reader, SCREEN, &mut time);
+            reader.set_sidebar_open(false);
+            settle_paginated_geometry(&ctx, &mut reader, SCREEN, &mut time);
+            reader.toggle_assistant_panel(AssistantPanel::Chat);
+            settle_paginated_geometry(&ctx, &mut reader, SCREEN, &mut time);
+            reader.close_assistant_panel();
+            settle_paginated_geometry(&ctx, &mut reader, SCREEN, &mut time);
+            for size in [
+                egui::vec2(1000.0, 650.0),
+                egui::vec2(1920.0, 1080.0),
+                SCREEN,
+            ] {
+                settle_paginated_geometry(&ctx, &mut reader, size, &mut time);
+            }
+        }
+    }
+}
+
+#[test]
+fn classic_reflow_reopening_the_sidebar_preserves_the_first_line_and_all_page_text() {
+    for spread in [SpreadMode::Single, SpreadMode::Double] {
+        let ctx = egui::Context::default();
+        let (mut reader, _) = classic_geometry_fixture(spread);
+        let mut time = 0.0;
+        // Keep the single-page case below the maximum text column width when open.
+        let size = if spread == SpreadMode::Single {
+            egui::vec2(950.0, 700.0)
+        } else {
+            SCREEN
+        };
+        reader.ui.sidebar_pinned = true;
+        settle_classic_geometry(&ctx, &mut reader, size, &mut time);
+        let wide_pages = reader.reader.current_reading_unit_pages().unwrap();
+        reader.set_sidebar_open(true);
+        settle_classic_geometry(&ctx, &mut reader, size, &mut time);
+        let pages = reader.reader.current_reading_unit_pages().unwrap();
+        let (position, narrow_start) = pages.iter().find_map(|narrow| {
+            let narrow_start = narrow.page.leading_source_range()?.start;
+            let wide = wide_pages.iter().find(|page| page.page.contains_source_anchor(&narrow_start))?;
+            let wide_start = wide.page.leading_source_range()?.start;
+            (!narrow.page.contains_source_anchor(&wide_start))
+                .then_some((narrow.position, narrow_start))
+        }).unwrap_or_else(|| panic!("{spread:?}: the wider layout must expose text from before a narrow page"));
+        let snapshot = reader.reader.set_visible_position(position).unwrap();
+        reader.apply_snapshot(snapshot, SnapshotEffects::navigation());
+
+        reader.set_sidebar_open(false);
+        settle_paginated_geometry(&ctx, &mut reader, size, &mut time);
+        let text = |pages: &[rebook_reader::ReaderSectionPage]| {
+            let mut text = String::new();
+            for entry in pages {
+                for i in 0..entry.page.text_region_count() {
+                    if let Some(bytes) = entry.page.text_region_visible_range(i) {
+                        text.push_str(&entry.page.text_region_text(i).unwrap()[bytes]);
+                    }
+                }
+            }
+            text
+        };
+        assert_eq!(text(&reader.reader.current_reading_unit_pages().unwrap()), text(&wide_pages));
+
+        reader.set_sidebar_open(true);
+        settle_paginated_geometry(&ctx, &mut reader, size, &mut time);
+        assert_eq!(reader.reader.current_page().leading_source_range().unwrap().start, narrow_start);
+        assert_eq!(text(&reader.reader.current_reading_unit_pages().unwrap()), text(&pages));
+
+        // Navigating to a different page establishes a new reading position.
+        let other = pages.iter().find(|entry| entry.position.page_index == 0).unwrap();
+        let snapshot = reader.reader.set_visible_position(other.position).unwrap();
+        reader.apply_snapshot(snapshot, SnapshotEffects::navigation());
+        reader.set_sidebar_open(false);
+        settle_paginated_geometry(&ctx, &mut reader, size, &mut time);
+    }
+}
+
+#[test]
+fn classic_reflow_quote_keeps_a_right_page_selection_visible() {
+    let ctx = egui::Context::default();
+    let (mut reader, _) = classic_geometry_fixture(SpreadMode::Double);
+    let mut time = 0.0;
+    settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+    let spread = reader.reader.current_spread().unwrap();
+    let mut range = spread.secondary.unwrap().leading_source_range().unwrap();
+    range.start.text_offset = range.end.text_offset - 32;
+    reader.selection = Some(ReaderSelection {
+        ranges: vec![range.clone()],
+        text: "Selected near the end of the right page.".into(),
+        rects: Vec::new(),
+    });
+    assert!(reader.quote_selection_to_chat());
+    assert!(reader.selection.is_none());
+    classic_geometry_frame(&ctx, &mut reader, SCREEN, &mut time);
+    let viewport = reader.semantic_layout.pending_viewport.unwrap();
+    let mut ordinary = reader.reader.prepare_resize_request(viewport, None).prepare().unwrap();
+    let ordinary_spread = ordinary.current_spread().unwrap();
+    assert!(!ordinary_spread.primary.contains_source_anchor(&range.start));
+    assert!(!ordinary_spread.secondary.is_some_and(|page| page.contains_source_anchor(&range.start)));
+
+    settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+    let spread = reader.reader.current_spread().unwrap();
+    let contains = |anchor: &SourceAnchor| {
+        spread.primary.contains_source_anchor(anchor)
+            || spread.secondary.as_ref().is_some_and(|page| page.contains_source_anchor(anchor))
+    };
+    assert!(contains(&range.start));
+    let mut last = range.end.clone();
+    last.text_offset -= 1;
+    assert!(contains(&last));
+    assert_eq!(reader.focused_mark.as_ref().unwrap().ranges, vec![range]);
+    assert!(reader.semantic_layout.chat_selection_reflow.is_none());
+    reader.close_assistant_panel();
+    assert!(reader.focused_mark.is_none());
+}
+
+#[test]
+fn classic_reflow_explain_keeps_the_selected_lines_inside_the_scroll_viewport() {
+    let ctx = egui::Context::default();
+    let (mut reader, section) = classic_geometry_fixture(SpreadMode::Scroll);
+    let mut time = 0.0;
+    let size = egui::vec2(1050.0, 440.0);
+    settle_classic_geometry(&ctx, &mut reader, size, &mut time);
+    let range = range_at(&section, "p10");
+    let (_, bottom) = reader.current_scroll_layout().unwrap()
+        .selected_text_bounds(std::slice::from_ref(&range)).unwrap();
+    let viewport = reader.scroll_viewport.unwrap();
+    let target = bottom - viewport.size.y + 8.0;
+    reader.pending_keyboard_scroll_delta = viewport.offset_y - target;
+    for _ in 0..12 {
+        classic_geometry_frame(&ctx, &mut reader, size, &mut time);
+    }
+    assert!((reader.scroll_viewport.unwrap().offset_y - target).abs() < 1.5);
+    reader.selection = Some(ReaderSelection {
+        ranges: vec![range.clone()],
+        text: "Selected near the bottom of the viewport.".into(),
+        rects: Vec::new(),
+    });
+    reader.explain_selection();
+    settle_classic_geometry(&ctx, &mut reader, size, &mut time);
+    let viewport = reader.scroll_viewport.unwrap();
+    let (top, bottom) = reader.current_scroll_layout().unwrap()
+        .selected_text_bounds(std::slice::from_ref(&range)).unwrap();
+    assert!(top >= viewport.offset_y - 1.5);
+    assert!(bottom <= viewport.offset_y + viewport.size.y + 1.5);
+    assert_eq!(reader.focused_mark.as_ref().unwrap().ranges, vec![range]);
+    assert!(reader.semantic_layout.chat_selection_reflow.is_none());
+}
+
+fn classic_anchor_screen_y(reader: &mut DesktopReader, anchor: &FocusReflowAnchor) -> f32 {
+    let viewport = reader.scroll_viewport.unwrap();
+    let layout = reader.current_scroll_layout().unwrap();
+    let top = if anchor.uses_baseline {
+        layout.source_baseline(&anchor.range)
+    } else {
+        layout.source_top(&anchor.range)
+    }
+    .unwrap();
+    top + reader.scroll_content_padding(viewport.size.y) - viewport.offset_y
+}
+
+#[test]
+fn classic_reflow_scroll_sidebar_and_resize_round_trips_keep_the_reading_baseline() {
+    let ctx = egui::Context::default();
+    let (mut reader, section) = classic_geometry_fixture(SpreadMode::Scroll);
+    let mut time = 0.0;
+    settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+    let top = reader
+        .current_scroll_layout()
+        .unwrap()
+        .source_top(&range_at(&section, "p5"))
+        .unwrap();
+    reader.pending_keyboard_scroll_delta = reader.scroll_viewport.unwrap().offset_y - top - 60.0;
+    for _ in 0..12 {
+        classic_geometry_frame(&ctx, &mut reader, SCREEN, &mut time);
+    }
+    let anchor = reader.capture_classic_reflow_anchor().unwrap();
+    for _ in 0..3 {
+        reader.set_sidebar_open(true);
+        settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+        reader.set_sidebar_open(false);
+        settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+        reader.toggle_assistant_panel(AssistantPanel::Chat);
+        settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+        reader.close_assistant_panel();
+        settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+        for size in [
+            egui::vec2(1000.0, 650.0),
+            egui::vec2(1920.0, 1080.0),
+            SCREEN,
+        ] {
+            settle_classic_geometry(&ctx, &mut reader, size, &mut time);
+            let drift = classic_anchor_screen_y(&mut reader, &anchor) - anchor.screen_y;
+            assert!(
+                drift.abs() < 1.5,
+                "{size:?}: original visible text drifted by {drift}"
+            );
+        }
+    }
+}
+
+#[test]
+fn classic_reflow_scroll_input_while_resize_is_pending_updates_the_reading_position() {
+    let ctx = egui::Context::default();
+    let (mut reader, section) = classic_geometry_fixture(SpreadMode::Scroll);
+    let mut time = 0.0;
+    settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+    let top = reader
+        .current_scroll_layout()
+        .unwrap()
+        .source_top(&range_at(&section, "p5"))
+        .unwrap();
+    reader.pending_keyboard_scroll_delta = reader.scroll_viewport.unwrap().offset_y - top - 60.0;
+    for _ in 0..12 {
+        classic_geometry_frame(&ctx, &mut reader, SCREEN, &mut time);
+    }
+    let resized = egui::vec2(1280.0, 800.0);
+    classic_geometry_frame(&ctx, &mut reader, resized, &mut time);
+    let before = reader.scroll_viewport.unwrap().offset_y;
+    assert!(reader.semantic_layout.pending_viewport.is_some());
+    reader.pending_keyboard_scroll_delta = -120.0;
+    for _ in 0..12 {
+        classic_geometry_frame(&ctx, &mut reader, resized, &mut time);
+    }
+    let after = reader.scroll_viewport.unwrap().offset_y;
+    assert!(
+        (after - before - 120.0).abs() < 1.5,
+        "pending reflow discarded user scrolling: {before} -> {after}"
+    );
+    let anchor = reader.capture_classic_reflow_anchor().unwrap();
+    settle_classic_geometry(&ctx, &mut reader, resized, &mut time);
+    let drift = classic_anchor_screen_y(&mut reader, &anchor) - anchor.screen_y;
+    assert!(
+        drift.abs() < 1.5,
+        "reflow restored the pre-scroll position: {drift}"
+    );
+}
+
+#[test]
+fn classic_reflow_drag_maximize_restore_and_dpi_reject_stale_layouts() {
+    for typesetting in [
+        rebook_layout::TypesettingMode::Book,
+        rebook_layout::TypesettingMode::Unified,
+    ] {
+        for spread in [SpreadMode::Single, SpreadMode::Double, SpreadMode::Scroll] {
+            let ctx = egui::Context::default();
+            let (mut reader, section) =
+                classic_geometry_fixture_with_typesetting(spread, typesetting);
+            let mut time = 0.0;
+            settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+            let scroll_anchor = if spread == SpreadMode::Scroll {
+                let top = reader
+                    .current_scroll_layout()
+                    .unwrap()
+                    .source_top(&range_at(&section, "p5"))
+                    .unwrap();
+                reader.pending_keyboard_scroll_delta =
+                    reader.scroll_viewport.unwrap().offset_y - top - 60.0;
+                for _ in 0..12 {
+                    classic_geometry_frame(&ctx, &mut reader, SCREEN, &mut time);
+                }
+                Some(reader.capture_classic_reflow_anchor().unwrap())
+            } else {
+                let pages = reader.reader.current_reading_unit_pages().unwrap();
+                let snapshot = reader
+                    .reader
+                    .set_visible_position(pages[2].position)
+                    .unwrap();
+                reader.apply_snapshot(snapshot, SnapshotEffects::navigation());
+                None
+            };
+            let installed = reader.reader.viewport();
+            let mut last_size = SCREEN;
+            // Live drag events coalesce without compiling/replacing the body.
+            for step in 1..=8 {
+                last_size = SCREEN - egui::vec2(step as f32 * 15.0, step as f32 * 10.0);
+                classic_geometry_frame(&ctx, &mut reader, last_size, &mut time);
+                assert_eq!(reader.reader.viewport(), installed);
+                if let Some(anchor) = &scroll_anchor {
+                    assert!(
+                        (classic_anchor_screen_y(&mut reader, anchor) - anchor.screen_y).abs()
+                            < 1.5
+                    );
+                }
+            }
+            let target = reader.semantic_layout.pending_viewport.unwrap();
+            let prepared = super::semantic_layout::tests::TestViewportReflow::prepare(&mut reader);
+            reader.resize_canvas(0.0, 0.0, 1.0); // Minimize must not discard the pending reading position.
+            assert_eq!(reader.semantic_layout.pending_viewport, Some(target));
+            last_size -= egui::vec2(20.0, 10.0);
+            classic_geometry_frame(&ctx, &mut reader, last_size, &mut time);
+            assert!(!prepared.adopt(&mut reader));
+            assert_eq!(
+                reader.reader.viewport(),
+                installed,
+                "stale drag result must not replace the visible body"
+            );
+            for size in [last_size, egui::vec2(1920.0, 1080.0), SCREEN] {
+                if let Some(anchor) = &scroll_anchor {
+                    settle_classic_geometry(&ctx, &mut reader, size, &mut time);
+                    assert!(
+                        (classic_anchor_screen_y(&mut reader, anchor) - anchor.screen_y).abs()
+                            < 1.5,
+                        "{spread:?}, {typesetting:?}, {size:?}"
+                    );
+                } else {
+                    settle_paginated_geometry(&ctx, &mut reader, size, &mut time);
+                }
+            }
+            for scale in [2.0, 1.0] {
+                ctx.set_pixels_per_point(scale);
+                if let Some(anchor) = &scroll_anchor {
+                    settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+                    let drift = classic_anchor_screen_y(&mut reader, anchor) - anchor.screen_y;
+                    assert!(drift.abs() < 1.5, "DPI scale={scale}, {spread:?}, {typesetting:?}, drift={drift}, original={:?}, captured={:?}", anchor.range, reader.capture_classic_reflow_anchor().map(|anchor| anchor.range));
+                } else {
+                    settle_paginated_geometry(&ctx, &mut reader, SCREEN, &mut time);
+                }
+                assert_eq!(reader.reader.viewport().raster_scale, scale);
+            }
+        }
+    }
+}
+
+#[test]
+fn classic_reflow_pagination_follows_new_navigation_instead_of_the_old_resize_anchor() {
+    for spread in [SpreadMode::Single, SpreadMode::Double] {
+        let ctx = egui::Context::default();
+        let (mut reader, _) = classic_geometry_fixture(spread);
+        let mut time = 0.0;
+        settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+        let pages = reader.reader.current_reading_unit_pages().unwrap();
+        let snapshot = reader
+            .reader
+            .set_visible_position(pages[2].position)
+            .unwrap();
+        reader.apply_snapshot(snapshot, SnapshotEffects::navigation());
+        let smaller = egui::vec2(1000.0, 650.0);
+        settle_classic_geometry(&ctx, &mut reader, smaller, &mut time);
+        let result = reader.reader.turn_page(PageDirection::Next).unwrap();
+        reader.apply_snapshot(result.snapshot, SnapshotEffects::navigation());
+        for size in [SCREEN, smaller, SCREEN] {
+            settle_paginated_geometry(&ctx, &mut reader, size, &mut time);
+        }
+    }
+}
+
+#[test]
+fn classic_reflow_scroll_preview_obeys_bottom_bounds_when_the_window_grows() {
+    let ctx = egui::Context::default();
+    let (mut reader, _) = classic_geometry_fixture(SpreadMode::Scroll);
+    let mut time = 0.0;
+    settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+    let viewport = reader.scroll_viewport.unwrap();
+    let maximum =
+        (reader.current_scroll_layout().unwrap().content_height - viewport.size.y).max(0.0);
+    reader.pending_keyboard_scroll_delta = viewport.offset_y - maximum + 2.0;
+    for _ in 0..12 {
+        classic_geometry_frame(&ctx, &mut reader, SCREEN, &mut time);
+    }
+    let taller = egui::vec2(SCREEN.x, SCREEN.y + 200.0);
+    for _ in 0..3 {
+        classic_geometry_frame(&ctx, &mut reader, taller, &mut time);
+        let viewport = reader.scroll_viewport.unwrap();
+        let content = reader.current_scroll_layout().unwrap().content_height;
+        assert!(
+            viewport.offset_y <= (content - viewport.size.y).max(0.0) + 0.5,
+            "preview exceeds classic content bounds"
+        );
+    }
+    settle_classic_geometry(&ctx, &mut reader, taller, &mut time);
+    settle_classic_geometry(&ctx, &mut reader, SCREEN, &mut time);
+}
+
 fn state_line(reader: &DesktopReader) -> String {
     let visible = visible_nodes(reader);
     format!(
