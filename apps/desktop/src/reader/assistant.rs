@@ -29,6 +29,12 @@ use crate::plugins::{
     set_pdf_ocr_view_mode,
 };
 
+/// Clipboard images one paste brings, read before the worker starts.
+enum ChatClipboard {
+    Pixels(Vec<crate::platform::ClipboardImage>),
+    Files(Vec<std::path::PathBuf>),
+}
+
 impl DesktopReader {
     pub(super) fn start_pdf_native(&mut self, action: super::PdfNativeAction) {
         if self.format != rebook_formats::BookFormat::Pdf
@@ -233,6 +239,41 @@ impl DesktopReader {
         );
         self.chat.references.push(ChatReference { id, ..reference });
         self.chat.move_cursor_to_end = true;
+    }
+
+    /// Attach the active text selection as the chat reference, opening and
+    /// focusing the chat panel if needed.
+    pub(super) fn quote_selection_to_chat(&mut self) -> bool {
+        let Some(selection) = self.selection.clone() else {
+            return false;
+        };
+        let selected_text = selection.text.trim();
+        if selected_text.is_empty() {
+            return false;
+        }
+        let english = self.language.resolved() == crate::preferences::AppLanguage::English;
+        let Some(reference) = selection_reference(
+            self.source.as_ref(),
+            &selection.ranges,
+            selected_text,
+            english,
+        ) else {
+            return false;
+        };
+        self.sync_focus_chat_session();
+        self.chat.references.retain(|existing| {
+            !existing.id.starts_with("focus:") && !existing.id.starts_with("selection:")
+        });
+        self.chat.references.push(reference);
+        self.cancel_text_selection();
+        if self.is_focus_mode() {
+            self.open_focus_assistant();
+        } else {
+            self.ui.assistant_presentation = super::AssistantPresentation::Sidebar;
+            self.open_assistant_panel(AssistantPanel::Chat);
+        }
+        self.chat.move_cursor_to_end = true;
+        true
     }
 
     #[allow(
@@ -1469,7 +1510,7 @@ impl DesktopReader {
 
     /// Whether the assistant panel is open. Closing keeps the panel in place until the
     /// motion settles, so the target has to be checked as well.
-    fn assistant_panel_is_open(&self) -> bool {
+    pub(super) fn assistant_panel_is_open(&self) -> bool {
         self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5
     }
 
@@ -1490,7 +1531,11 @@ impl DesktopReader {
         ctx.memory(|memory| memory.has_focus(id) || memory.focused().is_none())
     }
 
-    /// Coalesce paste shortcuts while a bounded batch is being prepared.
+    /// Read the clipboard on the event-loop thread, then prepare the paste off it.
+    ///
+    /// The read stays on this thread because egui-winit reads the same clipboard
+    /// for the paste event right after this handler, and two threads reading the
+    /// Windows clipboard at once corrupt its heap.
     pub(crate) fn paste_chat_images(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -1499,6 +1544,13 @@ impl DesktopReader {
         if self.chat.paste_task.is_pending() {
             return;
         }
+        let pasted = match crate::platform::chat_content() {
+            crate::platform::ClipboardContent::Images(images) => ChatClipboard::Pixels(images),
+            crate::platform::ClipboardContent::Files(paths) => ChatClipboard::Files(paths),
+            crate::platform::ClipboardContent::Text | crate::platform::ClipboardContent::None => {
+                return;
+            }
+        };
         let ordinal = self.chat.pending_images.len();
         self.chat.paste_task.begin(ordinal);
         let request = self.chat.paste_task.take_pending().unwrap();
@@ -1506,7 +1558,10 @@ impl DesktopReader {
         let proxy = proxy.clone();
         let worker = runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let images = crate::platform::images_without_text();
+                let images = match pasted {
+                    ChatClipboard::Pixels(images) => images,
+                    ChatClipboard::Files(paths) => crate::platform::read_image_files(&paths),
+                };
                 crate::plugins::chat_media::validate_image_count(ordinal + images.len())?;
                 images
                     .into_iter()

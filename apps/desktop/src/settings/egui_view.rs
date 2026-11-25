@@ -350,6 +350,10 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
                 ShortcutAction::ToggleTranslation,
                 language.text("翻译开关", "Toggle translation"),
             ),
+            (
+                ShortcutAction::FocusChat,
+                language.text("聚焦对话输入", "Focus chat input"),
+            ),
         ],
     );
     ui.add_space(12.0);
@@ -394,10 +398,6 @@ fn focus_shortcut_group(ui: &mut egui::Ui, state: &mut SettingsFeature, language
             (
                 ShortcutAction::FocusActions,
                 language.text("唤起工具栏", "Open action toolbar"),
-            ),
-            (
-                ShortcutAction::FocusChat,
-                language.text("唤起对话框", "Open chat panel"),
             ),
             (
                 ShortcutAction::FocusHighlight,
@@ -461,13 +461,28 @@ fn shortcut_group(
             .show(ui, |ui| {
                 for &(action, label) in actions {
                     settings_row_label(ui, label);
-                    settings_row_control_sized(ui, SHORTCUT_CONTROL_WIDTH, |ui| {
-                        shortcut_binding_button(ui, state, action);
+                    ui.horizontal(|ui| {
+                        settings_row_control_sized(ui, SHORTCUT_CONTROL_WIDTH, |ui| {
+                            shortcut_binding_button(ui, state, action);
+                        });
+                        if let Some(help) = shortcut_help_text(action, state.draft_language) {
+                            settings_help_icon(ui, help);
+                        }
                     });
                     ui.end_row();
                 }
             });
     });
+}
+
+fn shortcut_help_text(action: ShortcutAction, language: AppLanguage) -> Option<&'static str> {
+    match action {
+        ShortcutAction::FocusChat => Some(language.text(
+            "打开并聚焦输入框、划选时引用文字、在正文与输入框间切焦点",
+            "Open and focus chat input, quote selection, or switch focus between page and input",
+        )),
+        _ => None,
+    }
 }
 
 fn shortcut_label_min_width() -> f32 {

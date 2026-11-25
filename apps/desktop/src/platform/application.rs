@@ -726,8 +726,9 @@ impl ApplicationHandler<UserEvent> for Application {
         {
             self.app.paste_chat_images(&self.runtime, &self.proxy);
             state.window.request_redraw();
-            // Keep egui's ordinary text paste. The worker only accepts a
-            // clipboard without text, and wakes the event loop on completion.
+            // Keep egui's ordinary text paste. The clipboard is read here, on
+            // the same thread egui-winit reads it on, and the worker only
+            // decodes what that read captured.
         }
         let response = state.egui_state.on_window_event(&state.window, &event);
         // RedrawRequested is already being serviced below. egui-winit marks

@@ -1421,7 +1421,7 @@ impl DesktopReader {
         if self.focus_image_preview_shortcut(ctx, interaction_blocked) {
             return;
         }
-        if self.focus_chat_shortcut(ctx, interaction_blocked) {
+        if self.chat_panel_shortcut(ctx, interaction_blocked) {
             return;
         }
         if self.layout_shortcut(ctx, interaction_blocked) {
@@ -1935,11 +1935,12 @@ impl DesktopReader {
         true
     }
 
-    fn focus_chat_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
-        if !self.is_focus_mode()
-            || interaction_blocked
+    /// Tab summons the chat panel in both reading modes. Focus mode opens it
+    /// on the focused paragraph; the classic mode keeps the book's own
+    /// conversation and whatever paragraph references a click attached.
+    fn chat_panel_shortcut(&mut self, ctx: &egui::Context, interaction_blocked: bool) -> bool {
+        if interaction_blocked
             || self.ui.overlay_visible()
-            || self.ui.sidebar_open
             || self.preview_is_open()
             || self.annotation_note_draft.is_some()
         {
@@ -1947,6 +1948,16 @@ impl DesktopReader {
         }
         let open = self.focus_assistant_popup_visible() && self.ui.assistant_motion.target > 0.5;
         let input_focused = ctx.text_edit_focused();
+        // A field outside the composer keeps Tab for itself; the composer
+        // hands it to this shortcut through the suggestion check below.
+        if input_focused
+            && self
+                .chat
+                .composer_id
+                .is_none_or(|id| !ctx.memory(|memory| memory.has_focus(id)))
+        {
+            return false;
+        }
         let suggestions_active = if self.ui.assistant_panel.is_some() && input_focused {
             let (references, commands) = self.assistant_suggestions(self.chat.task.is_pending());
             active_suggestion_count(&references, &commands) > 0
@@ -1974,7 +1985,16 @@ impl DesktopReader {
         if action != FocusChatShortcutAction::IgnoreRepeat {
             self.ui.focus_navigation_repeat.held = None;
             self.ui.focus_actions_visible = false;
-            if self.assistant_is_docked() && self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5 {
+            let has_classic_selection = !self.is_focus_mode()
+                && !input_focused
+                && self.selection_toolbar_visible
+                && self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| !selection.text.trim().is_empty());
+            if has_classic_selection {
+                self.quote_selection_to_chat();
+            } else if self.assistant_is_docked() && self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5 {
                 if input_focused {
                     self.ui.assistant_keyboard_focus = false;
                     self.chat.move_cursor_to_end = false;
@@ -1986,11 +2006,14 @@ impl DesktopReader {
             } else if action == FocusChatShortcutAction::Close && open {
                 self.close_assistant_panel();
                 ctx.memory_mut(egui::Memory::stop_text_input);
-            } else {
+            } else if self.is_focus_mode() {
                 self.close_focus_footnotes();
                 self.ui.assistant_presentation = super::AssistantPresentation::Popup;
                 self.attach_current_focus_reference();
                 self.open_focus_assistant();
+            } else {
+                self.toggle_assistant_panel(AssistantPanel::Chat);
+                ctx.memory_mut(egui::Memory::stop_text_input);
             }
             ctx.request_repaint();
         }
@@ -6046,6 +6069,7 @@ impl DesktopReader {
         let mut open_note = false;
         let mut save_note = false;
         let mut cancel_note = false;
+        let mut quote_selection = false;
         let mut explain = false;
         egui::Area::new(egui::Id::unique("selection-actions"))
             .order(egui::Order::Tooltip)
@@ -6071,6 +6095,9 @@ impl DesktopReader {
                                 .clicked();
                             open_note = icon_button(ui, Icon::SelectionNote)
                                 .on_hover_text(self.language.text("添加批注", "Add note"))
+                                .clicked();
+                            quote_selection = icon_button(ui, Icon::MessageSquarePlus)
+                                .on_hover_text(self.language.text("引用", "Quote"))
                                 .clicked();
                             explain = icon_button(ui, Icon::SelectionAi)
                                 .on_hover_text(self.language.text("解释", "Explain"))
@@ -6104,6 +6131,8 @@ impl DesktopReader {
             self.create_highlight(note);
         } else if cancel_note {
             self.annotation_note_draft = None;
+        } else if quote_selection {
+            self.quote_selection_to_chat();
         } else if explain {
             self.explain_selection();
         }
