@@ -3,9 +3,9 @@ use sha2::{Digest, Sha256};
 
 pub fn download_builder() -> reqwest::ClientBuilder {
     super::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .read_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(600))
 }
 
 pub async fn fetch_sized_body(

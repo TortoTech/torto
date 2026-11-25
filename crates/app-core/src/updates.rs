@@ -216,14 +216,16 @@ pub async fn check_gitee_platform(
     {
         return Ok(None);
     }
-    // The sync job uploads this marker last. No marker means an incomplete mirror.
-    let marker_url = release
+    // The sync job uploads this marker last. If this platform's marker is absent,
+    // no update is ready for this platform on Gitee yet.
+    let Some(marker_url) = release
         .assets
         .iter()
         .find(|asset| asset.name == platform.manifest())
-        .ok_or_else(|| "The Gitee release has not finished synchronization".to_string())?
-        .browser_download_url
-        .clone();
+        .map(|asset| asset.browser_download_url.clone())
+    else {
+        return Ok(None);
+    };
     validate_release_url(
         &marker_url,
         "gitee.com",
@@ -453,11 +455,9 @@ pub fn release_from_github_platform(
             }
         });
     let Some(asset) = asset else {
-        // Existing releases can be newer than this client without shipping an IPA.
-        if platform == Platform::IosArm64 {
-            return Ok(None);
-        }
-        return Err("The latest release does not include an installer for this platform".into());
+        // Releases can be published before every platform's installer is uploaded,
+        // or without shipping an installer for this platform at all.
+        return Ok(None);
     };
     validate_release_url(
         &asset.browser_download_url,
@@ -772,7 +772,8 @@ mod mobile_tests {
                 "0.9.0",
                 Platform::AndroidX64
             )
-            .is_err()
+            .unwrap()
+            .is_none()
         );
         let mut invalid = json;
         invalid["assets"][0]["digest"] = serde_json::Value::Null;

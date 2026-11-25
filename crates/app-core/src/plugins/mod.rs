@@ -651,7 +651,7 @@ impl PluginSettings {
             return;
         };
         if semantic_layout::layout_model_protocol(provider, &layout.model)
-            == semantic_layout::LayoutModelProtocol::Chat
+            != semantic_layout::LayoutModelProtocol::Decision
         {
             layout.image_provider.clone_from(&layout.provider);
             layout.image_model.clone_from(&layout.model);
