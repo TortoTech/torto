@@ -4841,6 +4841,7 @@ impl DesktopReader {
             return;
         }
         let backdrop_rect = ctx.content_rect();
+        crate::app::window_chrome::dim_controls(ctx, 0.06 * progress);
         egui::Area::new(egui::Id::unique("reader-menu-backdrop"))
             .order(egui::Order::Middle)
             .fixed_pos(backdrop_rect.min)
@@ -6096,7 +6097,7 @@ impl DesktopReader {
                             open_note = icon_button(ui, Icon::SelectionNote)
                                 .on_hover_text(self.language.text("添加批注", "Add note"))
                                 .clicked();
-                            quote_selection = icon_button(ui, Icon::MessageSquarePlus)
+                            quote_selection = icon_button(ui, Icon::AtSign)
                                 .on_hover_text(self.language.text("引用", "Quote"))
                                 .clicked();
                             explain = icon_button(ui, Icon::SelectionAi)

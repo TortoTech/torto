@@ -347,12 +347,12 @@ fn shortcut_settings(ui: &mut egui::Ui, state: &mut SettingsFeature) {
             (ShortcutAction::Search, language.text("搜索", "Search")),
             (ShortcutAction::Copy, language.text("复制", "Copy")),
             (
-                ShortcutAction::ToggleTranslation,
-                language.text("翻译开关", "Toggle translation"),
-            ),
-            (
                 ShortcutAction::FocusChat,
                 language.text("聚焦对话输入", "Focus chat input"),
+            ),
+            (
+                ShortcutAction::ToggleTranslation,
+                language.text("翻译开关", "Toggle translation"),
             ),
         ],
     );
@@ -457,14 +457,13 @@ fn shortcut_group(
         egui::Grid::new(grid_id)
             .num_columns(2)
             .min_col_width(label_min_width)
+            .min_row_height(32.0)
             .spacing([24.0, 12.0])
             .show(ui, |ui| {
                 for &(action, label) in actions {
                     settings_row_label(ui, label);
-                    ui.horizontal(|ui| {
-                        settings_row_control_sized(ui, SHORTCUT_CONTROL_WIDTH, |ui| {
-                            shortcut_binding_button(ui, state, action);
-                        });
+                    settings_row_control(ui, |ui| {
+                        shortcut_binding_button(ui, state, action);
                         if let Some(help) = shortcut_help_text(action, state.draft_language) {
                             settings_help_icon(ui, help);
                         }
@@ -2207,7 +2206,17 @@ fn settings_module_row_label(ui: &mut egui::Ui, text: &str) {
 }
 
 fn settings_row_label(ui: &mut egui::Ui, text: &str) {
-    settings_row_control(ui, |ui| field_label(ui, text));
+    let color = palette().muted;
+    let font = egui::FontId::proportional(crate::ui::scaled_font_size(12.0));
+    let galley = ui.painter().layout_no_wrap(text.into(), font, color);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(galley.size().x, 32.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let origin = egui::pos2(
+            rect.left(),
+            rect.center().y - galley.mesh_bounds.center().y,
+        );
+        ui.painter().galley(origin, galley, color);
+    }
 }
 
 fn settings_help_icon(ui: &mut egui::Ui, text: &str) {

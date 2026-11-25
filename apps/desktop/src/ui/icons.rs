@@ -14,6 +14,7 @@ pub(crate) enum Icon {
     Chart,
     Table,
     AlertCircle,
+    AtSign,
     BookOpen,
     BookText,
     Bot,
@@ -73,10 +74,11 @@ pub(crate) enum Icon {
 
 impl Icon {
     #[cfg(test)]
-    const ALL: [Self; 57] = [
+    const ALL: [Self; 58] = [
         Self::Chart,
         Self::Table,
         Self::AlertCircle,
+        Self::AtSign,
         Self::BookOpen,
         Self::BookText,
         Self::Bot,
@@ -143,6 +145,7 @@ impl Icon {
             Self::SelectionAi => ("selection-ai", include_bytes!("../../../../assets/reader-icons/ai.svg")),
 
             Self::AlertCircle => asset!("alert-circle"),
+            Self::AtSign => asset!("at-sign"),
             Self::BookOpen => asset!("book-open"),
             Self::BookText => asset!("book-text"),
             Self::Bot => asset!("bot"),
