@@ -22,7 +22,7 @@ Apply these principles when changing the shelf, statistics, reader, settings, or
 - The summary tag must be exactly `<summary>中文更新说明</summary>`. Do not rename it or add attributes; the desktop updater uses this exact marker to select notes for the current interface language.
 - Write for ordinary users. Lead with what changed in their experience and why it is useful, rather than how it was implemented.
 - Prefer plain language and avoid library names, code symbols, architecture details, and other technical terminology unless users need them to understand compatibility or take action.
-- Keep the notes concise. Use one short sentence per entry, combine closely related changes, and omit internal maintenance that has no meaningful user-facing effect.
+- Keep the notes concise and focused: each bullet should describe a single feature or a closely related set of changes rather than bundling unrelated work into one catch-all item. Use one short sentence per entry, and omit internal maintenance or toolchain upgrades that have no meaningful user-facing effect.
 - Classify changes under these headings and keep this order in both language sections:
   1. `## Feature` for new user-facing capabilities.
   2. `## Improvement` for enhancements to existing behavior, usability, performance, or quality.
