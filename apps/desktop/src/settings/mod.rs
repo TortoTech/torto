@@ -625,6 +625,7 @@ enum SettingsTab {
 enum ShortcutAction {
     Fullscreen,
     ToggleLeftSidebar,
+    ToggleRightSidebar,
     ToggleTranslation,
     Search,
     Copy,
@@ -656,6 +657,7 @@ impl ShortcutAction {
         match self {
             Self::Fullscreen => shortcuts.fullscreen,
             Self::ToggleLeftSidebar => shortcuts.toggle_left_sidebar,
+            Self::ToggleRightSidebar => shortcuts.toggle_right_sidebar,
             Self::ToggleTranslation => shortcuts.toggle_translation,
             Self::Search => shortcuts.search,
             Self::Copy => shortcuts.copy,
@@ -687,6 +689,7 @@ impl ShortcutAction {
         match self {
             Self::Fullscreen => shortcuts.fullscreen = binding,
             Self::ToggleLeftSidebar => shortcuts.toggle_left_sidebar = binding,
+            Self::ToggleRightSidebar => shortcuts.toggle_right_sidebar = binding,
             Self::ToggleTranslation => shortcuts.toggle_translation = binding,
             Self::Search => shortcuts.search = binding,
             Self::Copy => shortcuts.copy = binding,

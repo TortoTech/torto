@@ -1862,12 +1862,18 @@ impl DesktopReader {
         let action = ctx.input_mut(|input| {
             if !typing && input.consume_shortcut(&self.shortcuts.toggle_left_sidebar) {
                 Some(0)
+            } else if input.consume_shortcut(&self.shortcuts.toggle_right_sidebar) {
+                Some(1)
             } else {
                 None
             }
         });
         match action {
             Some(0) => self.set_sidebar_open(!self.ui.sidebar_open),
+            Some(1) => {
+                self.toggle_assistant_panel(AssistantPanel::Chat);
+                ctx.memory_mut(egui::Memory::stop_text_input);
+            }
             Some(_) => unreachable!(),
             None => return false,
         }
@@ -1958,7 +1964,16 @@ impl DesktopReader {
         if action != FocusChatShortcutAction::IgnoreRepeat {
             self.ui.focus_navigation_repeat.held = None;
             self.ui.focus_actions_visible = false;
-            if self.assistant_is_docked() && self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5 {
+            let has_classic_selection = !self.is_focus_mode()
+                && !input_focused
+                && self.selection_toolbar_visible
+                && self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| !selection.text.trim().is_empty());
+            if has_classic_selection {
+                self.quote_selection_to_chat();
+            } else if self.assistant_is_docked() && self.ui.assistant_panel.is_some() && self.ui.assistant_motion.target > 0.5 {
                 if input_focused {
                     self.ui.assistant_keyboard_focus = false;
                     self.chat.move_cursor_to_end = false;
@@ -4936,6 +4951,7 @@ impl DesktopReader {
         let mut open_note = false;
         let mut save_note = false;
         let mut cancel_note = false;
+        let mut quote_selection = false;
         let mut explain = false;
         egui::Area::new(egui::Id::unique("selection-actions"))
             .order(egui::Order::Tooltip)
@@ -4961,6 +4977,9 @@ impl DesktopReader {
                                 .clicked();
                             open_note = icon_button(ui, Icon::SelectionNote)
                                 .on_hover_text(self.language.text("添加批注", "Add note"))
+                                .clicked();
+                            quote_selection = icon_button(ui, Icon::MessageSquarePlus)
+                                .on_hover_text(self.language.text("引用", "Quote"))
                                 .clicked();
                             explain = icon_button(ui, Icon::SelectionAi)
                                 .on_hover_text(self.language.text("解释", "Explain"))
@@ -4994,6 +5013,8 @@ impl DesktopReader {
             self.create_highlight(note);
         } else if cancel_note {
             self.annotation_note_draft = None;
+        } else if quote_selection {
+            self.quote_selection_to_chat();
         } else if explain {
             self.explain_selection();
         }
@@ -5194,11 +5215,7 @@ impl DesktopReader {
             }
             self.finish_text_selection(x, y, false);
             if self.selected_highlight_id.is_none() {
-                if self.is_focus_mode() {
-                    self.focus_clicked_unit(x, y);
-                } else {
-                    self.attach_clicked_paragraph_reference(x, y);
-                }
+                self.focus_clicked_unit(x, y);
             }
         }
     }

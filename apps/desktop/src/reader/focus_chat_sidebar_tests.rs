@@ -964,17 +964,14 @@ fn classic_tab_opens_the_chat_panel_without_touching_the_context() {
     assert!(reader.assistant_panel_is_open());
 }
 
-/// Clicking a paragraph with the panel open hands that paragraph to the
-/// conversation; another click replaces it, and a closed panel keeps the
-/// context as it is.
+/// Pressing Tab with an active classic-mode text selection attaches that
+/// selection as the chat reference, opens the chat sidebar if closed, clears
+/// the selection, and replaces any prior selection/focus reference.
 #[test]
-fn classic_click_attaches_the_paragraph_under_the_pointer() {
+fn classic_tab_quotes_active_selection_and_opens_chat_sidebar() {
     let mut reader = classic_reader();
     let _layout = reader.current_scroll_layout().unwrap();
     let ctx = egui::Context::default();
-    let binding = reader.shortcuts.focus_chat;
-    shortcut(&mut reader, &ctx, binding);
-    assert!(reader.assistant_panel_is_open());
     let point = (0u32..64)
         .find_map(|row| {
             let y = 24.0 + row as f32 * 12.0;
@@ -984,11 +981,27 @@ fn classic_click_attaches_the_paragraph_under_the_pointer() {
                     .hit_test_canvas(x, y, true)
                     .ok()
                     .flatten()
-                    .map(|_| (x, y))
+                    .map(|hit| (x, y, hit))
             })
         })
-        .expect("the fixture page paints text to click");
-    reader.attach_clicked_paragraph_reference(point.0, point.1);
+        .expect("the fixture page paints text to select");
+    let selection = reader
+        .reader
+        .selection_between_with_granularity(
+            &point.2,
+            &point.2,
+            rebook_reader::SelectionGranularity::Paragraph,
+        )
+        .unwrap()
+        .expect("paragraph selection at hit");
+    reader.selection = Some(selection.clone());
+    reader.selection_toolbar_visible = true;
+    assert!(!reader.assistant_panel_is_open());
+
+    let binding = reader.shortcuts.focus_chat;
+    shortcut(&mut reader, &ctx, binding);
+    assert!(reader.assistant_panel_is_open());
+    assert!(reader.selection.is_none());
     assert_eq!(
         reader.chat.references.len(),
         1,
@@ -996,15 +1009,13 @@ fn classic_click_attaches_the_paragraph_under_the_pointer() {
         reader.chat.references
     );
     let reference = &reader.chat.references[0];
-    assert!(reference.id.starts_with("focus:"), "{}", reference.id);
+    assert!(reference.id.starts_with("selection:"), "{}", reference.id);
     assert!(!reference.label.is_empty());
-    assert!(reference.excerpt.is_some());
-    // Another click replaces the context instead of stacking references.
-    reader.attach_clicked_paragraph_reference(point.0, point.1);
+
+    // Quoting another selection replaces the prior selection reference.
+    reader.selection = Some(selection);
+    reader.selection_toolbar_visible = true;
+    assert!(reader.quote_selection_to_chat());
     assert_eq!(reader.chat.references.len(), 1);
-    // A closed panel leaves the context alone.
-    reader.close_assistant_panel();
-    assert!(!reader.assistant_panel_is_open());
-    reader.attach_clicked_paragraph_reference(point.0, point.1);
-    assert_eq!(reader.chat.references.len(), 1);
+    assert!(reader.selection.is_none());
 }

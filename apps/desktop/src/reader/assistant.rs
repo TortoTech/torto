@@ -1,4 +1,4 @@
-use rebook_app_core::reading_text::{block_source_range, source_range_for_node};
+use rebook_app_core::reading_text::source_range_for_node;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -241,81 +241,39 @@ impl DesktopReader {
         self.chat.move_cursor_to_end = true;
     }
 
-    /// A classic-mode click hands the paragraph under the pointer to the open
-    /// conversation, the way turning to a paragraph does in focus mode. A
-    /// closed panel and an active selection keep the context as it is: the
-    /// selection toolbar already carries its own chat actions.
-    pub(super) fn attach_clicked_paragraph_reference(&mut self, x: f32, y: f32) {
-        if self.is_focus_mode() || !self.assistant_panel_is_open() || self.selection.is_some() {
-            return;
+    /// Attach the active text selection as the chat reference, opening and
+    /// focusing the chat panel if needed.
+    pub(super) fn quote_selection_to_chat(&mut self) -> bool {
+        let Some(selection) = self.selection.clone() else {
+            return false;
+        };
+        let selected_text = selection.text.trim();
+        if selected_text.is_empty() {
+            return false;
         }
-        let Some(hit) = self.hit_test_canvas(x, y, true).ok().flatten() else {
-            return;
-        };
-        let Some(paragraph) = self
-            .reader
-            .selection_between_with_granularity(
-                &hit,
-                &hit,
-                rebook_reader::SelectionGranularity::Paragraph,
-            )
-            .ok()
-            .flatten()
-        else {
-            return;
-        };
-        let Some(range) = paragraph.ranges.first() else {
-            return;
-        };
-        let Some(section_index) = self
-            .source
-            .book()
-            .sections
-            .iter()
-            .position(|section| section.id == range.start.spine)
-        else {
-            return;
-        };
-        let node = range.start.node.clone();
-        let text = normalize_chat_reference_text(&paragraph.text);
-        if text.chars().count() < 2 {
-            return;
-        }
-        let Ok(section) = self.source.parse_section(section_index) else {
-            return;
-        };
-        let paragraph_index = section
-            .blocks
-            .iter()
-            .position(|block| {
-                block_source_range(block).is_some_and(|source| source.start.node == node)
-                    || block.text_blocks().any(|part| {
-                        part.source
-                            .as_ref()
-                            .is_some_and(|source| source.start.node == node)
-                    })
-            })
-            .map_or(1, |index| index + 1);
-        let title = section_title(self.source.as_ref(), section_index, &section.blocks);
         let english = self.language.resolved() == crate::preferences::AppLanguage::English;
-        let reference = paragraph_reference(
-            section_index,
-            paragraph_index,
-            &title,
-            &node,
-            0,
-            &text,
+        let Some(reference) = selection_reference(
+            self.source.as_ref(),
+            &selection.ranges,
+            selected_text,
             english,
-        );
+        ) else {
+            return false;
+        };
         self.sync_focus_chat_session();
-        self.chat.references.retain(|reference| {
-            !reference.id.starts_with("focus:") && !reference.id.starts_with("selection:")
+        self.chat.references.retain(|existing| {
+            !existing.id.starts_with("focus:") && !existing.id.starts_with("selection:")
         });
-        self.chat.references.push(ChatReference {
-            id: format!("focus:{section_index}:{node}"),
-            ..reference
-        });
+        self.chat.references.push(reference);
+        self.cancel_text_selection();
+        if self.is_focus_mode() {
+            self.open_focus_assistant();
+        } else {
+            self.ui.assistant_presentation = super::AssistantPresentation::Sidebar;
+            self.open_assistant_panel(AssistantPanel::Chat);
+        }
         self.chat.move_cursor_to_end = true;
+        true
     }
 
     #[allow(
