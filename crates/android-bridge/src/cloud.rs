@@ -234,6 +234,8 @@ impl MobileCore {
 #[derive(uniffi::Record)]
 pub struct CloudResumeOffer {
     pub token: String,
+    /// Stable across local pagination/focus changes for the same remote update.
+    pub revision_key: String,
 }
 #[derive(Serialize, Deserialize)]
 struct ResumeToken {
@@ -252,13 +254,23 @@ impl MobileReader {
                 if !settings.enabled {
                     return Ok(None);
                 }
+                let account = sync::account_key(&settings);
+                if offer.as_ref().is_some_and(|offer| {
+                    self.resume_notices.lock().unwrap_or_else(|e| e.into_inner())
+                        .contains(&account, offer)
+                }) {
+                    return Ok(None);
+                }
                 offer
                     .map(|offer| {
+                        let revision_key = serde_json::to_string(
+                            &(&account, &offer.book_id, &offer.remote.updated_at),
+                        ).map_err(error)?;
                         serde_json::to_string(&ResumeToken {
-                            account: sync::account_key(&settings),
+                            account,
                             offer,
                         })
-                        .map(|token| CloudResumeOffer { token })
+                        .map(|token| CloudResumeOffer { token, revision_key })
                         .map_err(error)
                     })
                     .transpose()
@@ -279,24 +291,48 @@ impl MobileReader {
                 }
                 let offer = token.offer;
                 let baseline = sync_locator(s, scroll::active(s), s.focus);
-                if offer.book_id != s.book_id
-                    || !s
+                if offer.book_id != s.book_id {
+                    return Ok(None);
+                }
+                if !s
                         .store
                         .resume_offer_current(&offer, &baseline)
                         .map_err(error)?
                 {
+                    // A stale click acknowledges this version without moving
+                    // a user who has since navigated or hiding newer data.
+                    self.resume_notices.lock().unwrap_or_else(|e| e.into_inner())
+                        .mark_shown(&token.account, &offer);
                     return Ok(None);
                 }
                 s.session
                     .restore_locator(&offer.remote.locator)
                     .map_err(error)?;
-                s.focus_anchor = offer.remote.locator.source;
+                s.focus_anchor = offer.remote.locator.source.clone();
                 s.scroll_center = true;
                 scroll::invalidate(s);
-                render(s).map(Some)
+                let page = render(s)?;
+                self.resume_notices.lock().unwrap_or_else(|e| e.into_inner())
+                    .mark_shown(&token.account, &offer);
+                Ok(Some(page))
             })
         })
         .await
+    }
+
+    pub async fn dismiss_cloud_resume_offer(self: Arc<Self>, token: String) -> Result<()> {
+        work(move || {
+            self.with(|s| {
+                let token: ResumeToken = serde_json::from_str(&token).map_err(error)?;
+                let settings = SyncSettings::load_default().map_err(error)?;
+                if settings.enabled && token.account == sync::account_key(&settings)
+                    && token.offer.book_id == s.book_id {
+                    self.resume_notices.lock().unwrap_or_else(|e| e.into_inner())
+                        .mark_shown(&token.account, &token.offer);
+                }
+                Ok(())
+            })
+        }).await
     }
 }
 

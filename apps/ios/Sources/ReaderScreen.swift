@@ -261,7 +261,7 @@ struct ReaderScreen: View {
                     HStack(spacing: 8) {
                         Text(mobileText("发现其他设备进度", "Reading progress from another device")).font(.footnote)
                         Button(mobileText("跳转", "Go to")) { model.resumeRemoteProgress() }
-                        MobileIconButton(icon: "close", label: mobileText("关闭", "Dismiss"), size: 16) { model.resumeToken = nil }
+                        MobileIconButton(icon: "close", label: mobileText("关闭", "Dismiss"), size: 16) { model.dismissRemoteProgress() }
                             .frame(width: 30, height: 30)
                     }.padding(.leading, 10).padding(.trailing, 4)
                         .background(palette.surface, in: .capsule).disabled(model.working)

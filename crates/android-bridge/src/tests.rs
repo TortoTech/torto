@@ -20,6 +20,7 @@ async fn check_legacy_cover_backfill(source: &std::path::Path) {
     rebook_app_core::persistence::write_json_atomic(&manifest, &stored).unwrap();
     std::fs::remove_file(library_root.join("covers").join(format!("{}.cover", book.id))).unwrap();
     let core = Arc::new(MobileCore {
+        resume_notices: Default::default(),
         sync_wake: rebook_app_core::sync::SyncWake::for_path(&root.join("sync-v1.sqlite3")),
         root: root.clone(),
         library_lock: Arc::new(Mutex::new(())),
@@ -1446,17 +1447,42 @@ async fn statistics_cloud_and_diagnostics(
     let progress=serde_json::from_value(serde_json::json!({"locator":remote,"updated_at":updated})).unwrap();
     store.merge_progress(&progress).unwrap();
     let offered=reader.clone().cloud_resume_offer().await.unwrap().unwrap();
+    let offered_revision=offered.revision_key.clone();
     reader.clone().configure(22.0,true,false).await.unwrap();
     assert_eq!(store.load_progress(book).unwrap().unwrap().updated_at,updated);
     // Reflow may change the visible anchor, so ask for a fresh offer.
     let offered=reader.clone().cloud_resume_offer().await.unwrap().unwrap_or(offered);
+    assert_eq!(offered.revision_key,offered_revision,"local reflow must not create a new notice");
     let mut another=settings.clone();another.username.push_str("-other");
     core.clone().save_cloud_options(another,None).await.unwrap();
     assert!(reader.clone().resume_cloud_progress(offered.token.clone()).await.unwrap().is_none());
     core.clone().save_cloud_options(settings,None).await.unwrap();
     let offered=reader.clone().cloud_resume_offer().await.unwrap().unwrap();
     assert!(reader.clone().resume_cloud_progress(offered.token).await.unwrap().is_some());
+    reader.clone().configure(24.0,true,false).await.unwrap();
+    reader.with(|s| {
+        s.session.restore_locator(&baseline).map_err(error)?;
+        s.focus_anchor=baseline.source.clone();
+        s.scroll_center=true;
+        scroll::invalidate(s);
+        Ok(())
+    }).unwrap();
+    let normalized=reader.with(|s|Ok(sync_locator(s,scroll::active(s),s.focus))).unwrap();
+    assert!(store.resume_offer(book,&normalized).unwrap().is_some(),"fixture must still contain a distinct foreign locator");
+    assert!(reader.clone().cloud_resume_offer().await.unwrap().is_none(),"accepted progress must stay consumed after reflow");
+
+    let mut newer=remote.clone();newer.total_progression=Some(0.4);newer.progression=Some(0.4);
+    let mut newer_time=store.tick().unwrap();newer_time.device_id="remote-resume-peer".into();
+    let progress=serde_json::from_value(serde_json::json!({"locator":newer,"updated_at":newer_time})).unwrap();
+    store.merge_progress(&progress).unwrap();
+    let newer_offer=reader.clone().cloud_resume_offer().await.unwrap().unwrap();
+    assert_ne!(newer_offer.revision_key,offered_revision);
+    reader.clone().dismiss_cloud_resume_offer(newer_offer.token).await.unwrap();
+    assert!(reader.clone().cloud_resume_offer().await.unwrap().is_none(),"dismissed progress must not be offered by the next sync check");
     reader.shutdown().await.unwrap();
+    let reopened=core.clone().open_book(book.into(),Viewport {width:360,height:640,scale:1.0}).await.unwrap();
+    assert!(reopened.clone().cloud_resume_offer().await.unwrap().is_none(),"reopening the same book retains the core's consumed progress");
+    reopened.shutdown().await.unwrap();
 
     core.clone()
         .save_cloud_options(original, Some(String::new()))

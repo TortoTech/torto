@@ -1482,7 +1482,10 @@ fn translatable_text(block: &TextBlock) -> Option<String> {
         .content
         .iter()
         .flat_map(Inline::text_runs)
-        .any(|run| run.text.chars().any(|character| !character.is_whitespace()))
+        // Print-page labels remain available for navigation, but translation_text
+        // omits them. A marker-only block must not become an empty model input.
+        .any(|run| run.style.inline_role != InlineRole::PageMarker
+            && run.text.chars().any(|character| !character.is_whitespace()))
         .then_some(())
         .or_else(|| {
             block
@@ -3329,6 +3332,62 @@ mod tests {
             normalize_legacy_placeholder_tags("https://example.com/torto-note-0"),
             "https://example.com/torto-note-0"
         );
+    }
+
+    #[test]
+    fn page_marker_only_blocks_are_not_sent_for_translation() {
+        let inline = |text: &str| Inline::Text(TextRun {
+            text: text.into(), style: Default::default(), link: None,
+        });
+        let marker = Inline::Text(TextRun {
+            text: "xxi.".into(),
+            style: TextStyle { inline_role: InlineRole::PageMarker, ..Default::default() },
+            link: None,
+        });
+        let mut block = TextBlock {
+            kind: TextBlockKind::Paragraph,
+            content: vec![marker.clone(), Inline::Break, inline(" ")],
+            style: Default::default(),
+            source: None,
+        };
+        assert!(translation_text(&block).trim().is_empty());
+        assert_eq!(translatable_text(&block), None);
+        block.content.push(inline("A real paragraph."));
+        assert_eq!(translatable_text(&block).as_deref(), Some("\n A real paragraph."));
+        assert_eq!(block.content[0], marker, "Keep print-page metadata intact");
+    }
+
+    #[test]
+    fn epub_page_markers_do_not_create_empty_translation_inputs() {
+        let base = source();
+        let section = rebook_html::parse_section(
+            r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><section>
+            <span id="pxxi" aria-labelledby="vcpxxi" epub:type="pagebreak" role="doc-pagebreak"><span id="vcpxxi" hidden="hidden">xxi.</span></span>
+            <h1>Introduction</h1><p>First paragraph.<span id="pxxii" epub:type="pagebreak">xxii.</span> More prose.</p>
+            </section></body></html>"#,
+            &base.book().sections[0], |_| None,
+        ).unwrap();
+        let inputs = prepare_translation_inputs(&section, false);
+        assert!(!inputs.is_empty());
+        assert!(inputs.iter().all(|(input, _)| !input.text.trim().is_empty()), "{inputs:?}");
+        assert!(inputs.iter().any(|(input, _)| input.text.contains("Introduction")));
+        assert!(inputs.iter().any(|(input, _)| input.text.contains("First paragraph.") && input.text.contains("More prose.")));
+        assert!(inputs.iter().all(|(input, _)| !input.text.contains("xxi")));
+        assert!(section.anchors.iter().any(|anchor| anchor.fragment == "pxxi"));
+    }
+
+    #[test]
+    #[ignore = "requires TORTO_TRANSLATION_BOOK pointing to a local book"]
+    fn real_library_translation_inputs_are_nonempty() {
+        let path = std::env::var_os("TORTO_TRANSLATION_BOOK").expect("Set TORTO_TRANSLATION_BOOK");
+        let opened = rebook_formats::open_file(std::path::PathBuf::from(path)).unwrap();
+        let source = opened.source();
+        for index in 0..source.book().sections.len() {
+            let section = source.parse_section(index).unwrap();
+            for (input, _) in prepare_translation_inputs(&section, false) {
+                assert!(!input.text.trim().is_empty(), "section={index}, block={}, segment={:?}", input.block_index, input.segment_index);
+            }
+        }
     }
 
     #[test]

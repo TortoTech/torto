@@ -1,7 +1,7 @@
 //! Source-owned touch interactions. Kotlin only displays the result.
 use crate::*;
 use rebook_app_core::reading_text::{self as text, FocusFootnoteSource};
-use rebook_publication::{Block, Inline, LinkRole, SourceAnchor};
+use rebook_publication::{Block, Inline, InlineRole, LinkRole, SourceAnchor};
 
 #[derive(Clone, uniffi::Record)]
 pub struct TouchAction {
@@ -152,8 +152,19 @@ pub(crate) fn inline_note_markup(block: &Block, number: u32) -> String {
                 } else {
                     first.style.footnote_number
                 };
-                if number & 0x2000_0000 != 0 && ordinal == number & 0x1fff_ffff {
-                    found.push(text::note_inline_markdown(&text.content[range]));
+                if first.style.inline_role == InlineRole::Footnote
+                    && number & 0x2000_0000 != 0
+                    && ordinal == number & 0x1fff_ffff
+                {
+                    // In the popup these runs are the note body. The markup
+                    // writer otherwise hides them as embedded footnotes.
+                    let mut body = text.content[range].to_vec();
+                    for inline in &mut body {
+                        if let Inline::Text(run) = inline {
+                            run.style.inline_role = InlineRole::Normal;
+                        }
+                    }
+                    found.push(text::note_inline_markdown(&body));
                 }
             }
         }

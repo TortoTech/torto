@@ -5,6 +5,7 @@ mod listing;
 mod portable;
 mod protocol;
 mod rate_limit;
+mod resume;
 mod schedule;
 mod settings;
 mod store;
@@ -24,6 +25,7 @@ pub use engine::{
     run_sync,
 };
 pub use rate_limit::RateLimited;
+pub use resume::ResumeNoticeHistory;
 pub use schedule::{ScheduleSnapshot, SyncSchedule};
 pub use settings::{CloudProviderKind, SyncSettings};
 pub use store::{ResumeOffer, SyncStore};

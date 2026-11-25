@@ -195,6 +195,7 @@ impl Viewport {
 #[derive(uniffi::Object)]
 pub struct MobileCore {
     root: PathBuf,
+    resume_notices: Arc<Mutex<rebook_app_core::sync::ResumeNoticeHistory>>,
     sync_wake: Arc<rebook_app_core::sync::SyncWake>,
     library_lock: Arc<Mutex<()>>,
     font_download_lock: tokio::sync::Mutex<()>,
@@ -218,6 +219,7 @@ impl MobileCore {
         HOOK.call_once(rebook_app_core::diagnostics::install_panic_hook);
         static LIBRARY_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
         Ok(Arc::new(Self {
+            resume_notices: Default::default(),
             sync_wake:rebook_app_core::sync::SyncWake::for_path(&root.join("sync-v1.sqlite3")),
             root,
             font_download_lock: tokio::sync::Mutex::new(()),
@@ -418,6 +420,7 @@ impl MobileCore {
             let messages = Vec::new();
             let session_typesetting = session.style().typesetting;
             Ok(Arc::new(MobileReader {
+                resume_notices: Arc::clone(&self.resume_notices),
                 scheduler: Default::default(),
                 ai: Default::default(),
                 enhancement_claim: Default::default(),
@@ -512,6 +515,7 @@ struct ReaderState {
 }
 #[derive(uniffi::Object)]
 pub struct MobileReader {
+    resume_notices: Arc<Mutex<rebook_app_core::sync::ResumeNoticeHistory>>,
     scheduler: rebook_app_core::reading_ai::Scheduler,
     ai: Mutex<services::driver::State>,
     enhancement_claim: tokio::sync::Mutex<()>,
